@@ -1,0 +1,18 @@
+# built binary
+/tonnet
+/cmd/tonnet/tonnet
+
+# goreleaser output
+/dist/
+
+# node identity seed — NEVER commit (leaking it lets anyone impersonate the node;
+# losing it changes the ADNL id and breaks any .ton pointer)
+*.bin
+*.key
+node-key.bin
+
+# local scratch
+*.log
+
+# editor
+/.obsidian/

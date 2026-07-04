@@ -1,0 +1,53 @@
+# goreleaser v2 config — build cross-platform `tonnet` binaries for GitHub Releases.
+# Local dry run:  goreleaser release --snapshot --clean
+version: 2
+
+project_name: tonnet
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: tonnet
+    main: ./cmd/tonnet
+    binary: tonnet
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/TONresistor/tonnet-messenger/internal/cli.Version={{ .Version }}
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - id: tonnet
+    formats: [tar.gz]
+    name_template: "tonnet_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-dev"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: false
+  prerelease: auto

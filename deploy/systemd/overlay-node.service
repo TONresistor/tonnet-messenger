@@ -1,0 +1,17 @@
+[Unit]
+Description=Tonnet overlay-node (experimental group-chat overlay peer)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/overlay-node
+# --advertise is the PUBLIC ip:port the node publishes (open the UDP port in the firewall).
+# --room derives the overlay id; keep it identical on every node that should share the same room.
+# --key persists the ADNL id across restarts — back it up; deleting it breaks any .ton pointer.
+ExecStart=/opt/overlay-node/tonnet serve --listen 0.0.0.0:17400 --advertise PUBLIC_IP:17400 --room tonnet:groupchat:v1 --key /opt/overlay-node/node-key.bin --socket /opt/overlay-node/node.sock
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
