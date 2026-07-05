@@ -26,6 +26,8 @@ const maxConcurrentDials = 8
 
 const presenceSweepEach = 30 * time.Second
 
+const deliveredCap = 8192
+
 type Config struct {
 	Key       ed25519.PrivateKey
 	Listen    string
@@ -37,28 +39,46 @@ type Config struct {
 }
 
 type Node struct {
-	cfg     Config
-	gw      *adnl.Gateway
-	room    *room.Room
-	peers   *peerTable
-	dedup   *ov.Dedup
-	pub     atomic.Pointer[dht.Publisher]
-	dialSem chan struct{}
-	myID    string
-	started time.Time
+	cfg         Config
+	name        room.Name
+	gw          *adnl.Gateway
+	room        *room.Room
+	peers       *peerTable
+	dedup       *ov.Dedup
+	penalties   *penaltyBox
+	sources     *sourceLimits
+	uncertified *tokenBucket
+	certs       *certCache
+	devices     *deviceTable
+	wrappers    *wrapperStore
+	pub         atomic.Pointer[dht.Publisher]
+	dialSem     chan struct{}
+	myID        string
+	started     time.Time
 }
 
 func New(cfg Config) (*Node, error) {
+	name, err := room.ParseName(cfg.Room)
+	if err != nil {
+		return nil, fmt.Errorf("room %q: %w", cfg.Room, err)
+	}
 	gw := adnl.NewGateway(cfg.Key)
 	n := &Node{
-		cfg:     cfg,
-		gw:      gw,
-		room:    room.New(cfg.Room, cfg.OverlayID),
-		peers:   newPeerTable(0),
-		dedup:   ov.NewDedup(0),
-		dialSem: make(chan struct{}, maxConcurrentDials),
-		myID:    hex.EncodeToString(gw.GetID()),
-		started: time.Now(),
+		cfg:         cfg,
+		name:        name,
+		gw:          gw,
+		room:        room.New(name, cfg.OverlayID),
+		peers:       newPeerTable(0),
+		dedup:       ov.NewDedup(deliveredCap),
+		penalties:   newPenaltyBox(),
+		sources:     newSourceLimits(),
+		uncertified: newTokenBucket(uncertifiedBurst, uncertifiedRefill),
+		certs:       newCertCache(),
+		devices:     newDeviceTable(),
+		wrappers:    newWrapperStore(),
+		dialSem:     make(chan struct{}, maxConcurrentDials),
+		myID:        hex.EncodeToString(gw.GetID()),
+		started:     time.Now(),
 	}
 	gw.SetConnectionHandler(n.onInbound)
 

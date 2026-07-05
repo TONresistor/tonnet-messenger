@@ -16,6 +16,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/node"
 	"github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/pubip"
+	roompkg "github.com/TONresistor/tonnet-messenger/internal/room"
 )
 
 func newServeCmd() *cobra.Command {
@@ -37,6 +38,11 @@ func newServeCmd() *cobra.Command {
 			"the DHT so clients and other nodes can find it.",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			key := keys.LoadOrCreateKey(keyPath)
+
+			name, err := roompkg.ParseName(room)
+			if err != nil {
+				return fmt.Errorf("invalid --room %q (gated rooms are NAME#o=<64 hex>): %w", room, err)
+			}
 
 			oid, err := overlay.ID(room)
 			if err != nil {
@@ -69,7 +75,7 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 
-			printServeBanner(n.ADNLID(), room, listen, adv, oid, keyPath, sock)
+			printServeBanner(n.ADNLID(), name, listen, adv, oid, keyPath, sock)
 
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
@@ -108,7 +114,7 @@ func resolveAdvertise(ctx context.Context, advertise, listen string) (string, er
 	return net.JoinHostPort(ip.String(), port), nil
 }
 
-func printServeBanner(adnlID []byte, room, listen, advertise string, oid []byte, keyPath, socket string) {
+func printServeBanner(adnlID []byte, name roompkg.Name, listen, advertise string, oid []byte, keyPath, socket string) {
 	id := base64.StdEncoding.EncodeToString(adnlID)
 	oidB64 := base64.StdEncoding.EncodeToString(oid)
 
@@ -118,7 +124,11 @@ func printServeBanner(adnlID []byte, room, listen, advertise string, oid []byte,
 	} else {
 		fmt.Printf("! listening  %s   (no public address - pass --advertise)\n", listen)
 	}
-	fmt.Printf("✓ room       %q   (overlay %s)\n", room, shortB64(oidB64))
+	mode := "open"
+	if name.Mode == roompkg.ModeGated {
+		mode = "gated, owner " + shortB64(base64.StdEncoding.EncodeToString(name.OwnerKey))
+	}
+	fmt.Printf("✓ room       %q   (overlay %s, %s)\n", name.Display, shortB64(oidB64), mode)
 	fmt.Printf("→ point a .ton site record at %s to name it\n", id)
 	if socket != "" {
 		fmt.Println("node live · ctrl-C to stop · introspect: tonnet status")

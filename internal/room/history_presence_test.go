@@ -1,9 +1,6 @@
 package room
 
 import (
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/json"
 	"testing"
 	"time"
 
@@ -13,11 +10,11 @@ import (
 func TestHistoryCountCapEvictsOldest(t *testing.T) {
 	h := NewHistory(3, time.Hour)
 	for _, s := range []string{"a", "b", "c", "d"} {
-		h.Add([]byte(s))
+		h.Add(Item{Type: "msg", From: s})
 	}
 	got := h.Recent()
-	if len(got) != 3 || string(got[0]) != "b" || string(got[2]) != "d" {
-		t.Fatalf("want [b c d], got %q", got)
+	if len(got) != 3 || got[0].From != "b" || got[2].From != "d" {
+		t.Fatalf("want [b c d], got %+v", got)
 	}
 }
 
@@ -26,26 +23,16 @@ func TestHistoryAgeCapTrimsExpired(t *testing.T) {
 	h := NewHistory(100, time.Minute)
 	h.now = func() time.Time { return clk }
 
-	h.Add([]byte("old"))
+	h.Add(Item{Type: "msg", From: "old"})
 	clk = clk.Add(2 * time.Minute)
-	h.Add([]byte("new"))
+	h.Add(Item{Type: "msg", From: "new"})
 
 	got := h.Recent()
-	if len(got) != 1 || string(got[0]) != "new" {
-		t.Fatalf("want [new], got %q", got)
+	if len(got) != 1 || got[0].From != "new" {
+		t.Fatalf("want [new], got %+v", got)
 	}
 	if h.Len() != 1 {
 		t.Fatalf("expired entry not compacted, len=%d", h.Len())
-	}
-}
-
-func TestHistoryCopiesInput(t *testing.T) {
-	h := NewHistory(4, time.Hour)
-	buf := []byte("hello")
-	h.Add(buf)
-	copy(buf, "world")
-	if got := h.Recent(); string(got[0]) != "hello" {
-		t.Fatalf("history did not copy input: %q", got[0])
 	}
 }
 
@@ -112,52 +99,35 @@ func TestPresenceSweepDropsExpired(t *testing.T) {
 	}
 }
 
-func TestObserveOnlyMarksVerifiedPresence(t *testing.T) {
-	r := New("room", make([]byte, 32))
-
-	unsigned, _ := json.Marshal(map[string]any{"type": "msg", "nick": "x", "text": "hi", "ts": 1})
-	r.Observe(unsigned)
-	if r.PresenceCount() != 0 {
-		t.Fatal("an unsigned message must not create a presence entry")
-	}
-
-	_, priv, _ := ed25519.GenerateKey(rand.Reader)
-	env := envelope.Envelope{Type: "msg", Nick: "y", Text: "hi", TS: 2}
-	if err := env.Sign(priv); err != nil {
+func TestObserveAcceptedMarksPresenceAndStoresByType(t *testing.T) {
+	name, err := ParseName("tonnet:room")
+	if err != nil {
 		t.Fatal(err)
 	}
-	signed, _ := env.Marshal()
-	r.Observe(signed)
+	r := New(name, make([]byte, 32))
+
+	dm := envelope.Envelope{Type: "dm", Nick: "a", Text: "Ym94", TS: 1, Room: "tonnet:room", To: "aa", Key: "k1"}
+	r.ObserveAccepted(dm, nil)
+	if got := r.Recent(); len(got) != 1 || got[0].Type != "dm" || got[0].To != "aa" || got[0].From != "k1" {
+		t.Fatalf("dm must enter the history buffer with routing metadata, got %+v", got)
+	}
 	if r.PresenceCount() != 1 {
-		t.Fatal("a validly-signed message must create a presence entry")
+		t.Fatal("an accepted message must create a presence entry")
 	}
 
-	_, priv2, _ := ed25519.GenerateKey(rand.Reader)
-	forged := envelope.Envelope{Type: "msg", Nick: "z", Text: "orig", TS: 3}
-	if err := forged.Sign(priv2); err != nil {
-		t.Fatal(err)
-	}
-	forged.Text = "tampered"
-	badBytes, _ := forged.Marshal()
-	r.Observe(badBytes)
-	if r.PresenceCount() != 1 {
-		t.Fatalf("a tampered (bad-signature) message must not create presence, count=%d", r.PresenceCount())
-	}
-}
-
-func TestObserveStoresDMButNotHello(t *testing.T) {
-	r := New("room", make([]byte, 32))
-
-	dm, _ := json.Marshal(map[string]any{"type": "dm", "nick": "a", "text": "Ym94", "ts": 1, "room": "room", "to": "aa"})
-	r.Observe(dm)
-	if got := r.Recent(); len(got) != 1 {
-		t.Fatalf("dm must enter the history buffer, len=%d", len(got))
-	}
-
-	hello, _ := json.Marshal(map[string]any{"type": "hello", "nick": "a", "text": "", "ts": 2, "room": "room"})
-	r.Observe(hello)
+	hello := envelope.Envelope{Type: "hello", Nick: "b", TS: 2, Room: "tonnet:room", Key: "k2"}
+	r.ObserveAccepted(hello, nil)
 	if got := r.Recent(); len(got) != 1 {
 		t.Fatalf("hello must not enter the history buffer, len=%d", len(got))
+	}
+	if r.PresenceCount() != 2 {
+		t.Fatal("hello must mark presence")
+	}
+
+	grant := envelope.Envelope{Type: "cert-grant", Nick: "o", TS: 3, Room: "tonnet:room", To: "k1", Key: "k3"}
+	r.ObserveAccepted(grant, nil)
+	if got := r.Recent(); len(got) != 1 {
+		t.Fatalf("cert-grant must not enter the history buffer, len=%d", len(got))
 	}
 }
 

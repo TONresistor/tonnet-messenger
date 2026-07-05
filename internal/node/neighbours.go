@@ -13,6 +13,8 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
+
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 )
 
 const (
@@ -171,6 +173,12 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 		advertised = req.List
 	case *tonoverlay.GetRandomPeers:
 		advertised = req.List
+	case broadcast.GetTime, *broadcast.GetTime:
+		return n.answer(p, q, broadcast.Time{Now: int32(time.Now().Unix())})
+	case broadcast.GetBroadcast:
+		return n.answerGetBroadcast(p, q, req.Hash)
+	case *broadcast.GetBroadcast:
+		return n.answerGetBroadcast(p, q, req.Hash)
 	default:
 		return nil
 	}
@@ -186,6 +194,19 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 		go n.considerNode(context.Background(), &nd)
 	}
 	return nil
+}
+
+func (n *Node) answer(p *peer, q *adnl.MessageQuery, resp tl.Serializable) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return p.raw.Answer(ctx, q.ID, resp)
+}
+
+func (n *Node) answerGetBroadcast(p *peer, q *adnl.MessageQuery, hash []byte) error {
+	if b, ok := n.wrappers.get(hash); ok {
+		return n.answer(p, q, b)
+	}
+	return n.answer(p, q, broadcast.NotFound{})
 }
 
 func (n *Node) myNodesList() tonoverlay.NodesList {

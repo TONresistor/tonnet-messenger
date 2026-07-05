@@ -1,6 +1,7 @@
 package node
 
 import (
+	"math/rand"
 	"sync"
 	"time"
 
@@ -23,13 +24,15 @@ const (
 )
 
 type peer struct {
-	id      string
-	kind    peerKind
-	w       *tonoverlay.ADNLOverlayWrapper
-	raw     adnl.Peer
-	member  bool
-	signed  *tonoverlay.Node
-	limiter *tokenBucket
+	id       string
+	kind     peerKind
+	w        *tonoverlay.ADNLOverlayWrapper
+	raw      adnl.Peer
+	member   bool
+	replayed bool
+	errs     int
+	signed   *tonoverlay.Node
+	limiter  *tokenBucket
 }
 
 type peerTable struct {
@@ -128,7 +131,7 @@ func (t *peerTable) remove(id string) {
 	delete(t.m, id)
 }
 
-func (t *peerTable) relayTargets(exclude string) []*peer {
+func (t *peerTable) memberLeaves(exclude string) []*peer {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]*peer, 0, len(t.m))
@@ -136,11 +139,53 @@ func (t *peerTable) relayTargets(exclude string) []*peer {
 		if id == exclude {
 			continue
 		}
-		if p.kind == kindNode || p.member {
+		if p.kind == kindLeaf && p.member {
 			out = append(out, p)
 		}
 	}
 	return out
+}
+
+func (t *peerTable) nodeTargets(exclude string, max int) []*peer {
+	t.mu.RLock()
+	out := make([]*peer, 0, len(t.m))
+	for id, p := range t.m {
+		if id == exclude {
+			continue
+		}
+		if p.kind == kindNode {
+			out = append(out, p)
+		}
+	}
+	t.mu.RUnlock()
+
+	if max <= 0 || len(out) <= max {
+		return out
+	}
+	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
+	return out[:max]
+}
+
+func (t *peerTable) markReplayed(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[id]
+	if !ok || p.kind != kindLeaf || p.replayed {
+		return false
+	}
+	p.replayed = true
+	return true
+}
+
+func (t *peerTable) countError(id string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[id]
+	if !ok {
+		return 0
+	}
+	p.errs++
+	return p.errs
 }
 
 func (t *peerTable) nodePeers() []*peer {
@@ -203,7 +248,9 @@ func newTokenBucket(max, refillPerSec float64) *tokenBucket {
 	return &tokenBucket{tokens: max, max: max, refillPerSec: refillPerSec, last: time.Now()}
 }
 
-func (b *tokenBucket) allow() bool {
+func (b *tokenBucket) allow() bool { return b.take(1) }
+
+func (b *tokenBucket) take(n float64) bool {
 	if b == nil {
 		return true
 	}
@@ -215,8 +262,8 @@ func (b *tokenBucket) allow() bool {
 		b.tokens = b.max
 	}
 	b.last = now
-	if b.tokens >= 1 {
-		b.tokens--
+	if b.tokens >= n {
+		b.tokens -= n
 		return true
 	}
 	return false

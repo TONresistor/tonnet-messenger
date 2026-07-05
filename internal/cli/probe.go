@@ -12,6 +12,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/keys"
 	"github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/probe"
+	roompkg "github.com/TONresistor/tonnet-messenger/internal/room"
 )
 
 func newProbeCmd() *cobra.Command {
@@ -37,6 +38,9 @@ func newProbeCmd() *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			room := args[0]
+			if _, err := roompkg.ParseName(room); err != nil {
+				return fmt.Errorf("invalid room %q (gated rooms are NAME#o=<64 hex>): %w", room, err)
+			}
 			oid, err := overlay.ID(room)
 			if err != nil {
 				return err

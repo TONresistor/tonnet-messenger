@@ -6,22 +6,14 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/envelope"
 )
 
-type RawMessage struct {
-	Data []byte `tl:"bytes"`
-}
-
-func init() {
-	tl.Register(RawMessage{}, "ws.rawMessage data:bytes = ws.RawMessage")
-}
-
 type Room struct {
 	overlayID []byte
-	name      string
+	name      Name
 	hist      *History
 	pres      *Presence
 }
 
-func New(name string, overlayID []byte) *Room {
+func New(name Name, overlayID []byte) *Room {
 	return &Room{
 		overlayID: overlayID,
 		name:      name,
@@ -32,22 +24,18 @@ func New(name string, overlayID []byte) *Room {
 
 func (r *Room) OverlayID() []byte { return r.overlayID }
 
-func (r *Room) Observe(inner []byte) {
-	env, err := envelope.Unmarshal(inner)
-	if err != nil {
-		r.hist.Add(inner)
-		return
-	}
-	if env.Verify() == nil && (env.Room == "" || env.Room == r.name) {
-		r.pres.Mark(env.Key, env.Nick)
-	}
-	if env.Type == "" || env.Type == "msg" || env.Type == "dm" {
-		r.hist.Add(inner)
+func (r *Room) Name() Name { return r.name }
+
+func (r *Room) ObserveAccepted(env envelope.Envelope, obj tl.Serializable) {
+	r.pres.Mark(env.Key, env.Nick)
+	switch env.Type {
+	case "", "msg", "dm":
+		r.hist.Add(Item{Type: env.Type, From: env.Key, To: env.To, Obj: obj})
 	}
 }
 
 func (r *Room) SweepPresence() { r.pres.Sweep() }
 
-func (r *Room) Recent() [][]byte { return r.hist.Recent() }
+func (r *Room) Recent() []Item { return r.hist.Recent() }
 
 func (r *Room) PresenceCount() int { return r.pres.Count() }

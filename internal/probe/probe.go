@@ -14,8 +14,8 @@ import (
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/envelope"
-	"github.com/TONresistor/tonnet-messenger/internal/room"
 	"github.com/TONresistor/tonnet-messenger/internal/tonproof"
 )
 
@@ -141,25 +141,35 @@ func send(ctx context.Context, w *tonoverlay.ADNLOverlayWrapper, key ed25519.Pri
 	if err != nil {
 		return err
 	}
+	b, err := broadcast.Sign(key, nil, body, time.Now().Unix())
+	if err != nil {
+		return err
+	}
 	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	return w.SendCustomMessage(cctx, room.RawMessage{Data: body})
+	return w.SendCustomMessage(cctx, b)
 }
 
 func printFrame(data tl.Serializable, localRoom string) {
-	var body []byte
+	var b broadcast.Broadcast
 	switch v := data.(type) {
-	case room.RawMessage:
-		body = v.Data
-	case *room.RawMessage:
-		body = v.Data
+	case broadcast.Broadcast:
+		b = v
+	case *broadcast.Broadcast:
+		b = *v
 	default:
 		log.Printf("recv (non-chat %T)", data)
 		return
 	}
-	env, err := envelope.Unmarshal(body)
+	wrapper := "wrapper ok"
+	if err := b.Verify(); err != nil {
+		wrapper = "WRAPPER-BAD-SIG"
+	} else if !broadcast.Fresh(b.Date, time.Now()) {
+		wrapper = "wrapper stale (history)"
+	}
+	env, err := envelope.Unmarshal(b.Data)
 	if err != nil {
-		log.Printf("recv raw: %s", string(body))
+		log.Printf("recv raw (%s): %s", wrapper, string(b.Data))
 		return
 	}
 	verified := "unsigned"
@@ -176,7 +186,7 @@ func printFrame(data tl.Serializable, localRoom string) {
 			}
 		}
 	}
-	log.Printf("recv [%s] <%s> %s (%s)", env.Type, env.Nick, env.Text, verified)
+	log.Printf("recv [%s] <%s> %s (%s, %s)", env.Type, env.Nick, env.Text, verified, wrapper)
 }
 
 func nowMillis(_ Config) int64 { return time.Now().UnixMilli() }

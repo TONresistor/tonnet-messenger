@@ -105,13 +105,6 @@ func TestV2TamperDetected(t *testing.T) {
 		"nick":       func(x *Envelope) { x.Nick = "mallory" },
 		"room":       func(x *Envelope) { x.Room = "tonnet:other" },
 		"strip-room": func(x *Envelope) { x.Room = "" },
-		"wts":        func(x *Envelope) { x.WTS = 1 },
-		"wexp":       func(x *Envelope) { x.WExp = 9999999999 },
-		"wkey": func(x *Envelope) {
-			pub := seededKey(7).Public().(ed25519.PublicKey)
-			x.WKey = hex.EncodeToString(pub)
-		},
-		"strip-proof": func(x *Envelope) { x.WKey = ""; x.WSig = ""; x.WTS = 0; x.WExp = 0 },
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -124,17 +117,21 @@ func TestV2TamperDetected(t *testing.T) {
 	}
 }
 
-func TestV2GraftProofRejected(t *testing.T) {
+func TestV2ProofFieldsNotDeviceSigned(t *testing.T) {
 	priv := newKey(t)
 	e := signedV2(t, priv, false)
-	grafted := e
-	wpub := seededKey(9).Public().(ed25519.PublicKey)
-	grafted.WKey = hex.EncodeToString(wpub)
-	grafted.WSig = hex.EncodeToString(make([]byte, ed25519.SignatureSize))
-	grafted.WTS = 1719900000
-	grafted.WExp = 1722492000
-	if err := grafted.Verify(); err == nil {
-		t.Fatal("grafted proof verified as valid")
+	before := e.Sig
+
+	e.WKey = hex.EncodeToString(seededKey(9).Public().(ed25519.PublicKey))
+	e.WSig = hex.EncodeToString(make([]byte, ed25519.SignatureSize))
+	e.WTS = 1719900000
+	e.WExp = 1722492000
+
+	if e.Sig != before {
+		t.Fatal("adding wallet fields must not require re-signing (they are not device-signed)")
+	}
+	if err := e.Verify(); err != nil {
+		t.Fatalf("the device signature is over content only and must still verify: %v", err)
 	}
 }
 

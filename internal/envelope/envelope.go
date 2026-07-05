@@ -99,10 +99,6 @@ func (e Envelope) digest(pub []byte) ([]byte, error) {
 		writeField(h, pub)
 		return h.Sum(nil), nil
 	}
-	block, err := e.ProofBlock()
-	if err != nil {
-		return nil, err
-	}
 	if e.To == "" {
 		writeField(h, []byte(domainTagV2))
 	} else {
@@ -117,7 +113,6 @@ func (e Envelope) digest(pub []byte) ([]byte, error) {
 		writeField(h, []byte(e.To))
 	}
 	writeField(h, pub)
-	writeField(h, block)
 	return h.Sum(nil), nil
 }
 

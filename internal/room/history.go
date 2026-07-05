@@ -3,6 +3,8 @@ package room
 import (
 	"sync"
 	"time"
+
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 const (
@@ -10,8 +12,15 @@ const (
 	DefaultHistoryAge   = 6 * time.Hour
 )
 
+type Item struct {
+	Type string
+	From string
+	To   string
+	Obj  tl.Serializable
+}
+
 type histItem struct {
-	data []byte
+	item Item
 	at   time.Time
 }
 
@@ -34,19 +43,16 @@ func NewHistory(maxItems int, maxAge time.Duration) *History {
 	return &History{maxItems: maxItems, maxAge: maxAge, now: time.Now}
 }
 
-func (h *History) Add(data []byte) {
-	cp := make([]byte, len(data))
-	copy(cp, data)
-
+func (h *History) Add(it Item) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	h.buf = append(h.buf, histItem{data: cp, at: h.now()})
+	h.buf = append(h.buf, histItem{item: it, at: h.now()})
 	if over := len(h.buf) - h.maxItems; over > 0 {
 		h.buf = h.buf[over:]
 	}
 }
 
-func (h *History) Recent() [][]byte {
+func (h *History) Recent() []Item {
 	cutoff := h.now().Add(-h.maxAge)
 
 	h.mu.Lock()
@@ -60,9 +66,9 @@ func (h *History) Recent() [][]byte {
 		h.buf = h.buf[i:]
 	}
 
-	out := make([][]byte, len(h.buf))
+	out := make([]Item, len(h.buf))
 	for j, it := range h.buf {
-		out[j] = it.data
+		out[j] = it.item
 	}
 	return out
 }
