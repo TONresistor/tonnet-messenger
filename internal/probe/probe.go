@@ -151,40 +151,23 @@ func send(ctx context.Context, w *tonoverlay.ADNLOverlayWrapper, key ed25519.Pri
 }
 
 func printFrame(data tl.Serializable, localRoom string) {
-	var b broadcast.Broadcast
-	switch v := data.(type) {
-	case broadcast.Broadcast:
-		b = v
-	case *broadcast.Broadcast:
-		b = *v
-	default:
-		log.Printf("recv (non-chat %T)", data)
+	frame, err := broadcast.VerifyFrame(data, broadcast.VerifyFrameOptions{
+		Room:           localRoom,
+		CheckFreshness: false,
+	})
+	if err != nil {
+		log.Printf("recv invalid (%T): %v", data, err)
 		return
 	}
+	b := frame.Broadcast
+	env := frame.Envelope
 	wrapper := "wrapper ok"
-	if err := b.Verify(); err != nil {
-		wrapper = "WRAPPER-BAD-SIG"
-	} else if !broadcast.Fresh(b.Date, time.Now()) {
+	if !broadcast.Fresh(b.Date, time.Now()) {
 		wrapper = "wrapper stale (history)"
 	}
-	env, err := envelope.Unmarshal(b.Data)
-	if err != nil {
-		log.Printf("recv raw (%s): %s", wrapper, string(b.Data))
-		return
-	}
-	verified := "unsigned"
-	if env.Key != "" {
-		switch {
-		case env.Verify() != nil:
-			verified = "BAD-SIG"
-		case env.Room != "" && env.Room != localRoom:
-			verified = "WRONG-ROOM " + env.Room
-		default:
-			verified = "verified " + env.Fingerprint()
-			if addr, err := tonproof.Verify(env, time.Now()); err == nil {
-				verified = "wallet " + tonproof.Short(addr)
-			}
-		}
+	verified := "verified " + env.Fingerprint()
+	if addr, err := tonproof.Verify(env, time.Now()); err == nil {
+		verified = "wallet " + tonproof.Short(addr)
 	}
 	log.Printf("recv [%s] <%s> %s (%s, %s)", env.Type, env.Nick, env.Text, verified, wrapper)
 }

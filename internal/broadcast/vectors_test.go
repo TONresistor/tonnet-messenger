@@ -11,6 +11,8 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
+
+	"github.com/TONresistor/tonnet-messenger/internal/envelope"
 )
 
 type vectors struct {
@@ -20,7 +22,7 @@ type vectors struct {
 	OwnerSeed     string `json:"ownerSeed"`
 	OwnerPub      string `json:"ownerPub"`
 	OverlayID     string `json:"overlayId"`
-	Data          string `json:"data"`
+	DataHex       string `json:"dataHex"`
 	Date          int64  `json:"date"`
 	BroadcastID   string `json:"broadcastId"`
 	Signature     string `json:"signature"`
@@ -53,7 +55,14 @@ func computeVectors(t *testing.T) vectors {
 		overlayID[i] = byte(0x40 + i)
 	}
 
-	data := []byte(`{"type":"msg","nick":"vec","text":"hello v2","ts":1751700000000,"room":"tonnet:vectors"}`)
+	env := envelope.Envelope{Type: "msg", Nick: "vec", Text: "hello v4", TS: 1751700000000, Room: "tonnet:vectors"}
+	if err := env.Sign(priv); err != nil {
+		t.Fatal(err)
+	}
+	data, err := env.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
 	var date int64 = 1751700000
 	var expireAt uint32 = 1783236000
 	var maxSize uint32 = 4096
@@ -108,7 +117,7 @@ func computeVectors(t *testing.T) vectors {
 		OwnerSeed:     hex.EncodeToString(ownerSeed),
 		OwnerPub:      hex.EncodeToString(ownerPub),
 		OverlayID:     hex.EncodeToString(overlayID),
-		Data:          string(data),
+		DataHex:       hex.EncodeToString(data),
 		Date:          date,
 		BroadcastID:   hex.EncodeToString(id),
 		Signature:     hex.EncodeToString(plain.Signature),
@@ -165,5 +174,18 @@ func TestVectors(t *testing.T) {
 	}
 	if err := pb.Verify(); err != nil {
 		t.Fatalf("golden broadcast must verify: %v", err)
+	}
+	if hex.EncodeToString(pb.Data) != want.DataHex {
+		t.Fatal("golden broadcast data does not match dataHex")
+	}
+	if len(pb.Data) == 0 || pb.Data[0] == '{' {
+		t.Fatal("golden broadcast data must be boxed TL, not JSON")
+	}
+	frame, err := VerifyFrame(pb, VerifyFrameOptions{Room: "tonnet:vectors", CheckFreshness: false})
+	if err != nil {
+		t.Fatalf("golden broadcast frame must verify: %v", err)
+	}
+	if frame.Envelope.Text != "hello v4" {
+		t.Fatalf("unexpected golden envelope text: %q", frame.Envelope.Text)
 	}
 }

@@ -137,6 +137,40 @@ func TestAdmitAcceptsProvenAndDedups(t *testing.T) {
 	}
 }
 
+func TestAdmitConcurrentDuplicateSingleAccept(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	dev, wallet := genKey(t), genKey(t)
+	env := provenEnvelope(t, dev, wallet, "tonnet:test", "msg", "hi", "")
+	b := wrap(t, dev, nil, env, time.Now().Unix())
+	p := leafPeer(n, "leafA")
+
+	const workers = 32
+	start := make(chan struct{})
+	results := make(chan bool, workers)
+	now := time.Now()
+	for i := 0; i < workers; i++ {
+		go func() {
+			<-start
+			_, _, ok := n.admit(p, b, now)
+			results <- ok
+		}()
+	}
+	close(start)
+
+	accepted := 0
+	for i := 0; i < workers; i++ {
+		if <-results {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("exactly one concurrent duplicate must be accepted, got %d", accepted)
+	}
+	if len(n.room.Recent()) != 1 {
+		t.Fatal("concurrent duplicates must store one history item")
+	}
+}
+
 func TestAdmitRejectsStaleAndFutureDates(t *testing.T) {
 	n := newTestNode(t, "tonnet:test")
 	dev, wallet := genKey(t), genKey(t)

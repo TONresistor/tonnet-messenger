@@ -12,23 +12,22 @@ import (
 )
 
 type vectors struct {
-	DeviceSeed            string            `json:"deviceSeed"`
-	WalletSeed            string            `json:"walletSeed"`
-	DevicePub             string            `json:"devicePub"`
-	WalletPub             string            `json:"walletPub"`
-	WalletAddressRaw      string            `json:"walletAddressRaw"`
-	WalletAddressFriendly string            `json:"walletAddressFriendly"`
-	WalletAddressShort    string            `json:"walletAddressShort"`
-	TonproofDomain        string            `json:"tonproofDomain"`
-	WTS                   int64             `json:"wts"`
-	WExp                  int64             `json:"wexp"`
-	ProofPayload          string            `json:"proofPayload"`
-	ProofDigest           string            `json:"proofDigest"`
-	WSig                  string            `json:"wsig"`
-	V1                    envelope.Envelope `json:"v1"`
-	V2NoProof             envelope.Envelope `json:"v2NoProof"`
-	V2Proof               envelope.Envelope `json:"v2Proof"`
-	V3Dm                  envelope.Envelope `json:"v3Dm"`
+	DeviceSeed            string `json:"deviceSeed"`
+	WalletSeed            string `json:"walletSeed"`
+	DevicePub             string `json:"devicePub"`
+	WalletPub             string `json:"walletPub"`
+	WalletAddressRaw      string `json:"walletAddressRaw"`
+	WalletAddressFriendly string `json:"walletAddressFriendly"`
+	WalletAddressShort    string `json:"walletAddressShort"`
+	TonproofDomain        string `json:"tonproofDomain"`
+	WTS                   int64  `json:"wts"`
+	WExp                  int64  `json:"wexp"`
+	ProofPayload          string `json:"proofPayload"`
+	ProofDigest           string `json:"proofDigest"`
+	WSig                  string `json:"wsig"`
+	EnvelopeDomain        string `json:"envelopeDomain"`
+	DmPeerPub             string `json:"dmPeerPub"`
+	DmBox                 string `json:"dmBox"`
 }
 
 func loadVectors(t *testing.T) vectors {
@@ -94,51 +93,72 @@ func TestCrossLanguageVectors(t *testing.T) {
 	if got := hex.EncodeToString(ed25519.Sign(wpriv, digest)); got != v.WSig {
 		t.Fatalf("wsig mismatch: %s", got)
 	}
+	if got := envelope.DomainTag(); got != v.EnvelopeDomain {
+		t.Fatalf("envelope domain mismatch: %s vs %s", got, v.EnvelopeDomain)
+	}
 
-	for name, env := range map[string]envelope.Envelope{"v1": v.V1, "v2NoProof": v.V2NoProof, "v2Proof": v.V2Proof, "v3Dm": v.V3Dm} {
+	makeEnv := func(typ, nick, text, to string, proof bool) envelope.Envelope {
+		t.Helper()
+		env := envelope.Envelope{
+			Type: typ,
+			Nick: nick,
+			Text: text,
+			TS:   v.WTS * 1000,
+			Room: "tonnet:groupchat",
+			To:   to,
+		}
+		if proof {
+			env.WKey = v.WalletPub
+			env.WSig = v.WSig
+			env.WTS = v.WTS
+			env.WExp = v.WExp
+		}
+		if err := env.Sign(device); err != nil {
+			t.Fatal(err)
+		}
+		return env
+	}
+
+	v4NoProof := makeEnv("msg", "alice", "hi", "", false)
+	v4Proof := makeEnv("msg", v.WalletAddressShort, "hi", "", true)
+	v4Dm := makeEnv("dm", v.WalletAddressShort, v.DmBox, v.DmPeerPub, true)
+
+	for name, env := range map[string]envelope.Envelope{"v4NoProof": v4NoProof, "v4Proof": v4Proof, "v4Dm": v4Dm} {
 		if err := env.Verify(); err != nil {
 			t.Fatalf("%s verify: %v", name, err)
 		}
 	}
 
-	redirected := v.V3Dm
+	raw, err := v4Proof.Marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := envelope.Unmarshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := parsed.Verify(); err != nil {
+		t.Fatalf("v4Proof TL round-trip verify: %v", err)
+	}
+
+	redirected := v4Dm
 	redirected.To = hex.EncodeToString(make([]byte, ed25519.PublicKeySize))
 	if err := redirected.Verify(); err == nil {
-		t.Fatal("redirected v3Dm verified as valid")
+		t.Fatal("redirected v4Dm verified as valid")
 	}
 
-	resign := v.V1
+	resign := v4Proof
 	resign.Key = ""
 	resign.Sig = ""
 	if err := resign.Sign(device); err != nil {
 		t.Fatal(err)
 	}
-	if resign.Sig != v.V1.Sig {
-		t.Fatalf("v1 sig mismatch: %s", resign.Sig)
-	}
-
-	resign = v.V2Proof
-	resign.Key = ""
-	resign.Sig = ""
-	if err := resign.Sign(device); err != nil {
-		t.Fatal(err)
-	}
-	if resign.Sig != v.V2Proof.Sig {
-		t.Fatalf("v2Proof sig mismatch: %s", resign.Sig)
-	}
-
-	resign = v.V3Dm
-	resign.Key = ""
-	resign.Sig = ""
-	if err := resign.Sign(device); err != nil {
-		t.Fatal(err)
-	}
-	if resign.Sig != v.V3Dm.Sig {
-		t.Fatalf("v3Dm sig mismatch: %s", resign.Sig)
+	if resign.Sig != v4Proof.Sig {
+		t.Fatalf("v4Proof resign mismatch: %s", resign.Sig)
 	}
 
 	now := time.Unix(v.WTS+100, 0)
-	got, err := Verify(v.V2Proof, now)
+	got, err := Verify(v4Proof, now)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -69,3 +69,33 @@ func TestDedupConcurrentSingleWinner(t *testing.T) {
 		t.Fatalf("exactly one goroutine must see the hash as new, got %d", newCount)
 	}
 }
+
+func TestDedupReserveCommitRelease(t *testing.T) {
+	d := NewDedup(2)
+	id := h(9)
+
+	if !d.Reserve(id) {
+		t.Fatal("first reserve should win")
+	}
+	if d.Reserve(id) {
+		t.Fatal("pending id must block duplicate reserves")
+	}
+	if d.Contains(id) {
+		t.Fatal("pending id must not be marked delivered")
+	}
+
+	d.Release(id)
+	if !d.Reserve(id) {
+		t.Fatal("released id should be reservable again")
+	}
+	d.Commit(id)
+	if !d.Contains(id) {
+		t.Fatal("committed id must be delivered")
+	}
+	if d.Reserve(id) {
+		t.Fatal("committed id must not be reservable")
+	}
+	if !d.Seen(id) {
+		t.Fatal("committed id must dedup")
+	}
+}

@@ -3,7 +3,6 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
-	"encoding/hex"
 	"log"
 	"time"
 
@@ -70,7 +69,7 @@ func (n *Node) admit(p *peer, data tl.Serializable, now time.Time) (envelope.Env
 	var zeroEnv envelope.Envelope
 	var zeroB broadcast.Broadcast
 
-	b, ok := asBroadcast(data)
+	b, ok := broadcast.AsBroadcast(data)
 	if !ok {
 		return zeroEnv, zeroB, false
 	}
@@ -86,33 +85,34 @@ func (n *Node) admit(p *peer, data tl.Serializable, now time.Time) (envelope.Env
 	}
 	id, err := b.ID()
 	if err != nil {
-		return zeroEnv, zeroB, false
-	}
-	if n.dedup.Contains(id) {
-		return zeroEnv, zeroB, false
-	}
-	if err := b.Verify(); err != nil {
 		n.punish(p, now)
 		return zeroEnv, zeroB, false
 	}
-	env, err := envelope.Unmarshal(b.Data)
+	if !n.dedup.Reserve(id) {
+		return zeroEnv, zeroB, false
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			n.dedup.Release(id)
+		}
+	}()
+
+	frame, err := broadcast.VerifyFrameObject(b, raw, broadcast.VerifyFrameOptions{
+		Room:           n.name.Full,
+		Now:            now,
+		CheckFreshness: true,
+		MaxSize:        broadcast.MaxSize,
+	})
 	if err != nil {
+		if broadcast.ShouldPenalizeFrameError(err) {
+			n.punish(p, now)
+		}
 		return zeroEnv, zeroB, false
 	}
-	src, err := b.SourceKey()
-	if err != nil {
-		return zeroEnv, zeroB, false
-	}
-	if env.Key != hex.EncodeToString(src) {
-		n.punish(p, now)
-		return zeroEnv, zeroB, false
-	}
-	if env.Verify() != nil {
-		return zeroEnv, zeroB, false
-	}
-	if env.Room != n.name.Full {
-		return zeroEnv, zeroB, false
-	}
+	env := frame.Envelope
+	src := frame.Source
+
 	if n.name.Mode == room.ModeGated {
 		if env.Type == "cert-req" {
 			if len(raw) > broadcast.MaxCertReqSize || !n.uncertified.allow() {
@@ -126,7 +126,8 @@ func (n *Node) admit(p *peer, data tl.Serializable, now time.Time) (envelope.Env
 		return zeroEnv, zeroB, false
 	}
 
-	n.dedup.Seen(id)
+	n.dedup.Commit(id)
+	committed = true
 	n.room.ObserveAccepted(env, b)
 	if p.kind == kindLeaf {
 		n.devices.bind(env.Key, p.id, now)
@@ -230,16 +231,6 @@ func (n *Node) replayHistory(p *peer, key string) {
 			cancel()
 		}
 	}()
-}
-
-func asBroadcast(data tl.Serializable) (broadcast.Broadcast, bool) {
-	switch v := data.(type) {
-	case broadcast.Broadcast:
-		return v, true
-	case *broadcast.Broadcast:
-		return *v, true
-	}
-	return broadcast.Broadcast{}, false
 }
 
 func short(id string) string {

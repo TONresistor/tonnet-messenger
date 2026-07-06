@@ -6,7 +6,7 @@
 
 **Serverless group chat on the TON network layer.**
 
-Every chat room is a peer-to-peer overlay mesh. Nodes find each other through the TON DHT, flood messages between them, and clients join through any node. No hub, no database, no accounts: identity is the sender's TON wallet.
+Every chat room is a peer-to-peer overlay mesh. Nodes find each other through the TON DHT, flood messages between them, and clients join through any node. No hub, no database, no accounts: authenticity comes from signed device keys, with optional TON wallet attribution.
 
 > [!WARNING]
 > **Experimental, for testing only.** This is a research prototype, not a
@@ -21,7 +21,7 @@ Every chat room is a peer-to-peer overlay mesh. Nodes find each other through th
 
 - **No server.** A room is a self-healing mesh: any node can die, the room survives, clients reconnect to another node.
 - **One binary, one command.** Hosting a room and relaying it are the same thing: `tonnet serve --room NAME`.
-- **Wallet identity.** Every message is signed by an ed25519 device key endorsed by the sender's TON wallet (ton_proof). Nodes verify both signatures offline and relay only wallet-proven messages.
+- **Signed messages.** Every message is signed by an ed25519 device key; clients can add a TON Connect ton_proof to attribute that device to a wallet without making the mesh blockchain-dependent.
 - **Native TON stack.** ADNL transport, DHT discovery, overlay broadcast flooding. Point a `.ton` record at a node's ADNL id to name it.
 
 ## Install
@@ -80,9 +80,9 @@ tonnet keygen                create a node identity key
 
 ## How it works
 
-**Mesh.** Each node publishes itself to the TON DHT under the room's overlay id, looks up the other nodes of the same room, and peers with them over ADNL. Gossip keeps the neighbour set fresh. A message seen for the first time (dedup by content hash) is re-gossiped exactly once to every other peer and client: an epidemic flood with no hub.
+**Mesh.** Each node publishes itself to the TON DHT under the room's overlay id, looks up the other nodes of the same room, and peers with them over ADNL. Gossip keeps the neighbour set fresh. A message seen for the first time (dedup by signed broadcast id) is re-gossiped exactly once to every other peer and client: an epidemic flood with no hub.
 
-**Identity.** Messages carry two signatures that every node verifies offline, with zero blockchain reads: an ed25519 device-key signature over a domain-separated digest, and a TON Connect ton_proof binding that device key to the sender's wallet. Anything unsigned, forged or unproven is dropped: never relayed, never stored. Rooms are public and readable by design; signatures provide authenticity, not secrecy.
+**Identity.** Messages always carry two device-level checks that every node verifies offline: the ADNL overlay broadcast signature and an ed25519 device-key signature over the TL envelope. A TON Connect ton_proof can additionally bind that device key to the sender's wallet for display attribution. Anything unsigned, forged, cross-room, or malformed is dropped: never relayed, never stored. Rooms are public and readable by design; signatures provide authenticity, not secrecy.
 
 ## Deploy
 

@@ -23,7 +23,7 @@ func testKey(t *testing.T) ed25519.PrivateKey {
 
 func TestSignVerifyRoundtrip(t *testing.T) {
 	priv := testKey(t)
-	b, err := Sign(priv, nil, []byte(`{"type":"msg"}`), 1751700000)
+	b, err := Sign(priv, nil, []byte("payload"), 1751700000)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,11 +1,11 @@
 # Tonnet chat protocol
 
-**Spec version:** 0.2
+**Spec version:** 0.3
 **Status:** implemented and deployed. The Go node in this repository is the
-normative implementation; the TypeScript client (`tonnet-browser/src/main/chat`)
-is held byte-identical to it by the cross-language test vectors in
+normative implementation. Cross-language fixtures in
 `internal/broadcast/testdata/vectors.json`,
-`internal/tonproof/testdata/vectors.json`, and `internal/dm/testdata/vectors.json`.
+`internal/tonproof/testdata/vectors.json`, and `internal/dm/testdata/vectors.json`
+cover the wire broadcast envelope, TON proof attribution, and DM crypto.
 
 **Product scope:** the product is open rooms plus direct messages, on a
 blockchain-agnostic core: authorship is a device ed25519 key, and a TON wallet is
@@ -48,16 +48,16 @@ lowercase.
 ## 2. Design rationale
 
 The protocol floods signed messages over a TON overlay and lets each node dedup
-by content, rather than using the library's FEC broadcasts (which hand the
-receiver a decoded payload without the signed wire parts, so re-gossiping would
-re-originate under the relayer's key and defeat dedup). The signed-broadcast
-model closes the gaps of an earlier unsigned-flood draft:
+by signed broadcast id, rather than using the library's FEC broadcasts (which
+hand the receiver a decoded payload without the signed wire parts, so
+re-gossiping would re-originate under the relayer's key and defeat dedup). The
+signed-broadcast model closes the gaps of an earlier unsigned-flood draft:
 
 | Concern | Mechanism | Section |
 |---|---|---|
 | Bounded replay | signed `date`, +/-60 s freshness, dedup set larger than the window | 5 |
 | Authorship without a blockchain | device ed25519 signature over content | 7 |
-| Optional wallet attribution | ton_proof outside the signed digest, never required | 8 |
+| Optional wallet attribution | ton_proof inside the device-signed envelope, never required | 8 |
 | DM confidentiality and delivery | x25519 + AES-256-GCM, routed to the recipient's node | 11 |
 | Explicit wire version | TL constructor per format | 17 |
 | Cross-room injection | node enforces `envelope.room == room` | 12 |
@@ -119,7 +119,7 @@ Fields:
   otherwise (any certificate in an open room is ignored).
 - `flags`: MUST be `0`. Receivers MUST drop broadcasts with unknown flag bits.
   Reserved as the capability space.
-- `data`: the UTF-8 JSON envelope (section 6).
+- `data`: the boxed TL envelope `tonnet.envelopeV4` (section 6).
 - `date`: unix seconds at origination, set by the sender.
 - `signature`: by the device key over the id and date:
 
@@ -151,11 +151,14 @@ SHOULD calibrate their clock against their node via `tonnet.getTime` (section 16
 and apply the offset to `date`.
 
 **Dedup.** A node keeps a delivered set of the last 8192 `broadcast_id`s and MUST
-drop any broadcast already present. An id enters the set only when its broadcast
-is accepted (section 12, step 11), not on first sight, so a rejected copy cannot
-poison the id of a valid broadcast. Design invariant: the dedup memory MUST cover
-more traffic than can arrive within the freshness window; at the accept ceiling
-(section 13), 8192 ids exceed two full windows.
+drop any broadcast already present. Verification is guarded by an atomic
+reservation: a node reserves a fresh id before expensive cryptography, releases it
+if validation fails, and commits it only after acceptance (section 12, step 11).
+This prevents concurrent duplicate acceptance while preserving the rule that a
+rejected copy cannot permanently poison the id of a valid broadcast. Design
+invariant: the dedup memory MUST cover more traffic than can arrive within the
+freshness window; at the accept ceiling (section 13), 8192 ids exceed two full
+windows.
 
 `broadcast_id` covers `(src, data_hash, flags)` but not `date`, so a resend with
 a bumped date dedups naturally while the id is remembered. Nodes SHOULD also
@@ -165,64 +168,81 @@ retain the last 128 full wrappers to answer pull-repair queries (section 16).
 
 ## 6. The envelope
 
-A UTF-8 JSON object:
+The envelope is a boxed TL object carried in `tonnet.broadcast.data`:
 
-```jsonc
-{
-  "type": "msg" | "hello" | "dm" | "",   // "" is treated as "msg"
-  "nick": "string",     // advisory display name (section 15)
-  "text": "string",     // body, or base64(box) for a dm (section 11)
-  "ts":   1719900000000,// client timestamp, milliseconds, advisory
-  "room": "tonnet:groupchat",            // full room name, required on the wire
-  "to":   "hex",        // recipient device pubkey, addressed types only
-  "key":  "hex",        // sender device ed25519 public key (32 bytes)
-  "sig":  "hex",        // ed25519 signature of the digest (section 7)
-  "wkey": "hex",        // wallet public key (32 bytes), optional
-  "wsig": "hex",        // wallet ton_proof signature (64 bytes), optional
-  "wts":  1719900000,   // proof issued-at, seconds, optional
-  "wexp": 1722492000    // proof expiry, seconds, optional
-}
 ```
+tonnet.envelopeV4 type:string nick:string text:string ts:long
+                 room:string to:string key:int256
+                 wkey:int256 wsig:bytes wts:long wexp:long
+                 sig:bytes = tonnet.Envelope;
+
+tonnet.envelopeV4.toSign type:string nick:string text:string ts:long
+                        room:string to:string key:int256
+                        wkey:int256 wsig:bytes wts:long wexp:long
+                        = tonnet.EnvelopeToSign;
+```
+
+Fields:
+
+- `type`: `msg`, `hello`, `dm`, `cert-req`, `cert-grant`, or empty
+  (empty is treated as `msg`).
+- `nick`: advisory display name (section 15).
+- `text`: body, or base64(box) for a dm (section 11).
+- `ts`: client timestamp in milliseconds, advisory.
+- `room`: full room name, required and byte-equal to the node's room.
+- `to`: recipient device pubkey as lowercase 32-byte hex for addressed types, or
+  empty.
+- `key`: sender device ed25519 public key, raw 32 bytes.
+- `sig`: ed25519 signature, 64 bytes, over section 7's digest.
+- `wkey/wsig/wts/wexp`: optional wallet attribution proof (section 8). On the TL
+  wire, absence is encoded as `wkey = 32 zero bytes`, `wsig = empty bytes`,
+  `wts = 0`, `wexp = 0`.
 
 Field groups:
 
 - Device signature (`key`, `sig`): present on every message.
 - Wallet proof (`wkey`, `wsig`, `wts`, `wexp`): optional attribution (section 8).
   All four present together or all absent; any partial set is malformed.
-- Routing (`room`, `to`): `to` requires `room`.
+- Routing (`room`, `to`): `room` is mandatory; non-empty `to` MUST be a lowercase
+  32-byte hex key.
 
-Envelope v1 (no `room`) is obsolete: it cannot satisfy the room-match rule and
-MUST be rejected. Only v2 (room) and v3 (room and `to`) envelopes are valid on
-the wire. The `room` field MUST equal the node's full room name exactly.
+Strict byte limits before signature verification:
+
+| Field | Limit |
+|---|---:|
+| `type` | 16 B |
+| `nick` | 64 B |
+| `text` | 2048 B |
+| `room` | 256 B, visible ASCII |
+| `to` | 64 B |
+
+JSON envelopes and envelope v1/v2/v3 are obsolete and MUST be rejected on the
+wire. The `room` field MUST equal the node's full room name exactly.
 
 ---
 
 ## 7. Device signature
 
-The device key signs a domain-separated, length-prefixed digest over content and
-routing only, never over any wallet field. Each field is encoded as
-`field(x) = u32be(len(x)) ‖ x`; the digest is the sha256 of the concatenation;
-`sig = ed25519_sign(deviceKey, digest)` (`internal/envelope/envelope.go`). `ts`
-is its base-10 ASCII decimal; `pub` is the raw 32-byte device public key.
+The device key signs the SHA-256 of the boxed TL `tonnet.envelopeV4.toSign`
+object:
 
 ```
-v1 (no room):      tag="tonnet-envelope-v1"  fields: type, nick, text, ts, pub
-v2 (room, no to):  tag="tonnet-envelope-v2"  fields: type, nick, text, ts, room, pub
-v3 (room and to):  tag="tonnet-envelope-v3"  fields: type, nick, text, ts, room, to, pub
+digest = sha256( TL( tonnet.envelopeV4.toSign{
+  type, nick, text, ts, room, to, key, wkey, wsig, wts, wexp
+} ) )
+
+sig = ed25519_sign(deviceKey, digest)
 ```
 
-`room` in the digest closes cross-room replay; `to` binds a dm to its recipient.
-This is the sole authenticator of authorship. The v1 digest is defined only for
-verifying stored or legacy material and is not valid on the wire.
+The constructor id is the domain separator. `room` closes cross-room replay; `to`
+binds a dm to its recipient; `wkey/wsig/wts/wexp` are inside the device digest so
+wallet proofs cannot be grafted onto or stripped from an authored message.
 
-**Integrity invariant (C1).** The device digest does not cover the wallet fields,
-so the broadcast wrapper signature (section 4) is the only device attestation
-over `wkey/wsig/wts/wexp`: it signs `sha256(data)` over the whole envelope, and
-the node pins `src == envelope.key`. Every consumer (node, client, any future
-store) MUST verify the wrapper with `src == envelope.key` before reading any
-wallet field. Trusting a bare `envelope.Verify()`-only envelope is forbidden: it
-would let a valid third-party proof be grafted onto, or stripped from, an
-authored message.
+**Integrity invariant (C1).** Every consumer of a wire frame MUST use the common
+frame verifier: wrapper signature, `src == envelope.key`, envelope signature, and
+room match must all pass before wallet fields are used for attribution. A bare
+`envelope.Verify()` is now safe against wallet-proof grafting, but it is not a
+network-liveness proof and does not replace wrapper verification.
 
 ---
 
@@ -292,9 +312,9 @@ product scope. The remainder of this document describes open rooms.
 
 | type | envelope | stored | addressed | notes |
 |---|---|---|---|---|
-| `msg` / `""` | v2 | yes | no | room message |
-| `hello` | v2 | no | no | presence, triggers history replay |
-| `dm` | v3 | yes (ciphertext) | yes | E2E box (section 11) |
+| `msg` / `""` | v4 | yes | no | room message |
+| `hello` | v4 | no | no | presence, triggers history replay |
+| `dm` | v4 | yes (ciphertext) | yes | E2E box (section 11) |
 
 Addressed types carry `to` and follow the routing rule of section 11; all other
 types flood. The `nick` field is advisory; verifiers never trust it for identity,
@@ -306,7 +326,7 @@ define `cert-req` / `cert-grant`, dormant per section 9.
 ## 11. Direct messages
 
 A dm rides the same room overlay (leaves are NAT-bound and cannot open a direct
-channel). It is a v3 envelope with `type="dm"`, `to` = the recipient's device
+channel). It is a v4 envelope with `type="dm"`, `to` = the recipient's device
 public key, `text` = base64 of the sealed box, signed like any message.
 
 Encryption (`internal/dm/dm.go`):
@@ -360,14 +380,16 @@ cheap checks before cryptography:
 3. **Parse**: `tonnet.broadcast` only. Anything else is dropped; there is no
    legacy wire path.
 4. **Freshness**: `|now - date| <= 60 s`, else drop.
-5. **Dedup**: `broadcast_id ∈ delivered set` drops. The id is inserted at step
-   11, not here.
-6. **Broadcast signature**: verify `signature` by `src` over
-   `tonnet.broadcast.toSign{broadcast_id, date}`, then parse the envelope and
-   require `envelope.key == src`. Fail drops and applies the signature penalty
-   (section 13).
-7. **Envelope**: `envelope.Verify()` (device signature over the v2/v3 digest) and
-   `envelope.room ==` this node's full room name. Fail drops.
+5. **Dedup reservation**: `broadcast_id ∈ delivered set` or pending reservations
+   drops. Otherwise reserve the id. If any later validation step fails, release
+   the reservation; only step 11 commits it to the delivered set.
+6. **Frame verification**: use the common frame verifier:
+   `tonnet.broadcast.toSign{broadcast_id, date}` signature by `src`, parse boxed
+   TL `tonnet.envelopeV4`, require `envelope.key == src`, verify the envelope
+   device signature, and require `envelope.room ==` this node's full room name.
+   Wrapper signature/source failures apply the signature penalty (section 13).
+7. **Envelope policy**: field limits and malformed partial wallet proofs fail
+   inside frame verification. JSON or legacy v1/v2/v3 envelopes are dropped.
 8. **Attribution**: none. The node does not verify ton_proof (section 8).
 9. **Authorization (gated rooms only)**: `cert-req` is accepted uncertified
    within the uncertified budget (section 13) and only if <= 2048 bytes; anything
@@ -376,17 +398,17 @@ cheap checks before cryptography:
 10. **Per-source rate limit**: charge the device key's budget (section 13); over
     budget drops.
 11. **Observe**: presence mark; history add for storable types (store the
-    original wrapper bytes); insert `broadcast_id` into the delivered set.
-12. **Relay**: forward the original received bytes, never re-serialize or
-    re-originate. Flood types go to all member leaves and to at most 5 node-peers
-    (random when more are connected); addressed types follow section 11.
+    accepted wrapper); commit `broadcast_id` into the delivered set.
+12. **Relay**: forward the accepted wrapper without re-signing or re-originating.
+    Flood types go to all member leaves and to at most 5 node-peers (random when
+    more are connected); addressed types follow section 11.
 13. **Replay-on-join**: on leaf membership or `hello`, replay recent history to
     that leaf only, filtered per section 11.
 
-Relaying the original signed bytes is what makes multi-hop dedup work: every hop
-sees the same `broadcast_id` because the origin signature, source, and date are
-preserved. This resolves the re-origination problem that ruled out the library's
-FEC path.
+Relaying the accepted signed wrapper is what makes multi-hop dedup work: every hop
+sees the same `broadcast_id` because the origin data, signature, source, and date
+are preserved. This resolves the re-origination problem that ruled out the
+library's FEC path.
 
 ---
 
@@ -412,7 +434,7 @@ members into one bucket.
 
 Storable types (`msg`, `dm`) enter an in-memory ring, capped at 200 messages and
 6 hours (`internal/room/history.go`); `hello` is not stored. History stores the
-original wrapper bytes so replayed items stay fully verifiable. On a member join
+accepted wrapper so replayed items stay fully verifiable. On a member join
 or `hello`, the node replays the recent buffer to that leaf only (leaf-only, to
 avoid node-to-node amplification), filtered per-leaf for addressed types (section
 11). Replay recipients MUST NOT apply the freshness check to replayed items; all
@@ -440,11 +462,11 @@ shown as a tier (precedence `domain` > `wallet` > `device`):
   resolves to the proof wallet. Show the `.ton`; primary check.
 
 A present-but-invalid or expired proof degrades to device, never drops. Clients
-MUST verify the wrapper (broadcast signature, `src == envelope.key`, room match)
-before reading any wallet field (invariant C1, section 7). Only messages failing
-the device signature, the wrapper, or the room match are dropped. Clients treat
-`date` as informational and trust their node for liveness only, never for
-authenticity or authorization.
+MUST run the common frame verifier (broadcast signature, `src == envelope.key`,
+TL envelope signature, room match) before reading any wallet field (invariant C1,
+section 7). Only messages failing the device signature, the wrapper, or the room
+match are dropped. Clients treat `date` as informational and trust their node for
+liveness only, never for authenticity or authorization.
 
 ---
 
@@ -469,10 +491,11 @@ tonnet.broadcastNotFound = tonnet.Broadcast;
 
 Versioning is by TL constructor: a new wire format is a new constructor, and
 receivers dispatch on the constructor id. `flags` (always 0) is the
-intra-constructor capability space; the envelope keeps its own version via domain
-tags (v2/v3). Nodes speak only `tonnet.broadcast` and reject any legacy framing.
-Clients upgrade together with their node. A future wire format will be announced
-as deprecated one revision before removal.
+intra-constructor capability space; the envelope version is the constructor
+`tonnet.envelopeV4`. Nodes speak only `tonnet.broadcast` carrying
+`tonnet.envelopeV4` and reject JSON or legacy envelope framing. Clients upgrade
+together with their node. A future wire format will be announced as deprecated one
+revision before removal.
 
 ---
 
@@ -481,6 +504,8 @@ as deprecated one revision before removal.
 | Constant | Value |
 |---|---|
 | max broadcast size | 4096 B |
+| envelope wire format | boxed TL `tonnet.envelopeV4` |
+| envelope field limits | `type` 16 B; `nick` 64 B; `text` 2048 B; `room` 256 B; `to` 64 B |
 | freshness window | +/-60 s |
 | delivered set (dedup) | 8192 broadcast ids |
 | wrapper store (pull-repair) | 128 |
