@@ -347,13 +347,14 @@ when a broadcast is accepted and the delivering peer is a leaf, bind
 `envelope.key -> that leaf`. Leaves never relay, so a broadcast from a leaf
 originated there, proven by the device signature. For an accepted addressed
 broadcast the node delivers to every local leaf whose bound device key equals
-`to`, relays to node-peers (bounded fanout, section 12 step 12), and MUST NOT
-deliver to any other leaf. Other nodes apply the same rule, so the message
-reaches the recipient wherever attached and reaches nobody else's client. If the
-recipient is offline, dm history (ciphertext, section 14) is the best-effort
-delivery path on rejoin. History replay to a joining leaf is filtered per-leaf:
-the node learns the leaf's device key from its first accepted message and MUST
-skip stored `dm` items whose `to` is neither that key nor authored by it.
+`to`, relays to healthy node-peers (bounded fanout, section 12 step 12), and
+MUST NOT deliver to any other leaf. Other nodes apply the same rule, so the
+message reaches the recipient wherever attached and reaches nobody else's
+client. If the recipient is offline, dm history (ciphertext, section 14) is the
+best-effort delivery path on rejoin. History replay to a joining leaf is
+filtered per-leaf: the node learns the leaf's device key from its first accepted
+message and MUST skip stored `dm` items whose `to` is neither that key nor
+authored by it.
 
 Documented residual risk: an attacker who replays a victim's broadcast from its
 own leaf within the freshness window, after the id has been evicted from the
@@ -437,11 +438,13 @@ delivers an accepted broadcast. Quarantined nodes are not relay targets and are
 not advertised to other peers.
 
 Nodes maintain a per-peer bad score. Signature/source failures add a high score;
-rate-limit abuse adds a low score; repeated relay, probe, answer, or keepalive
-failures count as liveness failures. At the eviction threshold the peer is
-removed and the connection is closed. Non-member leaves that remain in
-quarantine past the quarantine TTL are also closed. Node-peers are periodically
-probed with ADNL keepalive so dead connections stop consuming relay slots.
+rate-limit abuse adds a low score; repeated relay, overlay probe, answer, or
+healthy-node keepalive failures count as liveness failures. At the eviction
+threshold the peer is removed and the connection is closed. Non-member leaves
+that remain in quarantine past the quarantine TTL are also closed. Healthy
+node-peers are periodically probed with ADNL keepalive so dead connections stop
+consuming relay slots; quarantined nodes must first pass an overlay liveness
+exchange before they are eligible for keepalive, relay, or advertisement.
 
 ---
 
@@ -529,7 +532,7 @@ revision before removal.
 | per-source rate limit | 30 msgs and 64 KiB per 60 s, LRU 4096 |
 | signature penalty | ignore peer 5 s |
 | peer hygiene | quarantine TTL 90 s; bad score eviction 8; failed liveness eviction 3 |
-| peer keepalive | maintenance 30 s; idle probe 45 s; probe timeout 5 s |
+| peer keepalive | maintenance 30 s; healthy idle probe 45 s; probe timeout 5 s |
 | device-key binding TTL | 90 s |
 | history / presence | 200 msgs / 6 h; presence TTL 90 s |
 | DHT publish / TTL | 5 min / 30 min |
@@ -556,6 +559,7 @@ revision before removal.
   attribution, not protection.
 - **Single device**: identity is per-install; no multi-device linking or
   device-key rotation beyond proof expiry.
+
 ---
 
 ## Appendix A. Correspondence to the TON reference
