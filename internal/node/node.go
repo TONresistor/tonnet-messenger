@@ -102,13 +102,17 @@ func (n *Node) onInbound(peer adnl.Peer) error {
 		return nil
 	}
 	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.room.OverlayID())
-	p, added := n.peers.addInbound(id, w, peer)
-	if p == nil {
-		return fmt.Errorf("leaf capacity reached")
+	if n.peers.has(id) || n.peers.isKnown(id) {
+		p, added := n.peers.addInbound(id, w, peer)
+		if p == nil {
+			return fmt.Errorf("leaf capacity reached")
+		}
+		if added {
+			n.wirePeer(p)
+		}
+		return nil
 	}
-	if added {
-		n.wirePeer(p)
-	}
+	n.wirePeer(newPeer(id, kindLeaf, w, peer, nil))
 	return nil
 }
 

@@ -106,6 +106,10 @@ func leafPeer(n *Node, id string) *peer {
 	return p
 }
 
+func detachedPeer(id string) *peer {
+	return newPeer(id, kindLeaf, nil, nil, nil)
+}
+
 func TestAdmitAcceptsProvenAndDedups(t *testing.T) {
 	n := newTestNode(t, "tonnet:test")
 	dev, wallet := genKey(t), genKey(t)
@@ -431,6 +435,20 @@ func TestInvalidCustomMessageDoesNotPromoteLeaf(t *testing.T) {
 	}
 }
 
+func TestUnknownInboundInvalidCustomIsNotTracked(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	p := detachedPeer("adnlNoise")
+
+	n.handleCustomMessage(p, tl.Raw([]byte{0x01, 0x02}), time.Now())
+
+	if _, ok := n.peers.get("adnlNoise"); ok {
+		t.Fatal("unknown ADNL peer must not be tracked before a valid Tonnet broadcast")
+	}
+	if evicted := n.peers.evictStale(time.Now().Add(peerQuarantineTTL + time.Second)); len(evicted) != 0 {
+		t.Fatalf("untracked ADNL noise must not produce quarantine evictions, got %+v", evicted)
+	}
+}
+
 func TestAcceptedHelloPromotesLeafOutOfQuarantine(t *testing.T) {
 	n := newTestNode(t, "tonnet:test")
 	dev := genKey(t)
@@ -452,6 +470,53 @@ func TestAcceptedHelloPromotesLeafOutOfQuarantine(t *testing.T) {
 	}
 	if got.state != peerHealthy {
 		t.Fatalf("accepted hello must promote leaf, got state=%v", got.state)
+	}
+}
+
+func TestUnknownInboundAcceptedHelloTracksMember(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	dev := genKey(t)
+	env := envelope.Envelope{Type: "hello", Nick: "leaf", TS: time.Now().UnixMilli(), Room: "tonnet:test"}
+	if err := env.Sign(dev); err != nil {
+		t.Fatal(err)
+	}
+	b := wrap(t, dev, nil, env, time.Now().Unix())
+	p := detachedPeer("leafA")
+
+	n.handleCustomMessage(p, b, time.Now())
+
+	got, ok := n.peers.get("leafA")
+	if !ok {
+		t.Fatal("valid Tonnet broadcast must track the inbound peer")
+	}
+	if !got.member || got.state != peerHealthy {
+		t.Fatalf("accepted peer must be a healthy member, got member=%v state=%v", got.member, got.state)
+	}
+	if members, _ := n.peers.counts(); members != 1 {
+		t.Fatalf("accepted peer must count as one member, got %d", members)
+	}
+}
+
+func TestUnknownInboundLeafCapRefusesWithoutCommit(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	n.peers = newPeerTable(1)
+	leafPeer(n, "leafFull")
+	n.peers.markMember("leafFull")
+
+	dev := genKey(t)
+	env := envelope.Envelope{Type: "hello", Nick: "leaf", TS: time.Now().UnixMilli(), Room: "tonnet:test"}
+	if err := env.Sign(dev); err != nil {
+		t.Fatal(err)
+	}
+	b := wrap(t, dev, nil, env, time.Now().Unix())
+
+	n.handleCustomMessage(detachedPeer("leafOverflow"), b, time.Now())
+
+	if _, ok := n.peers.get("leafOverflow"); ok {
+		t.Fatal("overflow leaf must not be tracked")
+	}
+	if len(n.room.Recent()) != 0 {
+		t.Fatal("overflow leaf message must not enter history")
 	}
 }
 

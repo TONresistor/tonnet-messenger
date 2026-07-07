@@ -37,13 +37,16 @@ func (n *Node) wirePeer(p *peer) {
 	})
 
 	p.w.SetDisconnectHandler(func(addr string, _ ed25519.PublicKey) {
-		if n.peers.remove(id) {
+		if n.peers.removePeer(id, p) {
 			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
 		}
 	})
 }
 
 func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time) {
+	if p == nil {
+		return
+	}
 	id := p.id
 	n.peers.markSeen(id, now)
 	if n.penalties.banned(id, now) {
@@ -54,18 +57,29 @@ func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time)
 		return
 	}
 
-	env, b, accepted := n.admit(p, data, now)
-	if accepted {
-		n.peers.markGood(id, now)
-		if n.peers.markAccepted(id, now) {
-			log.Printf("member joined %s… (%s)", short(id), n.countsString())
-			n.replayHistory(p, leafKey(env, accepted))
-		} else if accepted && p.kind == kindLeaf && env.Type == "hello" {
-			n.replayHistory(p, env.Key)
-		}
-
-		n.relayAccepted(id, env, b)
+	adm, accepted := n.prepareAdmission(p, data, now)
+	if !accepted {
+		return
 	}
+	defer n.releaseAdmission(&adm)
+
+	acceptedPeer, joined, ok := n.peers.acceptInbound(p, now)
+	if !ok {
+		n.closePeer(p, "leaf capacity reached")
+		return
+	}
+	n.commitAdmission(acceptedPeer, &adm, now)
+
+	env := adm.frame.Envelope
+	b := adm.frame.Broadcast
+	if joined {
+		log.Printf("member joined %s… (%s)", short(id), n.countsString())
+		n.replayHistory(acceptedPeer, leafKey(env, accepted))
+	} else if acceptedPeer.kind == kindLeaf && env.Type == "hello" {
+		n.replayHistory(acceptedPeer, env.Key)
+	}
+
+	n.relayAccepted(id, env, b)
 }
 
 func leafKey(env envelope.Envelope, accepted bool) string {
@@ -75,38 +89,41 @@ func leafKey(env envelope.Envelope, accepted bool) string {
 	return env.Key
 }
 
+type admission struct {
+	frame     broadcast.Frame
+	committed bool
+}
+
 func (n *Node) admit(p *peer, data tl.Serializable, now time.Time) (envelope.Envelope, broadcast.Broadcast, bool) {
 	var zeroEnv envelope.Envelope
 	var zeroB broadcast.Broadcast
 
-	b, ok := broadcast.AsBroadcast(data)
+	adm, ok := n.prepareAdmission(p, data, now)
 	if !ok {
 		return zeroEnv, zeroB, false
 	}
+	defer n.releaseAdmission(&adm)
+	n.commitAdmission(p, &adm, now)
+	return adm.frame.Envelope, adm.frame.Broadcast, true
+}
+
+func (n *Node) prepareAdmission(p *peer, data tl.Serializable, now time.Time) (admission, bool) {
+	var zero admission
+
+	b, ok := broadcast.AsBroadcast(data)
+	if !ok {
+		return zero, false
+	}
 	if b.Flags != 0 {
-		return zeroEnv, zeroB, false
+		return zero, false
 	}
 	raw, err := tl.Serialize(b, true)
 	if err != nil || len(raw) > broadcast.MaxSize {
-		return zeroEnv, zeroB, false
+		return zero, false
 	}
 	if !broadcast.Fresh(b.Date, now) {
-		return zeroEnv, zeroB, false
+		return zero, false
 	}
-	id, err := b.ID()
-	if err != nil {
-		n.punish(p, now)
-		return zeroEnv, zeroB, false
-	}
-	if !n.dedup.Reserve(id) {
-		return zeroEnv, zeroB, false
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			n.dedup.Release(id)
-		}
-	}()
 
 	frame, err := broadcast.VerifyFrameObject(b, raw, broadcast.VerifyFrameOptions{
 		Room:           n.name.Full,
@@ -118,32 +135,56 @@ func (n *Node) admit(p *peer, data tl.Serializable, now time.Time) (envelope.Env
 		if broadcast.ShouldPenalizeFrameError(err) {
 			n.punish(p, now)
 		}
-		return zeroEnv, zeroB, false
+		return zero, false
 	}
-	env := frame.Envelope
-	src := frame.Source
+	if !n.dedup.Reserve(frame.ID) {
+		return zero, false
+	}
+	adm := admission{frame: frame}
+	owned := false
+	defer func() {
+		if !owned {
+			n.dedup.Release(frame.ID)
+		}
+	}()
 
 	if n.name.Mode == room.ModeGated {
-		if env.Type == "cert-req" {
+		if frame.Envelope.Type == "cert-req" {
 			if len(raw) > broadcast.MaxCertReqSize || !n.uncertified.allow() {
-				return zeroEnv, zeroB, false
+				return zero, false
 			}
-		} else if !n.certOK(b.Certificate, src, uint32(len(raw)), now) {
-			return zeroEnv, zeroB, false
+		} else if !n.certOK(b.Certificate, frame.Source, uint32(len(raw)), now) {
+			return zero, false
 		}
 	}
-	if !n.sources.allow(env.Key, len(raw), now) {
-		return zeroEnv, zeroB, false
+	if !n.sources.allow(frame.Envelope.Key, len(raw), now) {
+		return zero, false
 	}
 
-	n.dedup.Commit(id)
-	committed = true
+	owned = true
+	return adm, true
+}
+
+func (n *Node) releaseAdmission(adm *admission) {
+	if adm == nil || adm.committed {
+		return
+	}
+	n.dedup.Release(adm.frame.ID)
+}
+
+func (n *Node) commitAdmission(p *peer, adm *admission, now time.Time) {
+	if adm == nil || adm.committed {
+		return
+	}
+	n.dedup.Commit(adm.frame.ID)
+	adm.committed = true
+	env := adm.frame.Envelope
+	b := adm.frame.Broadcast
 	n.room.ObserveAccepted(env, b)
-	if p.kind == kindLeaf {
+	if p != nil && p.kind == kindLeaf {
 		n.devices.bind(env.Key, p.id, now)
 	}
-	n.wrappers.put(id, b)
-	return env, b, true
+	n.wrappers.put(adm.frame.ID, b)
 }
 
 func (n *Node) punish(p *peer, now time.Time) {

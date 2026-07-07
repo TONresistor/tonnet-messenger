@@ -104,6 +104,61 @@ func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw 
 	return p, true
 }
 
+func (t *peerTable) has(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	_, ok := t.m[id]
+	return ok
+}
+
+func (t *peerTable) isKnown(id string) bool {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.known[id]
+}
+
+func (t *peerTable) acceptInbound(p *peer, now time.Time) (*peer, bool, bool) {
+	if p == nil {
+		return nil, false, false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if existing, ok := t.m[p.id]; ok {
+		existing.lastSeen = now
+		existing.lastGood = now
+		existing.failures = 0
+		if existing.badScore > 0 {
+			existing.badScore--
+		}
+		if existing.state == peerQuarantine {
+			existing.state = peerHealthy
+		}
+		if existing.kind != kindLeaf || existing.member {
+			return existing, false, true
+		}
+		existing.member = true
+		return existing, true, true
+	}
+	kind := kindLeaf
+	if t.known[p.id] {
+		kind = kindNode
+	}
+	if kind == kindLeaf && t.leafCountLocked() >= t.maxLeaves {
+		return nil, false, false
+	}
+	p.kind = kind
+	p.state = peerHealthy
+	p.lastSeen = now
+	p.lastGood = now
+	p.failures = 0
+	if p.badScore > 0 {
+		p.badScore--
+	}
+	p.member = kind == kindLeaf
+	t.m[p.id] = p
+	return p, p.member, true
+}
+
 func (t *peerTable) get(id string) (*peer, bool) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
@@ -268,10 +323,14 @@ func (t *peerTable) evictStale(now time.Time) []*peer {
 	return out
 }
 
-func (t *peerTable) remove(id string) bool {
+func (t *peerTable) removePeer(id string, target *peer) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.m[id]; !ok {
+	p, ok := t.m[id]
+	if !ok {
+		return false
+	}
+	if target != nil && p != target {
 		return false
 	}
 	delete(t.m, id)
