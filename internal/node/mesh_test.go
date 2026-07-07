@@ -330,6 +330,7 @@ func TestSelectTargetsRoutesAddressedTypes(t *testing.T) {
 	leafPeer(n, "leafB")
 	n.peers.markMember("leafB")
 	n.peers.addNode("nodeC", nil, nil, nil)
+	n.peers.markGood("nodeC", now)
 	n.devices.bind("recipientKey", "leafR", now)
 
 	dm := envelope.Envelope{Type: "dm", To: "recipientKey"}
@@ -357,7 +358,9 @@ func TestSelectTargetsRoutesAddressedTypes(t *testing.T) {
 func TestSelectTargetsBoundsNodeFanout(t *testing.T) {
 	n := newTestNode(t, "tonnet:test")
 	for i := 0; i < 9; i++ {
-		n.peers.addNode(string(rune('a'+i)), nil, nil, nil)
+		id := string(rune('a' + i))
+		n.peers.addNode(id, nil, nil, nil)
+		n.peers.markGood(id, time.Now())
 	}
 	msg := envelope.Envelope{Type: "msg"}
 	if got := len(n.selectTargets("x", msg, time.Now())); got != nodeFanout {
@@ -411,6 +414,118 @@ func TestPeerTableLeafVsNodeCounting(t *testing.T) {
 	}
 	if m, nd := tbl.counts(); m != 1 || nd != 1 {
 		t.Fatalf("want members=1 nodes=1, got members=%d nodes=%d", m, nd)
+	}
+}
+
+func TestInvalidCustomMessageDoesNotPromoteLeaf(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	p := leafPeer(n, "leafBad")
+
+	n.handleCustomMessage(p, tl.Raw([]byte{0x01, 0x02}), time.Now())
+
+	if members, _ := n.peers.counts(); members != 0 {
+		t.Fatalf("invalid custom message must not create a member, got %d", members)
+	}
+	if len(n.room.Recent()) != 0 {
+		t.Fatal("invalid custom message must not enter history")
+	}
+}
+
+func TestAcceptedHelloPromotesLeafOutOfQuarantine(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	dev := genKey(t)
+	env := envelope.Envelope{Type: "hello", Nick: "leaf", TS: time.Now().UnixMilli(), Room: "tonnet:test"}
+	if err := env.Sign(dev); err != nil {
+		t.Fatal(err)
+	}
+	b := wrap(t, dev, nil, env, time.Now().Unix())
+	p := leafPeer(n, "leafA")
+
+	n.handleCustomMessage(p, b, time.Now())
+
+	if members, _ := n.peers.counts(); members != 1 {
+		t.Fatalf("accepted hello must create one member, got %d", members)
+	}
+	got, ok := n.peers.get("leafA")
+	if !ok {
+		t.Fatal("accepted hello must keep leaf in the table")
+	}
+	if got.state != peerHealthy {
+		t.Fatalf("accepted hello must promote leaf, got state=%v", got.state)
+	}
+}
+
+func TestNodeOnlyGoodSignalDoesNotPromoteLeaf(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	leafPeer(n, "leafQ")
+
+	if n.peers.markNodeGood("leafQ", time.Now()) {
+		t.Fatal("node-only liveness must not promote a leaf")
+	}
+	got, ok := n.peers.get("leafQ")
+	if !ok {
+		t.Fatal("leaf must remain in the table")
+	}
+	if got.state != peerQuarantine {
+		t.Fatalf("leaf must remain quarantined, got state=%v", got.state)
+	}
+}
+
+func TestQuarantinedNodeIsNotRelayTarget(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	n.peers.addNode("nodeQ", nil, nil, nil)
+
+	if got := n.selectTargets("leafS", envelope.Envelope{Type: "msg"}, time.Now()); len(got) != 0 {
+		t.Fatalf("quarantined node must not receive relays, got %d targets", len(got))
+	}
+
+	n.peers.markGood("nodeQ", time.Now())
+	if got := n.selectTargets("leafS", envelope.Envelope{Type: "msg"}, time.Now()); len(got) != 1 || got[0].id != "nodeQ" {
+		t.Fatalf("healthy node must receive relays, got %+v", got)
+	}
+}
+
+func TestKeepaliveOnlyTargetsHealthyNodes(t *testing.T) {
+	tbl := newPeerTable(0)
+	now := time.Now()
+	tbl.addNode("nodeQ", nil, nil, nil)
+
+	if got := tbl.nodePeersIdleSince(now.Add(peerKeepaliveIdle+time.Second), peerKeepaliveIdle); len(got) != 0 {
+		t.Fatalf("quarantined node must not be selected for keepalive, got %d", len(got))
+	}
+
+	tbl.markNodeGood("nodeQ", now)
+	got := tbl.nodePeersIdleSince(now.Add(peerKeepaliveIdle+time.Second), peerKeepaliveIdle)
+	if len(got) != 1 || got[0].id != "nodeQ" {
+		t.Fatalf("healthy idle node must be selected for keepalive, got %+v", got)
+	}
+}
+
+func TestPeerBadScoreEvictsRepeatedSignatureFailures(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	p := leafPeer(n, "leafBad")
+	now := time.Now()
+
+	n.punish(p, now)
+	if _, ok := n.peers.get("leafBad"); !ok {
+		t.Fatal("first signature failure should warn, not evict")
+	}
+	n.punish(p, now.Add(time.Second))
+	if _, ok := n.peers.get("leafBad"); ok {
+		t.Fatal("repeated signature failures should evict the peer")
+	}
+}
+
+func TestPeerTableEvictsStaleQuarantineLeaves(t *testing.T) {
+	tbl := newPeerTable(0)
+	tbl.addInbound("silent", nil, nil)
+
+	evicted := tbl.evictStale(time.Now().Add(peerQuarantineTTL + time.Second))
+	if len(evicted) != 1 || evicted[0].id != "silent" {
+		t.Fatalf("stale silent leaf must be evicted, got %+v", evicted)
+	}
+	if _, ok := tbl.get("silent"); ok {
+		t.Fatal("stale leaf must be removed from the table")
 	}
 }
 

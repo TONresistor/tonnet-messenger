@@ -168,6 +168,7 @@ func (n *Node) Run(ctx context.Context) error {
 	go pub.Run(ctx)
 	go n.discoveryLoop(ctx)
 	go n.presenceSweeper(ctx)
+	go n.peerMaintenanceLoop(ctx)
 
 	<-ctx.Done()
 	return ctx.Err()

@@ -23,16 +23,36 @@ const (
 	kindNode
 )
 
+type peerState int
+
+const (
+	peerQuarantine peerState = iota
+	peerHealthy
+	peerBad
+)
+
+const (
+	peerQuarantineTTL = 90 * time.Second
+	peerBadScoreEvict = 8
+	peerMaxFailures   = 3
+)
+
 type peer struct {
-	id       string
-	kind     peerKind
-	w        *tonoverlay.ADNLOverlayWrapper
-	raw      adnl.Peer
-	member   bool
-	replayed bool
-	errs     int
-	signed   *tonoverlay.Node
-	limiter  *tokenBucket
+	id        string
+	kind      peerKind
+	state     peerState
+	w         *tonoverlay.ADNLOverlayWrapper
+	raw       adnl.Peer
+	member    bool
+	replayed  bool
+	errs      int
+	badScore  int
+	failures  int
+	firstSeen time.Time
+	lastSeen  time.Time
+	lastGood  time.Time
+	signed    *tonoverlay.Node
+	limiter   *tokenBucket
 }
 
 type peerTable struct {
@@ -50,10 +70,26 @@ func newPeerTable(maxLeaves int) *peerTable {
 	return &peerTable{maxLeaves: maxLeaves, m: map[string]*peer{}, known: map[string]bool{}}
 }
 
+func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) *peer {
+	now := time.Now()
+	return &peer{
+		id:        id,
+		kind:      kind,
+		state:     peerQuarantine,
+		w:         w,
+		raw:       raw,
+		signed:    signed,
+		firstSeen: now,
+		lastSeen:  now,
+		limiter:   newTokenBucket(perPeerBurst, perPeerRefillRate),
+	}
+}
+
 func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) (*peer, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
+		p.lastSeen = time.Now()
 		return p, false
 	}
 	kind := kindLeaf
@@ -63,7 +99,7 @@ func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw 
 	if kind == kindLeaf && t.leafCountLocked() >= t.maxLeaves {
 		return nil, false
 	}
-	p := &peer{id: id, kind: kind, w: w, raw: raw, limiter: newTokenBucket(perPeerBurst, perPeerRefillRate)}
+	p := newPeer(id, kind, w, raw, nil)
 	t.m[id] = p
 	return p, true
 }
@@ -82,12 +118,13 @@ func (t *peerTable) addNode(id string, w *tonoverlay.ADNLOverlayWrapper, raw adn
 	if p, ok := t.m[id]; ok {
 		p.kind = kindNode
 		p.member = false
+		p.lastSeen = time.Now()
 		if signed != nil {
 			p.signed = signed
 		}
 		return p, false
 	}
-	p := &peer{id: id, kind: kindNode, w: w, raw: raw, signed: signed, limiter: newTokenBucket(perPeerBurst, perPeerRefillRate)}
+	p := newPeer(id, kindNode, w, raw, signed)
 	t.m[id] = p
 	return p, true
 }
@@ -108,6 +145,7 @@ func (t *peerTable) setSigned(id string, signed *tonoverlay.Node) bool {
 	}
 	p.kind = kindNode
 	p.member = false
+	p.lastSeen = time.Now()
 	if signed != nil {
 		p.signed = signed
 	}
@@ -115,20 +153,129 @@ func (t *peerTable) setSigned(id string, signed *tonoverlay.Node) bool {
 }
 
 func (t *peerTable) markMember(id string) bool {
+	return t.markAccepted(id, time.Now())
+}
+
+func (t *peerTable) markAccepted(id string, now time.Time) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	p, ok := t.m[id]
 	if !ok || p.kind != kindLeaf || p.member {
 		return false
 	}
+	p.state = peerHealthy
 	p.member = true
+	p.lastSeen = now
+	p.lastGood = now
+	p.failures = 0
 	return true
 }
 
-func (t *peerTable) remove(id string) {
+func (t *peerTable) markGood(id string, now time.Time) bool {
+	return t.markGoodLockedKind(id, now, false)
+}
+
+func (t *peerTable) markNodeGood(id string, now time.Time) bool {
+	return t.markGoodLockedKind(id, now, true)
+}
+
+func (t *peerTable) markGoodLockedKind(id string, now time.Time, nodeOnly bool) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	p, ok := t.m[id]
+	if !ok {
+		return false
+	}
+	if nodeOnly && p.kind != kindNode {
+		return false
+	}
+	p.lastSeen = now
+	p.lastGood = now
+	p.failures = 0
+	if p.badScore > 0 {
+		p.badScore--
+	}
+	if p.state == peerQuarantine {
+		p.state = peerHealthy
+		return true
+	}
+	return false
+}
+
+func (t *peerTable) markSeen(id string, now time.Time) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if p, ok := t.m[id]; ok {
+		p.lastSeen = now
+	}
+}
+
+func (t *peerTable) markBad(id string, score int, now time.Time) (int, *peer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[id]
+	if !ok {
+		return 0, nil
+	}
+	if score < 1 {
+		score = 1
+	}
+	p.lastSeen = now
+	p.badScore += score
+	if p.badScore < peerBadScoreEvict {
+		return p.badScore, nil
+	}
+	p.state = peerBad
 	delete(t.m, id)
+	return p.badScore, p
+}
+
+func (t *peerTable) markFailure(id string, now time.Time) (int, *peer) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[id]
+	if !ok {
+		return 0, nil
+	}
+	p.lastSeen = now
+	p.failures++
+	p.badScore += 2
+	if p.failures < peerMaxFailures && p.badScore < peerBadScoreEvict {
+		return p.failures, nil
+	}
+	p.state = peerBad
+	delete(t.m, id)
+	return p.failures, p
+}
+
+func (t *peerTable) evictStale(now time.Time) []*peer {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	var out []*peer
+	for id, p := range t.m {
+		if p.kind == kindNode {
+			continue
+		}
+		if p.member {
+			continue
+		}
+		if now.Sub(p.firstSeen) <= peerQuarantineTTL {
+			continue
+		}
+		delete(t.m, id)
+		out = append(out, p)
+	}
+	return out
+}
+
+func (t *peerTable) remove(id string) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, ok := t.m[id]; !ok {
+		return false
+	}
+	delete(t.m, id)
+	return true
 }
 
 func (t *peerTable) memberLeaves(exclude string) []*peer {
@@ -139,7 +286,7 @@ func (t *peerTable) memberLeaves(exclude string) []*peer {
 		if id == exclude {
 			continue
 		}
-		if p.kind == kindLeaf && p.member {
+		if p.kind == kindLeaf && p.member && p.state == peerHealthy {
 			out = append(out, p)
 		}
 	}
@@ -153,7 +300,7 @@ func (t *peerTable) nodeTargets(exclude string, max int) []*peer {
 		if id == exclude {
 			continue
 		}
-		if p.kind == kindNode {
+		if p.kind == kindNode && p.state == peerHealthy {
 			out = append(out, p)
 		}
 	}
@@ -200,12 +347,31 @@ func (t *peerTable) nodePeers() []*peer {
 	return out
 }
 
+func (t *peerTable) nodePeersIdleSince(now time.Time, idle time.Duration) []*peer {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	out := make([]*peer, 0)
+	for _, p := range t.m {
+		if p.kind != kindNode || p.state != peerHealthy {
+			continue
+		}
+		last := p.lastGood
+		if last.IsZero() {
+			last = p.firstSeen
+		}
+		if now.Sub(last) >= idle {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func (t *peerTable) signedNodes() []tonoverlay.Node {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	out := make([]tonoverlay.Node, 0)
 	for _, p := range t.m {
-		if p.kind == kindNode && p.signed != nil {
+		if p.kind == kindNode && p.state == peerHealthy && p.signed != nil {
 			out = append(out, *p.signed)
 		}
 	}

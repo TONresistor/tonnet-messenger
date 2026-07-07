@@ -19,32 +19,16 @@ const (
 	relayTimeout = 8 * time.Second
 
 	nodeFanout = 5
+
+	badScoreSignature = 4
+	badScoreRateLimit = 1
 )
 
 func (n *Node) wirePeer(p *peer) {
 	id := p.id
 
 	p.w.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
-		now := time.Now()
-		if n.penalties.banned(id, now) {
-			return nil
-		}
-		if !p.limiter.allow() {
-			return nil
-		}
-
-		env, b, accepted := n.admit(p, msg.Data, now)
-
-		if n.peers.markMember(id) {
-			log.Printf("member joined %s… (%s)", short(id), n.countsString())
-			n.replayHistory(p, leafKey(env, accepted))
-		} else if accepted && p.kind == kindLeaf && env.Type == "hello" {
-			n.replayHistory(p, env.Key)
-		}
-
-		if accepted {
-			n.relayAccepted(id, env, b)
-		}
+		n.handleCustomMessage(p, msg.Data, time.Now())
 		return nil
 	})
 
@@ -53,9 +37,35 @@ func (n *Node) wirePeer(p *peer) {
 	})
 
 	p.w.SetDisconnectHandler(func(addr string, _ ed25519.PublicKey) {
-		n.peers.remove(id)
-		log.Printf("peer left    %s… (%s)", short(id), n.countsString())
+		if n.peers.remove(id) {
+			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
+		}
 	})
+}
+
+func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time) {
+	id := p.id
+	n.peers.markSeen(id, now)
+	if n.penalties.banned(id, now) {
+		return
+	}
+	if !p.limiter.allow() {
+		n.scorePeer(p, badScoreRateLimit, now, "rate limited")
+		return
+	}
+
+	env, b, accepted := n.admit(p, data, now)
+	if accepted {
+		n.peers.markGood(id, now)
+		if n.peers.markAccepted(id, now) {
+			log.Printf("member joined %s… (%s)", short(id), n.countsString())
+			n.replayHistory(p, leafKey(env, accepted))
+		} else if accepted && p.kind == kindLeaf && env.Type == "hello" {
+			n.replayHistory(p, env.Key)
+		}
+
+		n.relayAccepted(id, env, b)
+	}
 }
 
 func leafKey(env envelope.Envelope, accepted bool) string {
@@ -141,6 +151,21 @@ func (n *Node) punish(p *peer, now time.Time) {
 	if errs := n.peers.countError(p.id); errs == 1 || errs%16 == 0 {
 		log.Printf("bad signature from %s… (%d errors, penalized %s)", short(p.id), errs, sigPenalty)
 	}
+	n.scorePeer(p, badScoreSignature, now, "bad signature")
+}
+
+func (n *Node) scorePeer(p *peer, score int, now time.Time, reason string) {
+	if p == nil {
+		return
+	}
+	total, evicted := n.peers.markBad(p.id, score, now)
+	if evicted == nil {
+		if total == score || total%peerBadScoreEvict == peerBadScoreEvict-1 {
+			log.Printf("peer warning %s…: %s (score %d/%d)", short(p.id), reason, total, peerBadScoreEvict)
+		}
+		return
+	}
+	n.closePeer(evicted, reason)
 }
 
 func (n *Node) certOK(cert any, src ed25519.PublicKey, size uint32, now time.Time) bool {
@@ -200,6 +225,7 @@ func (n *Node) relayAccepted(fromID string, env envelope.Envelope, b broadcast.B
 			defer cancel()
 			if err := p.w.SendCustomMessage(ctx, b); err != nil {
 				log.Printf("relay to %s… failed: %v", short(p.id), err)
+				n.peerFailure(p, time.Now(), "relay failed")
 			}
 		}(p)
 	}

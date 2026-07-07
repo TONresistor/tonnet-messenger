@@ -375,7 +375,7 @@ On receiving an overlay custom message a node processes strictly in this order,
 cheap checks before cryptography:
 
 1. **Per-peer rate limit**: token bucket, burst 128, refill 64/s. Excess dropped
-   silently.
+   silently and adds a small bad-peer score.
 2. **Size**: serialized message <= 4096 bytes, else drop.
 3. **Parse**: `tonnet.broadcast` only. Anything else is dropped; there is no
    legacy wire path.
@@ -400,8 +400,9 @@ cheap checks before cryptography:
 11. **Observe**: presence mark; history add for storable types (store the
     accepted wrapper); commit `broadcast_id` into the delivered set.
 12. **Relay**: forward the accepted wrapper without re-signing or re-originating.
-    Flood types go to all member leaves and to at most 5 node-peers (random when
-    more are connected); addressed types follow section 11.
+    Flood types go to all healthy member leaves and to at most 5 healthy
+    node-peers (random when more are connected); addressed types follow section
+    11.
 13. **Replay-on-join**: on leaf membership or `hello`, replay recent history to
     that leaf only, filtered per section 11.
 
@@ -423,10 +424,24 @@ library's FEC path.
 
 **Signature penalty.** A peer delivering a broadcast that fails signature
 verification (step 6) MUST have all its traffic ignored for 5 s. Nodes SHOULD
-keep a per-peer error counter and MAY disconnect leaves that repeatedly trip it.
+keep a per-peer error counter and MAY disconnect peers that repeatedly trip it.
 Per-source keying (device key) is a deliberate deviation from the reference's
 issuer keying: with a single owner per room, issuer keying would collapse all
 members into one bucket.
+
+**Peer hygiene.** New peers begin in quarantine. A leaf leaves quarantine only
+after a broadcast is accepted; invalid or stale first traffic MUST NOT create
+membership or trigger history replay. A node leaves quarantine only after a
+successful overlay liveness exchange, such as `getRandomPeers`, or after it
+delivers an accepted broadcast. Quarantined nodes are not relay targets and are
+not advertised to other peers.
+
+Nodes maintain a per-peer bad score. Signature/source failures add a high score;
+rate-limit abuse adds a low score; repeated relay, probe, answer, or keepalive
+failures count as liveness failures. At the eviction threshold the peer is
+removed and the connection is closed. Non-member leaves that remain in
+quarantine past the quarantine TTL are also closed. Node-peers are periodically
+probed with ADNL keepalive so dead connections stop consuming relay slots.
 
 ---
 
@@ -513,6 +528,8 @@ revision before removal.
 | per-peer rate limit | burst 128, refill 64/s |
 | per-source rate limit | 30 msgs and 64 KiB per 60 s, LRU 4096 |
 | signature penalty | ignore peer 5 s |
+| peer hygiene | quarantine TTL 90 s; bad score eviction 8; failed liveness eviction 3 |
+| peer keepalive | maintenance 30 s; idle probe 45 s; probe timeout 5 s |
 | device-key binding TTL | 90 s |
 | history / presence | 200 msgs / 6 h; presence TTL 90 s |
 | DHT publish / TTL | 5 min / 30 min |
@@ -539,10 +556,6 @@ revision before removal.
   attribution, not protection.
 - **Single device**: identity is per-install; no multi-device linking or
   device-key rotation beyond proof expiry.
-- **Peer hygiene**: bad-peer eviction, new-peer quarantine behind a liveness
-  check, and keepalive-based unresponsive marking (reference
-  overlay-peers.cpp:274) are recommended but not yet implemented.
-
 ---
 
 ## Appendix A. Correspondence to the TON reference

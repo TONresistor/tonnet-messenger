@@ -57,10 +57,8 @@ func (n *Node) discoverOnce(ctx context.Context) {
 	}
 
 	for _, p := range n.peers.nodePeers() {
-		gctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		nodes, err := p.w.GetRandomPeers(gctx)
-		cancel()
-		if err != nil {
+		nodes, ok := n.probeNode(ctx, p)
+		if !ok {
 			continue
 		}
 		nodes = capNodes(nodes)
@@ -134,8 +132,29 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 		if created {
 			n.wirePeer(p)
 		}
+		if nodes, ok := n.probeNode(ctx, p); ok {
+			for i := range capNodes(nodes) {
+				nd := nodes[i]
+				go n.considerNode(context.Background(), &nd)
+			}
+		}
 	}
 	log.Printf("meshed with node %s… at %s (%s)", short(idHex), dialStr, n.countsString())
+}
+
+func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool) {
+	if p == nil || p.w == nil {
+		return nil, false
+	}
+	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
+	defer cancel()
+	nodes, err := p.w.GetRandomPeers(gctx)
+	if err != nil {
+		n.peerFailure(p, time.Now(), "peer probe failed")
+		return nil, false
+	}
+	n.peers.markNodeGood(p.id, time.Now())
+	return nodes, true
 }
 
 func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
@@ -164,7 +183,10 @@ func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error
 }
 
 func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
+	now := time.Now()
+	n.peers.markSeen(p.id, now)
 	if !p.limiter.allow() {
+		n.scorePeer(p, badScoreRateLimit, now, "query rate limited")
 		return nil
 	}
 	var advertised tonoverlay.NodesList
@@ -186,8 +208,10 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := p.raw.Answer(ctx, q.ID, n.myNodesList()); err != nil {
+		n.peerFailure(p, time.Now(), "answer getRandomPeers failed")
 		return err
 	}
+	n.peers.markNodeGood(p.id, time.Now())
 
 	for i := range capNodes(advertised.List) {
 		nd := advertised.List[i]
@@ -199,7 +223,12 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 func (n *Node) answer(p *peer, q *adnl.MessageQuery, resp tl.Serializable) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return p.raw.Answer(ctx, q.ID, resp)
+	if err := p.raw.Answer(ctx, q.ID, resp); err != nil {
+		n.peerFailure(p, time.Now(), "answer query failed")
+		return err
+	}
+	n.peers.markNodeGood(p.id, time.Now())
+	return nil
 }
 
 func (n *Node) answerGetBroadcast(p *peer, q *adnl.MessageQuery, hash []byte) error {
