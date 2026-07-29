@@ -15,7 +15,7 @@ Every chat room is a peer-to-peer overlay mesh. Nodes find each other through th
 > open to review.
 >
 > To try it end to end, build the desktop client from source from the
-> [`groupchat` branch of Tonnet Browser](https://github.com/TONresistor/Tonnet-Browser/tree/groupchat).
+> [`dev` branch of Tonnet Browser](https://github.com/TONresistor/Tonnet-Browser/tree/dev).
 
 ## Features
 
@@ -23,6 +23,7 @@ Every chat room is a peer-to-peer overlay mesh. Nodes find each other through th
 - **One binary, one command.** Hosting a room and relaying it are the same thing: `tonnet serve --room NAME`.
 - **Signed messages.** Every message is signed by an ed25519 device key; clients can add a TON Connect ton_proof to attribute that device to a wallet without making the mesh blockchain-dependent.
 - **Native TON stack.** ADNL transport, DHT discovery, overlay broadcast flooding. Point a `.ton` record at a node's ADNL id to name it.
+- **Free identity.** A device key may be kept or rotated at any time. Wallet proof is optional display attribution, not an account, admission token, or Sybil defense.
 
 ## Install
 
@@ -77,10 +78,12 @@ tonnet keygen                create a node identity key
 | `--advertise` | autodetect | public `ip:port` published to the DHT |
 | `--key` | `~/.tonnet/node.key` | ed25519 seed, defines the ADNL id (back it up) |
 | `--socket` | `~/.tonnet/node.sock` | control socket for `tonnet status` |
+| `--max-leaves` | `256` | accepted leaves, configurable from 1 to 2048 |
+| `--experimental-gated-rooms` | off | enable the unstable owner-certificate room mode |
 
 ## How it works
 
-**Mesh.** Each node publishes itself to the TON DHT under the room's overlay id, looks up the other nodes of the same room, and peers with them over ADNL. Gossip keeps the neighbour set fresh. A message seen for the first time (dedup by signed broadcast id) is re-gossiped exactly once to every other peer and client: an epidemic flood with no hub.
+**Mesh.** Each node publishes itself to the TON DHT under the room's overlay id, looks up verified fresh node records, and peers with live addresses over ADNL. A message seen for the first time is relayed through bounded per-peer queues. The in-memory history is only an opportunistic cache: no delivery, completeness, ordering, persistence, or availability guarantee.
 
 **Identity.** Messages always carry two device-level checks that every node verifies offline: the ADNL overlay broadcast signature and an ed25519 device-key signature over the TL envelope. A TON Connect ton_proof can additionally bind that device key to the sender's wallet for display attribution. Anything unsigned, forged, cross-room, or malformed is dropped: never relayed, never stored. Rooms are public and readable by design; signatures provide authenticity, not secrecy.
 
@@ -90,8 +93,12 @@ Cross-compile a static binary, ship it, then install the systemd unit from [`dep
 
 ```bash
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o tonnet ./cmd/tonnet
-scp tonnet SERVER:/opt/tonnet/tonnet
+scp tonnet SERVER:/tmp/tonnet
+ssh SERVER sudo install -m 0755 /tmp/tonnet /usr/local/bin/tonnet
 ```
+
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for the environment file,
+firewall, observability, backup, and GTON plus two-client smoke-test procedure.
 
 ## Clients
 

@@ -16,6 +16,7 @@ type Item struct {
 	Type string
 	From string
 	To   string
+	ID   string
 	Obj  tl.Serializable
 }
 

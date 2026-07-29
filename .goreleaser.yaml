@@ -4,10 +4,6 @@ version: 2
 
 project_name: tonnet
 
-before:
-  hooks:
-    - go mod tidy
-
 builds:
   - id: tonnet
     main: ./cmd/tonnet
@@ -36,6 +32,10 @@ archives:
 
 checksum:
   name_template: "checksums.txt"
+
+sboms:
+  - id: archive
+    artifacts: archive
 
 snapshot:
   version_template: "{{ incpatch .Version }}-dev"

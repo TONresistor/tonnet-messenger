@@ -5,13 +5,40 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/overlay-node
-# --advertise is the PUBLIC ip:port the node publishes (open the UDP port in the firewall).
-# --room derives the overlay id; keep it identical on every node that should share the same room.
-# --key persists the ADNL id across restarts — back it up; deleting it breaks any .ton pointer.
-ExecStart=/opt/overlay-node/tonnet serve --listen 0.0.0.0:17400 --advertise PUBLIC_IP:17400 --room tonnet:groupchat:v1 --key /opt/overlay-node/node-key.bin --socket /opt/overlay-node/node.sock
-Restart=always
+DynamicUser=yes
+StateDirectory=tonnet
+RuntimeDirectory=tonnet
+ConfigurationDirectory=tonnet
+Environment=TONNET_ROOM=tonnet:groupchat:v1
+Environment=TONNET_MAX_LEAVES=256
+EnvironmentFile=/etc/tonnet/tonnet.env
+ExecStart=/usr/local/bin/tonnet serve --listen 0.0.0.0:17400 --advertise ${TONNET_ADVERTISE} --room ${TONNET_ROOM} --key /var/lib/tonnet/node.key --socket /run/tonnet/node.sock --max-leaves ${TONNET_MAX_LEAVES}
+Restart=on-failure
 RestartSec=3
+TimeoutStopSec=20
+UMask=0077
+
+NoNewPrivileges=yes
+PrivateDevices=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectHome=yes
+ProtectHostname=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+
+MemoryHigh=512M
+MemoryMax=768M
+TasksMax=512
+LimitNOFILE=8192
 
 [Install]
 WantedBy=multi-user.target

@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -481,7 +482,11 @@ func TestUnknownInboundAcceptedHelloTracksMember(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := wrap(t, dev, nil, env, time.Now().Unix())
-	p := detachedPeer("leafA")
+	raw := detachedPeer("leafA")
+	p, added := n.peers.addInbound(raw.id, raw.w, raw.raw)
+	if p == nil || !added {
+		t.Fatal("first Tonnet frame must reserve a pending peer slot")
+	}
 
 	n.handleCustomMessage(p, b, time.Now())
 
@@ -533,6 +538,105 @@ func TestNodeOnlyGoodSignalDoesNotPromoteLeaf(t *testing.T) {
 	}
 	if got.state != peerQuarantine {
 		t.Fatalf("leaf must remain quarantined, got state=%v", got.state)
+	}
+}
+
+func TestNodePeerGetsAggregateTrafficBudget(t *testing.T) {
+	tbl := newPeerTable(0)
+	leaf, _ := tbl.addInbound("leaf", nil, nil)
+	nodePeer, _ := tbl.addNode("node", nil, nil, nil)
+
+	for i := 0; i < leafPeerBurst; i++ {
+		if !leaf.allowIngress() {
+			t.Fatalf("leaf token %d should be available", i)
+		}
+	}
+	if leaf.allowIngress() {
+		t.Fatal("leaf must stop at its strict burst")
+	}
+	for i := 0; i < leafPeerBurst+1; i++ {
+		if !nodePeer.allowIngress() {
+			t.Fatalf("node peer must absorb aggregate burst at token %d", i)
+		}
+	}
+}
+
+func TestPeerLimiterUpgradeIsSynchronized(t *testing.T) {
+	tbl := newPeerTable(0)
+	p, added := tbl.addInbound("upgrade", nil, nil)
+	if p == nil || !added {
+		t.Fatal("leaf should be admitted before limiter upgrade")
+	}
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1_000; i++ {
+			p.allowIngress()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 1_000; i++ {
+			tbl.setSigned("upgrade", nil)
+		}
+	}()
+	wg.Wait()
+}
+
+func TestNodeMetadataRefreshDoesNotRefillLimiter(t *testing.T) {
+	tests := []struct {
+		name    string
+		refresh func(*peerTable)
+	}{
+		{
+			name: "signed record",
+			refresh: func(tbl *peerTable) {
+				tbl.setSigned("node", nil)
+			},
+		},
+		{
+			name: "existing node connection",
+			refresh: func(tbl *peerTable) {
+				tbl.addNode("node", nil, nil, nil)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tbl := newPeerTable(0)
+			p, added := tbl.addNode("node", nil, nil, nil)
+			if p == nil || !added {
+				t.Fatal("node should be admitted")
+			}
+
+			p.limiterMu.RLock()
+			limiter := p.limiter
+			p.limiterMu.RUnlock()
+			limiter.mu.Lock()
+			limiter.refillPerSec = 0
+			limiter.mu.Unlock()
+			for i := 0; i < nodePeerBurst; i++ {
+				if !p.allowIngress() {
+					t.Fatalf("node token %d should be available", i)
+				}
+			}
+			if p.allowIngress() {
+				t.Fatal("precondition: node limiter should be exhausted")
+			}
+
+			tt.refresh(tbl)
+
+			p.limiterMu.RLock()
+			refreshed := p.limiter
+			p.limiterMu.RUnlock()
+			if refreshed != limiter {
+				t.Fatal("metadata refresh replaced and refilled the node limiter")
+			}
+			if p.allowIngress() {
+				t.Fatal("metadata refresh refilled an exhausted node limiter")
+			}
+		})
 	}
 }
 
@@ -594,6 +698,44 @@ func TestPeerTableEvictsStaleQuarantineLeaves(t *testing.T) {
 	}
 }
 
+func TestPeerTableEvictsMemberWithoutAcceptedApplicationTraffic(t *testing.T) {
+	tbl := newPeerTable(0)
+	now := time.Now()
+	tbl.addInbound("idle-member", nil, nil)
+	if !tbl.markAccepted("idle-member", now) {
+		t.Fatal("member should be accepted")
+	}
+
+	// Invalid or transport-only activity may update diagnostics, but must not
+	// preserve an application membership slot.
+	tbl.markBad("idle-member", 1, now.Add(peerMemberIdleTTL-time.Second))
+	evicted := tbl.evictStale(now.Add(peerMemberIdleTTL + time.Second))
+	if len(evicted) != 1 || evicted[0].id != "idle-member" {
+		t.Fatalf("idle member must be evicted, got %+v", evicted)
+	}
+}
+
+func TestWrongRoomFramesPenalizeAndEvictPeer(t *testing.T) {
+	n := newTestNode(t, "tonnet:test")
+	p := leafPeer(n, "wrongRoom")
+	dev := genKey(t)
+	env := envelope.Envelope{Type: "msg", Nick: "leaf", Text: "noise", TS: time.Now().UnixMilli(), Room: "tonnet:other"}
+	if err := env.Sign(dev); err != nil {
+		t.Fatal(err)
+	}
+	b := wrap(t, dev, nil, env, time.Now().Unix())
+	now := time.Now()
+
+	n.handleCustomMessage(p, b, now)
+	if _, ok := n.peers.get(p.id); !ok {
+		t.Fatal("first authenticated policy violation should warn, not evict")
+	}
+	n.handleCustomMessage(p, b, now.Add(sigPenalty+time.Second))
+	if _, ok := n.peers.get(p.id); ok {
+		t.Fatal("repeated authenticated wrong-room frames must evict the peer")
+	}
+}
+
 func TestInboundNodeReclassifiedNotDoubleCounted(t *testing.T) {
 	tbl := newPeerTable(0)
 
@@ -615,18 +757,47 @@ func TestInboundNodeReclassifiedNotDoubleCounted(t *testing.T) {
 
 func TestLeafCapRefusesButNodesBypass(t *testing.T) {
 	tbl := newPeerTable(2)
-	if p, added := tbl.addInbound("l1", nil, nil); p == nil || !added {
+	p1, added := tbl.addInbound("l1", nil, nil)
+	if p1 == nil || !added {
 		t.Fatal("first leaf should be admitted")
 	}
-	if p, added := tbl.addInbound("l2", nil, nil); p == nil || !added {
+	p2, added := tbl.addInbound("l2", nil, nil)
+	if p2 == nil || !added {
 		t.Fatal("second leaf should be admitted")
 	}
-	if p, added := tbl.addInbound("l3", nil, nil); p != nil || added {
-		t.Fatal("leaf past the cap must be refused as (nil, false) so onInbound closes it")
+	p3, added := tbl.addInbound("l3", nil, nil)
+	if p3 == nil || !added {
+		t.Fatal("pending peers use their own cap and must not consume member slots")
+	}
+	if _, _, ok := tbl.acceptInbound(p1, time.Now()); !ok {
+		t.Fatal("first member should be accepted")
+	}
+	if _, _, ok := tbl.acceptInbound(p2, time.Now()); !ok {
+		t.Fatal("second member should be accepted")
+	}
+	if _, _, ok := tbl.acceptInbound(p3, time.Now()); ok {
+		t.Fatal("third accepted member must be refused at the member cap")
 	}
 	tbl.markKnown("nodeX")
 	if p, added := tbl.addInbound("nodeX", nil, nil); p == nil || !added {
 		t.Fatal("a known node must be admitted despite the leaf cap")
+	}
+}
+
+func TestDisconnectedPendingPeerCannotBeReinsertedByLateAdmission(t *testing.T) {
+	tbl := newPeerTable(2)
+	p, added := tbl.addInbound("late", nil, nil)
+	if p == nil || !added {
+		t.Fatal("pending peer should be admitted")
+	}
+	if !tbl.removePeer("late", p) {
+		t.Fatal("pending peer should be removable")
+	}
+	if _, _, ok := tbl.acceptInbound(p, time.Now()); ok {
+		t.Fatal("late verification must not reinsert a disconnected peer")
+	}
+	if tbl.has("late") {
+		t.Fatal("disconnected peer became a ghost member")
 	}
 }
 
@@ -640,6 +811,36 @@ func TestRateLimiterBlocksBurst(t *testing.T) {
 	}
 	if got != 3 {
 		t.Fatalf("token bucket should allow exactly the burst (3), allowed %d", got)
+	}
+}
+
+func TestGlobalIngressLimiterChargesMessagesAndBytesAtomically(t *testing.T) {
+	l := newDualLimiter()
+	l.messages = 1
+	l.bytes = 10
+	l.messageRefill = 0
+	l.byteRefill = 0
+	now := time.Now()
+	if l.allow(11, now) {
+		t.Fatal("oversized charge must fail")
+	}
+	if !l.allow(10, now) {
+		t.Fatal("failed byte charge must not consume the message token")
+	}
+	if l.allow(1, now) {
+		t.Fatal("message token must be consumed after acceptance")
+	}
+}
+
+func TestPendingPeerCapIsSeparateFromMemberCap(t *testing.T) {
+	tbl := newPeerTable(1)
+	for i := 0; i < MaxPendingPeers; i++ {
+		if p, added := tbl.addInbound(fmt.Sprintf("pending-%d", i), nil, nil); p == nil || !added {
+			t.Fatalf("pending peer %d should fit", i)
+		}
+	}
+	if p, added := tbl.addInbound("overflow", nil, nil); p != nil || added {
+		t.Fatal("pending peer past the cap must be refused")
 	}
 }
 
@@ -680,6 +881,52 @@ func TestDeviceTableTTL(t *testing.T) {
 	}
 	if _, ok := d.lookup("k", now.Add(deviceBindTTL+time.Second)); ok {
 		t.Fatal("expired binding must not resolve")
+	}
+}
+
+func TestDeviceTableSupportsMultiplePeersAndDisconnectCleanup(t *testing.T) {
+	d := newDeviceTable()
+	now := time.Now()
+	d.bind("k", "peer1", now)
+	d.bind("k", "peer2", now)
+	if got := d.lookupAll("k", now); len(got) != 2 {
+		t.Fatalf("want two device bindings, got %v", got)
+	}
+	d.removePeer("peer1")
+	got := d.lookupAll("k", now)
+	if len(got) != 1 || got[0] != "peer2" {
+		t.Fatalf("disconnect cleanup left %v", got)
+	}
+}
+
+func TestDeviceBindingRequiresConnectionChallenge(t *testing.T) {
+	tbl := newPeerTable(2)
+	p, added := tbl.addInbound("leaf", nil, nil)
+	if p == nil || !added {
+		t.Fatal("leaf should be pending")
+	}
+	nonce := make([]byte, 32)
+	nonce[0] = 0x42
+	now := time.Now()
+	if !tbl.setChallenge(p, nonce, now.Add(time.Minute)) {
+		t.Fatal("challenge should attach to the pending peer")
+	}
+	if _, _, ok := tbl.acceptInbound(p, now); !ok {
+		t.Fatal("valid first frame should admit the peer")
+	}
+	key := hex.EncodeToString(genKey(t).Public().(ed25519.PublicKey))
+	if tbl.authenticateDevice(p, key, "", true, now) {
+		t.Fatal("a signed frame without the connection challenge must not bind")
+	}
+	if !tbl.authenticateDevice(p, key, hex.EncodeToString(nonce), true, now) {
+		t.Fatal("the current signed connection challenge must bind")
+	}
+	if !tbl.authenticateDevice(p, key, "", false, now.Add(time.Second)) {
+		t.Fatal("later frames from the authenticated device must refresh its binding")
+	}
+	other := hex.EncodeToString(genKey(t).Public().(ed25519.PublicKey))
+	if tbl.authenticateDevice(p, other, hex.EncodeToString(nonce), true, now) {
+		t.Fatal("one connection must not switch to another device key")
 	}
 }
 

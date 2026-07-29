@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/xssnick/tonutils-go/address"
@@ -21,6 +20,7 @@ const (
 	Domain        = "tonnet.chat"
 	payloadPrefix = "tonnet-chat-device:v1:"
 	maxSkew       = 300
+	maxLifetime   = 7 * 24 * 60 * 60
 )
 
 var (
@@ -28,26 +28,20 @@ var (
 	ErrBadProof   = errors.New("tonproof: malformed proof fields")
 	ErrExpired    = errors.New("tonproof: proof expired")
 	ErrFutureTS   = errors.New("tonproof: proof timestamp in the future")
+	ErrLifetime   = errors.New("tonproof: invalid proof lifetime")
 	ErrBadWallet  = errors.New("tonproof: wallet signature does not verify")
 	ErrBadAddress = errors.New("tonproof: cannot derive wallet address")
 )
-
-var addrCache sync.Map
 
 func Payload(deviceKeyHex string, wexp int64) string {
 	return payloadPrefix + deviceKeyHex + ":" + strconv.FormatInt(wexp, 10)
 }
 
 func WalletAddress(walletPub ed25519.PublicKey) (*address.Address, error) {
-	key := string(walletPub)
-	if v, ok := addrCache.Load(key); ok {
-		return v.(*address.Address), nil
-	}
 	addr, err := wallet.AddressFromPubKey(walletPub, wallet.ConfigV5R1Final{NetworkGlobalID: wallet.MainnetGlobalID, Workchain: 0}, 0)
 	if err != nil {
 		return nil, ErrBadAddress
 	}
-	addrCache.Store(key, addr)
 	return addr, nil
 }
 
@@ -92,6 +86,9 @@ func Verify(env envelope.Envelope, now time.Time) (*address.Address, error) {
 	}
 	if env.WTS > now.Unix()+maxSkew {
 		return nil, ErrFutureTS
+	}
+	if env.WExp <= env.WTS || env.WExp-env.WTS > maxLifetime {
+		return nil, ErrLifetime
 	}
 	if env.WExp <= now.Unix() {
 		return nil, ErrExpired

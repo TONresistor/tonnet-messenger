@@ -63,6 +63,8 @@ func TestVerifyFrameRejectsWrongRoomAndStale(t *testing.T) {
 	b := signedFrame(t, priv, "tonnet:a")
 	if _, err := VerifyFrame(b, VerifyFrameOptions{Room: "tonnet:b"}); !errors.Is(err, ErrWrongRoom) {
 		t.Fatalf("want wrong room, got %v", err)
+	} else if !ShouldPenalizeFrameError(err) {
+		t.Fatal("authenticated wrong-room traffic must be penalized")
 	}
 
 	env := envelope.Envelope{Type: "msg", Nick: "frame", Text: "old", TS: time.Now().UnixMilli(), Room: "tonnet:a"}

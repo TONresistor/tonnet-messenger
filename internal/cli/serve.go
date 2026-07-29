@@ -28,6 +28,8 @@ func newServeCmd() *cobra.Command {
 		cfgURL    string
 		socket    string
 		noSocket  bool
+		maxLeaves int
+		gated     bool
 	)
 	cmd := &cobra.Command{
 		Use:   "serve",
@@ -63,13 +65,15 @@ func newServeCmd() *cobra.Command {
 			}
 
 			n, err := node.New(node.Config{
-				Key:       key,
-				Listen:    listen,
-				Advertise: adv,
-				ConfigURL: cfgURL,
-				Room:      room,
-				OverlayID: oid,
-				Socket:    sock,
+				Key:               key,
+				Listen:            listen,
+				Advertise:         adv,
+				ConfigURL:         cfgURL,
+				Room:              room,
+				OverlayID:         oid,
+				Socket:            sock,
+				MaxLeaves:         maxLeaves,
+				ExperimentalGated: gated,
 			})
 			if err != nil {
 				return err
@@ -93,6 +97,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
 	cmd.Flags().StringVar(&socket, "socket", defaultSocket(), "local control socket for `tonnet status`")
 	cmd.Flags().BoolVar(&noSocket, "no-socket", false, "disable the control socket")
+	cmd.Flags().IntVar(&maxLeaves, "max-leaves", node.DefaultMaxLeaves, "maximum connected member leaves (1..2048)")
+	cmd.Flags().BoolVar(&gated, "experimental-gated-rooms", false, "enable experimental gated room mode")
 	return cmd
 }
 

@@ -24,9 +24,12 @@ type Name struct {
 }
 
 func ParseName(s string) (Name, error) {
+	if len(s) == 0 || len(s) > 256 {
+		return Name{}, ErrBadName
+	}
 	i := strings.IndexByte(s, '#')
 	if i < 0 {
-		if s == "" || !visibleASCII(s) {
+		if !visibleASCII(s) {
 			return Name{}, ErrBadName
 		}
 		return Name{Full: s, Display: s, Mode: ModeOpen}, nil

@@ -132,9 +132,17 @@ func (e Envelope) validate(withSignature bool) error {
 	if e.Room == "" || !visibleASCII(e.Room) {
 		return ErrBadRoom
 	}
-	if e.To != "" {
+	switch e.Type {
+	case "dm", "cert-grant":
+		if e.To == "" || strings.ToLower(e.To) != e.To {
+			return ErrBadTo
+		}
 		if _, err := decodeHexFixed(e.To, ed25519.PublicKeySize, ErrBadTo); err != nil {
 			return err
+		}
+	default:
+		if e.To != "" {
+			return ErrBadTo
 		}
 	}
 	if e.Key != "" {

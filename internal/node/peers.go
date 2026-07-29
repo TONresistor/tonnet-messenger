@@ -1,6 +1,8 @@
 package node
 
 import (
+	"bytes"
+	"encoding/hex"
 	"math/rand"
 	"sync"
 	"time"
@@ -10,10 +12,17 @@ import (
 )
 
 const (
-	DefaultMaxLeaves = 2048
+	DefaultMaxLeaves = 256
+	MaxLeavesLimit   = 2048
+	MaxNodePeers     = 16
+	MaxPendingPeers  = 100
+	maxKnownNodes    = 256
+	outboundQueueCap = 32
 
-	perPeerBurst      = 128
-	perPeerRefillRate = 64
+	leafPeerBurst      = 4
+	leafPeerRefillRate = 2
+	nodePeerBurst      = 32
+	nodePeerRefillRate = 16
 )
 
 type peerKind int
@@ -32,27 +41,35 @@ const (
 )
 
 const (
-	peerQuarantineTTL = 90 * time.Second
+	peerQuarantineTTL = 30 * time.Second
+	peerMemberIdleTTL = 150 * time.Second
 	peerBadScoreEvict = 8
 	peerMaxFailures   = 3
 )
 
 type peer struct {
-	id        string
-	kind      peerKind
-	state     peerState
-	w         *tonoverlay.ADNLOverlayWrapper
-	raw       adnl.Peer
-	member    bool
-	replayed  bool
-	errs      int
-	badScore  int
-	failures  int
-	firstSeen time.Time
-	lastSeen  time.Time
-	lastGood  time.Time
-	signed    *tonoverlay.Node
-	limiter   *tokenBucket
+	id             string
+	kind           peerKind
+	state          peerState
+	w              *tonoverlay.ADNLOverlayWrapper
+	raw            adnl.Peer
+	member         bool
+	replayed       bool
+	errs           int
+	badScore       int
+	failures       int
+	firstSeen      time.Time
+	lastSeen       time.Time
+	lastGood       time.Time
+	signed         *tonoverlay.Node
+	challenge      []byte
+	challengeUntil time.Time
+	boundKey       string
+	limiterMu      sync.RWMutex
+	limiter        *tokenBucket
+	out            chan outboundJob
+	stop           chan struct{}
+	stopOnce       sync.Once
 }
 
 type peerTable struct {
@@ -60,18 +77,22 @@ type peerTable struct {
 
 	mu    sync.RWMutex
 	m     map[string]*peer
-	known map[string]bool
+	known map[string]time.Time
 }
 
 func newPeerTable(maxLeaves int) *peerTable {
 	if maxLeaves <= 0 {
 		maxLeaves = DefaultMaxLeaves
 	}
-	return &peerTable{maxLeaves: maxLeaves, m: map[string]*peer{}, known: map[string]bool{}}
+	return &peerTable{maxLeaves: maxLeaves, m: map[string]*peer{}, known: map[string]time.Time{}}
 }
 
 func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) *peer {
 	now := time.Now()
+	burst, refill := float64(leafPeerBurst), float64(leafPeerRefillRate)
+	if kind == kindNode {
+		burst, refill = nodePeerBurst, nodePeerRefillRate
+	}
 	return &peer{
 		id:        id,
 		kind:      kind,
@@ -81,7 +102,9 @@ func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adn
 		signed:    signed,
 		firstSeen: now,
 		lastSeen:  now,
-		limiter:   newTokenBucket(perPeerBurst, perPeerRefillRate),
+		limiter:   newTokenBucket(burst, refill),
+		out:       make(chan outboundJob, outboundQueueCap),
+		stop:      make(chan struct{}),
 	}
 }
 
@@ -89,14 +112,16 @@ func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
-		p.lastSeen = time.Now()
 		return p, false
 	}
 	kind := kindLeaf
-	if t.known[id] {
+	if _, ok := t.known[id]; ok {
 		kind = kindNode
 	}
-	if kind == kindLeaf && t.leafCountLocked() >= t.maxLeaves {
+	if kind == kindLeaf && t.pendingCountLocked() >= MaxPendingPeers {
+		return nil, false
+	}
+	if kind == kindNode && t.nodeCountLocked() >= MaxNodePeers {
 		return nil, false
 	}
 	p := newPeer(id, kind, w, raw, nil)
@@ -114,7 +139,8 @@ func (t *peerTable) has(id string) bool {
 func (t *peerTable) isKnown(id string) bool {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.known[id]
+	_, ok := t.known[id]
+	return ok
 }
 
 func (t *peerTable) acceptInbound(p *peer, now time.Time) (*peer, bool, bool) {
@@ -123,40 +149,27 @@ func (t *peerTable) acceptInbound(p *peer, now time.Time) (*peer, bool, bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if existing, ok := t.m[p.id]; ok {
-		existing.lastSeen = now
-		existing.lastGood = now
-		existing.failures = 0
-		if existing.badScore > 0 {
-			existing.badScore--
-		}
-		if existing.state == peerQuarantine {
-			existing.state = peerHealthy
-		}
-		if existing.kind != kindLeaf || existing.member {
-			return existing, false, true
-		}
-		existing.member = true
-		return existing, true, true
-	}
-	kind := kindLeaf
-	if t.known[p.id] {
-		kind = kindNode
-	}
-	if kind == kindLeaf && t.leafCountLocked() >= t.maxLeaves {
+	existing, ok := t.m[p.id]
+	if !ok || existing != p {
 		return nil, false, false
 	}
-	p.kind = kind
-	p.state = peerHealthy
-	p.lastSeen = now
-	p.lastGood = now
-	p.failures = 0
-	if p.badScore > 0 {
-		p.badScore--
+	existing.lastSeen = now
+	existing.lastGood = now
+	existing.failures = 0
+	if existing.badScore > 0 {
+		existing.badScore--
 	}
-	p.member = kind == kindLeaf
-	t.m[p.id] = p
-	return p, p.member, true
+	if existing.state == peerQuarantine {
+		existing.state = peerHealthy
+	}
+	if existing.kind != kindLeaf || existing.member {
+		return existing, false, true
+	}
+	if t.memberLeafCountLocked() >= t.maxLeaves {
+		return nil, false, false
+	}
+	existing.member = true
+	return existing, true, true
 }
 
 func (t *peerTable) get(id string) (*peer, bool) {
@@ -166,12 +179,69 @@ func (t *peerTable) get(id string) (*peer, bool) {
 	return p, ok
 }
 
+func (t *peerTable) memberLeaf(id string) (*peer, bool) {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	p, ok := t.m[id]
+	if !ok || p.kind != kindLeaf || !p.member || p.state != peerHealthy {
+		return nil, false
+	}
+	return p, true
+}
+
+func (t *peerTable) setChallenge(candidate *peer, nonce []byte, until time.Time) bool {
+	if candidate == nil || len(nonce) != 32 {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[candidate.id]
+	if !ok || p != candidate {
+		return false
+	}
+	p.challenge = append(p.challenge[:0], nonce...)
+	p.challengeUntil = until
+	return true
+}
+
+func (t *peerTable) authenticateDevice(candidate *peer, key, proof string, allowNew bool, now time.Time) bool {
+	if candidate == nil || key == "" {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[candidate.id]
+	if !ok || p != candidate || p.kind != kindLeaf || !p.member || p.state != peerHealthy {
+		return false
+	}
+	if p.boundKey == key {
+		return true
+	}
+	if !allowNew || p.boundKey != "" || !p.challengeUntil.After(now) {
+		return false
+	}
+	decoded, err := hex.DecodeString(proof)
+	if err != nil || !bytes.Equal(decoded, p.challenge) {
+		return false
+	}
+	p.boundKey = key
+	p.challenge = nil
+	p.challengeUntil = time.Time{}
+	return true
+}
+
 func (t *peerTable) addNode(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) (*peer, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.known[id] = true
+	t.markKnownLocked(id)
 	if p, ok := t.m[id]; ok {
-		p.kind = kindNode
+		if p.kind != kindNode && t.nodeCountLocked() >= MaxNodePeers {
+			return nil, false
+		}
+		if p.kind != kindNode {
+			p.kind = kindNode
+			p.useNodeLimiter()
+		}
 		p.member = false
 		p.lastSeen = time.Now()
 		if signed != nil {
@@ -179,26 +249,63 @@ func (t *peerTable) addNode(id string, w *tonoverlay.ADNLOverlayWrapper, raw adn
 		}
 		return p, false
 	}
+	if t.nodeCountLocked() >= MaxNodePeers {
+		return nil, false
+	}
 	p := newPeer(id, kindNode, w, raw, signed)
 	t.m[id] = p
 	return p, true
 }
 
+func (t *peerTable) installOverlay(target *peer, w *tonoverlay.ADNLOverlayWrapper) bool {
+	if target == nil || w == nil {
+		return false
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	p, ok := t.m[target.id]
+	if !ok || p != target || p.w != nil {
+		return false
+	}
+	p.w = w
+	return true
+}
+
 func (t *peerTable) markKnown(id string) {
 	t.mu.Lock()
-	t.known[id] = true
+	t.markKnownLocked(id)
 	t.mu.Unlock()
+}
+
+func (t *peerTable) markKnownLocked(id string) {
+	if _, exists := t.known[id]; !exists && len(t.known) >= maxKnownNodes {
+		var oldestID string
+		var oldest time.Time
+		for candidate, seen := range t.known {
+			if oldestID == "" || seen.Before(oldest) {
+				oldestID, oldest = candidate, seen
+			}
+		}
+		delete(t.known, oldestID)
+	}
+	t.known[id] = time.Now()
 }
 
 func (t *peerTable) setSigned(id string, signed *tonoverlay.Node) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.known[id] = true
+	t.markKnownLocked(id)
 	p, ok := t.m[id]
 	if !ok {
 		return false
 	}
-	p.kind = kindNode
+	if p.kind != kindNode && t.nodeCountLocked() >= MaxNodePeers {
+		return false
+	}
+	if p.kind != kindNode {
+		p.kind = kindNode
+		p.useNodeLimiter()
+	}
 	p.member = false
 	p.lastSeen = time.Now()
 	if signed != nil {
@@ -312,6 +419,11 @@ func (t *peerTable) evictStale(now time.Time) []*peer {
 			continue
 		}
 		if p.member {
+			if now.Sub(p.lastGood) <= peerMemberIdleTTL {
+				continue
+			}
+			delete(t.m, id)
+			out = append(out, p)
 			continue
 		}
 		if now.Sub(p.firstSeen) <= peerQuarantineTTL {
@@ -451,14 +563,47 @@ func (t *peerTable) counts() (members, nodes int) {
 	return
 }
 
-func (t *peerTable) leafCountLocked() int {
+func (t *peerTable) memberLeafCountLocked() int {
 	n := 0
 	for _, p := range t.m {
-		if p.kind == kindLeaf {
+		if p.kind == kindLeaf && p.member {
 			n++
 		}
 	}
 	return n
+}
+
+func (t *peerTable) pendingCountLocked() int {
+	n := 0
+	for _, p := range t.m {
+		if p.kind == kindLeaf && !p.member {
+			n++
+		}
+	}
+	return n
+}
+
+func (t *peerTable) nodeCountLocked() int {
+	n := 0
+	for _, p := range t.m {
+		if p.kind == kindNode {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *peer) allowIngress() bool {
+	p.limiterMu.RLock()
+	limiter := p.limiter
+	p.limiterMu.RUnlock()
+	return limiter.allow()
+}
+
+func (p *peer) useNodeLimiter() {
+	p.limiterMu.Lock()
+	p.limiter = newTokenBucket(nodePeerBurst, nodePeerRefillRate)
+	p.limiterMu.Unlock()
 }
 
 type tokenBucket struct {

@@ -107,5 +107,7 @@ func AsBroadcast(data tl.Serializable) (Broadcast, bool) {
 func ShouldPenalizeFrameError(err error) bool {
 	return errors.Is(err, ErrBadSignature) ||
 		errors.Is(err, ErrBadSource) ||
-		errors.Is(err, ErrSourceMismatch)
+		errors.Is(err, ErrSourceMismatch) ||
+		errors.Is(err, ErrWrongRoom) ||
+		errors.Is(err, envelope.ErrBadSignature)
 }

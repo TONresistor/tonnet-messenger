@@ -10,7 +10,16 @@ import (
 )
 
 const (
-	sigPenalty = 5 * time.Second
+	sigPenalty   = 5 * time.Second
+	maxPenalties = 4096
+
+	globalMessageBurst  = 64
+	globalMessageRefill = 32.0
+	globalByteBurst     = 256 * 1024
+	globalByteRefill    = 128 * 1024.0
+
+	globalQueryBurst  = 128
+	globalQueryRefill = 64.0
 
 	sourceMsgsPerMinute  = 30
 	sourceBytesPerMinute = 64 * 1024
@@ -23,8 +32,9 @@ const (
 	certMissBurst  = 60
 	certMissRefill = 1.0
 
-	deviceBindTTL = 90 * time.Second
-	maxDeviceBind = 4096
+	deviceBindTTL     = 90 * time.Second
+	maxDeviceBind     = 4096
+	maxPeersPerDevice = 4
 
 	wrapperStoreCap = 128
 )
@@ -40,6 +50,21 @@ func newPenaltyBox() *penaltyBox {
 
 func (b *penaltyBox) punish(id string, now time.Time) {
 	b.mu.Lock()
+	for peerID, until := range b.m {
+		if !until.After(now) {
+			delete(b.m, peerID)
+		}
+	}
+	if _, exists := b.m[id]; !exists && len(b.m) >= maxPenalties {
+		var oldestID string
+		var oldest time.Time
+		for peerID, until := range b.m {
+			if oldestID == "" || until.Before(oldest) {
+				oldestID, oldest = peerID, until
+			}
+		}
+		delete(b.m, oldestID)
+	}
 	b.m[id] = now.Add(sigPenalty)
 	b.mu.Unlock()
 }
@@ -62,6 +87,46 @@ type sourceBucket struct {
 	msgs  *tokenBucket
 	bytes *tokenBucket
 	last  time.Time
+}
+
+type dualLimiter struct {
+	mu sync.Mutex
+
+	messages, messageMax, messageRefill float64
+	bytes, byteMax, byteRefill          float64
+	last                                time.Time
+}
+
+func newDualLimiter() *dualLimiter {
+	return &dualLimiter{
+		messages:      globalMessageBurst,
+		messageMax:    globalMessageBurst,
+		messageRefill: globalMessageRefill,
+		bytes:         globalByteBurst,
+		byteMax:       globalByteBurst,
+		byteRefill:    globalByteRefill,
+		last:          time.Now(),
+	}
+}
+
+func (l *dualLimiter) allow(size int, now time.Time) bool {
+	if l == nil {
+		return true
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	elapsed := now.Sub(l.last).Seconds()
+	if elapsed > 0 {
+		l.messages = min(l.messageMax, l.messages+elapsed*l.messageRefill)
+		l.bytes = min(l.byteMax, l.bytes+elapsed*l.byteRefill)
+		l.last = now
+	}
+	if l.messages < 1 || l.bytes < float64(size) {
+		return false
+	}
+	l.messages--
+	l.bytes -= float64(size)
+	return true
 }
 
 type sourceLimits struct {
@@ -169,11 +234,12 @@ type deviceBinding struct {
 
 type deviceTable struct {
 	mu sync.Mutex
-	m  map[string]deviceBinding
+	m  map[string]map[string]deviceBinding
+	n  int
 }
 
 func newDeviceTable() *deviceTable {
-	return &deviceTable{m: map[string]deviceBinding{}}
+	return &deviceTable{m: map[string]map[string]deviceBinding{}}
 }
 
 func (t *deviceTable) bind(key, peerID string, now time.Time) {
@@ -182,37 +248,100 @@ func (t *deviceTable) bind(key, peerID string, now time.Time) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if _, ok := t.m[key]; !ok && len(t.m) >= maxDeviceBind {
-		t.evictOldestLocked()
+	t.sweepLocked(now)
+	bindings := t.m[key]
+	if bindings == nil {
+		bindings = map[string]deviceBinding{}
+		t.m[key] = bindings
 	}
-	t.m[key] = deviceBinding{peerID: peerID, at: now}
+	if _, exists := bindings[peerID]; !exists && len(bindings) >= maxPeersPerDevice {
+		var oldestPeer string
+		var oldest time.Time
+		for id, binding := range bindings {
+			if oldestPeer == "" || binding.at.Before(oldest) {
+				oldestPeer, oldest = id, binding.at
+			}
+		}
+		delete(bindings, oldestPeer)
+		t.n--
+	}
+	if _, exists := bindings[peerID]; !exists && t.n >= maxDeviceBind {
+		t.evictOldestLocked()
+		if t.m[key] == nil {
+			t.m[key] = bindings
+		}
+	}
+	if _, exists := bindings[peerID]; !exists {
+		t.n++
+	}
+	bindings[peerID] = deviceBinding{peerID: peerID, at: now}
 }
 
 func (t *deviceTable) lookup(key string, now time.Time) (string, bool) {
+	all := t.lookupAll(key, now)
+	if len(all) == 0 {
+		return "", false
+	}
+	return all[0], true
+}
+
+func (t *deviceTable) lookupAll(key string, now time.Time) []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	b, ok := t.m[key]
-	if !ok {
-		return "", false
+	t.sweepLocked(now)
+	bindings := t.m[key]
+	out := make([]string, 0, len(bindings))
+	for peerID := range bindings {
+		out = append(out, peerID)
 	}
-	if now.Sub(b.at) > deviceBindTTL {
-		delete(t.m, key)
-		return "", false
+	return out
+}
+
+func (t *deviceTable) removePeer(peerID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for key, bindings := range t.m {
+		if _, ok := bindings[peerID]; ok {
+			delete(bindings, peerID)
+			t.n--
+		}
+		if len(bindings) == 0 {
+			delete(t.m, key)
+		}
 	}
-	return b.peerID, true
+}
+
+func (t *deviceTable) sweepLocked(now time.Time) {
+	for key, bindings := range t.m {
+		for peerID, binding := range bindings {
+			if now.Sub(binding.at) > deviceBindTTL {
+				delete(bindings, peerID)
+				t.n--
+			}
+		}
+		if len(bindings) == 0 {
+			delete(t.m, key)
+		}
+	}
 }
 
 func (t *deviceTable) evictOldestLocked() {
-	var oldestKey string
+	var oldestKey, oldestPeer string
 	var oldest time.Time
 	first := true
-	for k, b := range t.m {
-		if first || b.at.Before(oldest) {
-			oldest, oldestKey, first = b.at, k, false
+	for key, bindings := range t.m {
+		for peerID, binding := range bindings {
+			if first || binding.at.Before(oldest) {
+				oldest, oldestKey, oldestPeer, first = binding.at, key, peerID, false
+			}
 		}
 	}
 	if oldestKey != "" {
-		delete(t.m, oldestKey)
+		delete(t.m[oldestKey], oldestPeer)
+		t.n--
+		if len(t.m[oldestKey]) == 0 {
+			delete(t.m, oldestKey)
+		}
 	}
 }
 

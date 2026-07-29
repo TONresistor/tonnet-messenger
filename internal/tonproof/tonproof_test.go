@@ -48,7 +48,7 @@ func proofEnvelope(t *testing.T, deviceSeed, walletSeed byte, wts, wexp int64) e
 
 func TestVerifyValidProof(t *testing.T) {
 	now := time.Unix(1719900100, 0)
-	e := proofEnvelope(t, 1, 9, 1719900000, 1722492000)
+	e := proofEnvelope(t, 1, 9, 1719900000, 1720504800)
 	if err := e.Verify(); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestVerifyValidProof(t *testing.T) {
 	}
 	again, err := Verify(e, now)
 	if err != nil || again.String() != addr.String() {
-		t.Fatalf("cache mismatch: %v %v", again, err)
+		t.Fatalf("repeat verification mismatch: %v %v", again, err)
 	}
 	if s := Short(addr); len(s) < 9 {
 		t.Fatalf("short form too short: %q", s)
@@ -70,7 +70,7 @@ func TestVerifyValidProof(t *testing.T) {
 
 func TestVerifyRejections(t *testing.T) {
 	now := time.Unix(1719900100, 0)
-	valid := proofEnvelope(t, 1, 9, 1719900000, 1722492000)
+	valid := proofEnvelope(t, 1, 9, 1719900000, 1720504800)
 
 	noProof := valid
 	noProof.WKey = ""
@@ -91,7 +91,17 @@ func TestVerifyRejections(t *testing.T) {
 		t.Fatalf("want ErrFutureTS, got %v", err)
 	}
 
-	swapped := proofEnvelope(t, 2, 9, 1719900000, 1722492000)
+	tooLong := proofEnvelope(t, 1, 9, 1719900000, 1720504801)
+	if _, err := Verify(tooLong, now); err != ErrLifetime {
+		t.Fatalf("want ErrLifetime, got %v", err)
+	}
+
+	backwards := proofEnvelope(t, 1, 9, 1719900000, 1719900000)
+	if _, err := Verify(backwards, now); err != ErrLifetime {
+		t.Fatalf("want ErrLifetime for non-positive lifetime, got %v", err)
+	}
+
+	swapped := proofEnvelope(t, 2, 9, 1719900000, 1720504800)
 	swapped.Key = valid.Key
 	if _, err := Verify(swapped, now); err != ErrBadWallet {
 		t.Fatalf("want ErrBadWallet for foreign device key, got %v", err)
@@ -105,7 +115,7 @@ func TestVerifyRejections(t *testing.T) {
 		t.Fatalf("want ErrBadWallet for tampered wsig, got %v", err)
 	}
 
-	otherWallet := proofEnvelope(t, 1, 9, 1719900000, 1722492000)
+	otherWallet := proofEnvelope(t, 1, 9, 1719900000, 1720504800)
 	wpub := seededKey(7).Public().(ed25519.PublicKey)
 	otherWallet.WKey = hex.EncodeToString(wpub)
 	if _, err := Verify(otherWallet, now); err != ErrBadWallet {

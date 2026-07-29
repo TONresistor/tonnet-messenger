@@ -47,6 +47,7 @@ func TestParseNameInvalid(t *testing.T) {
 		"#o=" + ownerHex,
 		"tonnet:sp ace",
 		"tonnet:x#o=" + ownerHex + "#extra",
+		strings.Repeat("x", 257),
 	}
 	for _, c := range cases {
 		if _, err := ParseName(c); err == nil {

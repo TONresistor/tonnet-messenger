@@ -22,7 +22,7 @@ func (n *Node) peerMaintenanceLoop(ctx context.Context) {
 		case <-ticker.C:
 			now := time.Now()
 			for _, p := range n.peers.evictStale(now) {
-				n.closePeer(p, "quarantine expired")
+				n.closePeer(p, "leaf activity expired")
 			}
 			for _, p := range n.peers.nodePeersIdleSince(now, peerKeepaliveIdle) {
 				go n.keepalivePeer(ctx, p)
@@ -64,6 +64,8 @@ func (n *Node) closePeer(p *peer, reason string) {
 	if p == nil {
 		return
 	}
+	p.stopOnce.Do(func() { close(p.stop) })
+	n.devices.removePeer(p.id)
 	log.Printf("peer evicted %s…: %s (%s)", short(p.id), reason, n.countsString())
 	if p.w != nil {
 		p.w.Close()

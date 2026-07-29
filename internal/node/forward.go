@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"encoding/hex"
 	"log"
 	"time"
 
@@ -24,8 +25,51 @@ const (
 	badScoreRateLimit = 1
 )
 
+type outboundJob struct {
+	items []tl.Serializable
+}
+
+// The tonutils-go gateway invokes its connection handler for both accepted and
+// locally dialed ADNL peers. Unknown peers therefore stay outside the Tonnet
+// peer table until they actually send Tonnet overlay custom or query traffic;
+// this prevents ordinary DHT transport connections from consuming the
+// pending-leaf budget.
+func (n *Node) wireUntrackedPeer(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) {
+	promote := func() (*peer, bool) {
+		p, added := n.peers.addInbound(id, w, raw)
+		if p == nil {
+			raw.Close()
+			return nil, false
+		}
+		if !added && p.raw != raw {
+			raw.Close()
+			return nil, false
+		}
+		if added {
+			n.wirePeer(p)
+		}
+		return p, true
+	}
+	w.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
+		p, ok := promote()
+		if !ok {
+			return nil
+		}
+		n.handleCustomMessage(p, msg.Data, time.Now())
+		return nil
+	})
+	w.SetQueryHandler(func(q *adnl.MessageQuery) error {
+		p, ok := promote()
+		if !ok {
+			return nil
+		}
+		return n.answerQuery(p, q)
+	})
+}
+
 func (n *Node) wirePeer(p *peer) {
 	id := p.id
+	go n.outboundWriter(p)
 
 	p.w.SetCustomMessageHandler(func(msg *adnl.MessageCustom) error {
 		n.handleCustomMessage(p, msg.Data, time.Now())
@@ -38,9 +82,50 @@ func (n *Node) wirePeer(p *peer) {
 
 	p.w.SetDisconnectHandler(func(addr string, _ ed25519.PublicKey) {
 		if n.peers.removePeer(id, p) {
+			n.devices.removePeer(id)
+			p.stopOnce.Do(func() { close(p.stop) })
 			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
 		}
 	})
+}
+
+func (n *Node) outboundWriter(p *peer) {
+	for {
+		select {
+		case <-p.stop:
+			return
+		case job := <-p.out:
+			for _, item := range job.items {
+				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
+				err := p.w.SendCustomMessage(ctx, item)
+				cancel()
+				if err != nil {
+					log.Printf("relay to %s… failed: %v", short(p.id), err)
+					n.peerFailure(p, time.Now(), "relay failed")
+					break
+				}
+			}
+		}
+	}
+}
+
+func (n *Node) enqueue(p *peer, items ...tl.Serializable) bool {
+	if p == nil || p.w == nil || len(items) == 0 {
+		return false
+	}
+	job := outboundJob{items: items}
+	select {
+	case <-p.stop:
+		return false
+	case p.out <- job:
+		return true
+	default:
+		n.stats.slowPeerDisconnects.Add(1)
+		n.peers.removePeer(p.id, p)
+		n.devices.removePeer(p.id)
+		n.closePeer(p, "outbound queue full")
+		return false
+	}
 }
 
 func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time) {
@@ -48,11 +133,11 @@ func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time)
 		return
 	}
 	id := p.id
-	n.peers.markSeen(id, now)
 	if n.penalties.banned(id, now) {
 		return
 	}
-	if !p.limiter.allow() {
+	if !p.allowIngress() {
+		n.stats.peerRateDrops.Add(1)
 		n.scorePeer(p, badScoreRateLimit, now, "rate limited")
 		return
 	}
@@ -68,25 +153,19 @@ func (n *Node) handleCustomMessage(p *peer, data tl.Serializable, now time.Time)
 		n.closePeer(p, "leaf capacity reached")
 		return
 	}
-	n.commitAdmission(acceptedPeer, &adm, now)
+	authenticatedDevice := n.commitAdmission(acceptedPeer, &adm, now)
+	n.peers.markSeen(id, now)
 
 	env := adm.frame.Envelope
 	b := adm.frame.Broadcast
 	if joined {
 		log.Printf("member joined %s… (%s)", short(id), n.countsString())
-		n.replayHistory(acceptedPeer, leafKey(env, accepted))
-	} else if acceptedPeer.kind == kindLeaf && env.Type == "hello" {
-		n.replayHistory(acceptedPeer, env.Key)
+	}
+	if authenticatedDevice && n.peers.markReplayed(acceptedPeer.id) {
+		n.replayHistory(acceptedPeer, env.Key, adm.frame.ID)
 	}
 
 	n.relayAccepted(id, env, b)
-}
-
-func leafKey(env envelope.Envelope, accepted bool) string {
-	if !accepted {
-		return ""
-	}
-	return env.Key
 }
 
 type admission struct {
@@ -112,16 +191,45 @@ func (n *Node) prepareAdmission(p *peer, data tl.Serializable, now time.Time) (a
 
 	b, ok := broadcast.AsBroadcast(data)
 	if !ok {
+		n.stats.invalidDrops.Add(1)
 		return zero, false
 	}
 	if b.Flags != 0 {
+		n.stats.invalidDrops.Add(1)
 		return zero, false
 	}
 	raw, err := tl.Serialize(b, true)
 	if err != nil || len(raw) > broadcast.MaxSize {
+		n.stats.invalidDrops.Add(1)
 		return zero, false
 	}
 	if !broadcast.Fresh(b.Date, now) {
+		n.stats.invalidDrops.Add(1)
+		return zero, false
+	}
+
+	id, err := b.ID()
+	if err != nil {
+		n.stats.invalidDrops.Add(1)
+		if broadcast.ShouldPenalizeFrameError(err) {
+			n.punish(p, now)
+		}
+		return zero, false
+	}
+	if !n.dedup.Reserve(id) {
+		n.stats.duplicateDrops.Add(1)
+		return zero, false
+	}
+	adm := admission{frame: broadcast.Frame{Broadcast: b, ID: id, Raw: raw}}
+	owned := false
+	defer func() {
+		if !owned {
+			n.dedup.Release(id)
+		}
+	}()
+
+	if !n.ingress.allow(len(raw), now) {
+		n.stats.globalRateDrops.Add(1)
 		return zero, false
 	}
 
@@ -132,32 +240,27 @@ func (n *Node) prepareAdmission(p *peer, data tl.Serializable, now time.Time) (a
 		MaxSize:        broadcast.MaxSize,
 	})
 	if err != nil {
+		n.stats.invalidDrops.Add(1)
 		if broadcast.ShouldPenalizeFrameError(err) {
 			n.punish(p, now)
 		}
 		return zero, false
 	}
-	if !n.dedup.Reserve(frame.ID) {
-		return zero, false
-	}
-	adm := admission{frame: frame}
-	owned := false
-	defer func() {
-		if !owned {
-			n.dedup.Release(frame.ID)
-		}
-	}()
+	adm.frame = frame
 
 	if n.name.Mode == room.ModeGated {
 		if frame.Envelope.Type == "cert-req" {
 			if len(raw) > broadcast.MaxCertReqSize || !n.uncertified.allow() {
+				n.stats.invalidDrops.Add(1)
 				return zero, false
 			}
 		} else if !n.certOK(b.Certificate, frame.Source, uint32(len(raw)), now) {
+			n.stats.invalidDrops.Add(1)
 			return zero, false
 		}
 	}
 	if !n.sources.allow(frame.Envelope.Key, len(raw), now) {
+		n.stats.sourceRateDrops.Add(1)
 		return zero, false
 	}
 
@@ -172,27 +275,31 @@ func (n *Node) releaseAdmission(adm *admission) {
 	n.dedup.Release(adm.frame.ID)
 }
 
-func (n *Node) commitAdmission(p *peer, adm *admission, now time.Time) {
+func (n *Node) commitAdmission(p *peer, adm *admission, now time.Time) bool {
 	if adm == nil || adm.committed {
-		return
+		return false
 	}
 	n.dedup.Commit(adm.frame.ID)
 	adm.committed = true
+	n.stats.accepted.Add(1)
 	env := adm.frame.Envelope
 	b := adm.frame.Broadcast
-	n.room.ObserveAccepted(env, b)
-	if p != nil && p.kind == kindLeaf {
+	n.room.ObserveAcceptedWithID(env, b, adm.frame.ID)
+	allowNewBinding := env.Type == "hello" || env.Type == "cert-req"
+	authenticatedDevice := n.peers.authenticateDevice(p, env.Key, env.Text, allowNewBinding, now)
+	if authenticatedDevice {
 		n.devices.bind(env.Key, p.id, now)
 	}
 	n.wrappers.put(adm.frame.ID, b)
+	return authenticatedDevice
 }
 
 func (n *Node) punish(p *peer, now time.Time) {
 	n.penalties.punish(p.id, now)
 	if errs := n.peers.countError(p.id); errs == 1 || errs%16 == 0 {
-		log.Printf("bad signature from %s… (%d errors, penalized %s)", short(p.id), errs, sigPenalty)
+		log.Printf("invalid authenticated frame from %s… (%d errors, penalized %s)", short(p.id), errs, sigPenalty)
 	}
-	n.scorePeer(p, badScoreSignature, now, "bad signature")
+	n.scorePeer(p, badScoreSignature, now, "invalid authenticated frame")
 }
 
 func (n *Node) scorePeer(p *peer, score int, now time.Time, reason string) {
@@ -247,35 +354,50 @@ func addressed(env envelope.Envelope) bool {
 
 func (n *Node) selectTargets(fromID string, env envelope.Envelope, now time.Time) []*peer {
 	targets := n.peers.nodeTargets(fromID, nodeFanout)
+	if env.Type == "hello" {
+		return targets
+	}
 	if addressed(env) {
-		if peerID, ok := n.devices.lookup(env.To, now); ok && peerID != fromID {
-			if p, ok := n.peers.get(peerID); ok && p.kind == kindLeaf && p.member {
+		for _, peerID := range n.devices.lookupAll(env.To, now) {
+			if peerID == fromID {
+				continue
+			}
+			if p, ok := n.peers.memberLeaf(peerID); ok {
 				targets = append(targets, p)
 			}
 		}
 	} else {
 		targets = append(targets, n.peers.memberLeaves(fromID)...)
 	}
-	return targets
+	seen := make(map[string]struct{}, len(targets))
+	out := targets[:0]
+	for _, p := range targets {
+		if _, ok := seen[p.id]; ok {
+			continue
+		}
+		seen[p.id] = struct{}{}
+		out = append(out, p)
+	}
+	return out
 }
 
 func (n *Node) relayAccepted(fromID string, env envelope.Envelope, b broadcast.Broadcast) {
 	for _, p := range n.selectTargets(fromID, env, time.Now()) {
-		go func(p *peer) {
-			ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
-			defer cancel()
-			if err := p.w.SendCustomMessage(ctx, b); err != nil {
-				log.Printf("relay to %s… failed: %v", short(p.id), err)
-				n.peerFailure(p, time.Now(), "relay failed")
-			}
-		}(p)
+		n.enqueue(p, b)
 	}
 }
 
-func replayItems(items []room.Item, key string) []room.Item {
+func replayItems(items []room.Item, key string, excludeIDs ...string) []room.Item {
+	excludeID := ""
+	if len(excludeIDs) > 0 {
+		excludeID = excludeIDs[0]
+	}
 	out := make([]room.Item, 0, len(items))
 	for _, it := range items {
 		if it.Obj == nil {
+			continue
+		}
+		if excludeID != "" && it.ID == excludeID {
 			continue
 		}
 		if it.Type == "dm" && (key == "" || (it.To != key && it.From != key)) {
@@ -286,18 +408,18 @@ func replayItems(items []room.Item, key string) []room.Item {
 	return out
 }
 
-func (n *Node) replayHistory(p *peer, key string) {
-	items := replayItems(n.room.Recent(), key)
+func (n *Node) replayHistory(p *peer, key string, excludeID []byte) {
+	items := replayItems(n.room.Recent(), key, hex.EncodeToString(excludeID))
 	if len(items) == 0 {
 		return
 	}
-	go func() {
-		for _, it := range items {
-			ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
-			_ = p.w.SendCustomMessage(ctx, it.Obj)
-			cancel()
-		}
-	}()
+	batch := make([]tl.Serializable, 0, len(items))
+	for _, it := range items {
+		batch = append(batch, it.Obj)
+	}
+	if n.enqueue(p, batch...) {
+		n.stats.replayedItems.Add(uint64(len(batch)))
+	}
 }
 
 func short(id string) string {

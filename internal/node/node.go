@@ -29,13 +29,27 @@ const presenceSweepEach = 30 * time.Second
 const deliveredCap = 8192
 
 type Config struct {
-	Key       ed25519.PrivateKey
-	Listen    string
-	Advertise string
-	ConfigURL string
-	Room      string
-	OverlayID []byte
-	Socket    string
+	Key               ed25519.PrivateKey
+	Listen            string
+	Advertise         string
+	ConfigURL         string
+	Room              string
+	OverlayID         []byte
+	Socket            string
+	MaxLeaves         int
+	ExperimentalGated bool
+}
+
+type stats struct {
+	accepted            atomic.Uint64
+	duplicateDrops      atomic.Uint64
+	invalidDrops        atomic.Uint64
+	peerRateDrops       atomic.Uint64
+	globalRateDrops     atomic.Uint64
+	sourceRateDrops     atomic.Uint64
+	queryRateDrops      atomic.Uint64
+	slowPeerDisconnects atomic.Uint64
+	replayedItems       atomic.Uint64
 }
 
 type Node struct {
@@ -51,6 +65,9 @@ type Node struct {
 	certs       *certCache
 	devices     *deviceTable
 	wrappers    *wrapperStore
+	ingress     *dualLimiter
+	queries     *tokenBucket
+	stats       stats
 	pub         atomic.Pointer[dht.Publisher]
 	dialSem     chan struct{}
 	myID        string
@@ -62,13 +79,22 @@ func New(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, fmt.Errorf("room %q: %w", cfg.Room, err)
 	}
+	if name.Mode == room.ModeGated && !cfg.ExperimentalGated {
+		return nil, fmt.Errorf("gated rooms are experimental; pass --experimental-gated-rooms to enable")
+	}
+	if cfg.MaxLeaves == 0 {
+		cfg.MaxLeaves = DefaultMaxLeaves
+	}
+	if cfg.MaxLeaves < 1 || cfg.MaxLeaves > MaxLeavesLimit {
+		return nil, fmt.Errorf("max leaves must be between 1 and %d", MaxLeavesLimit)
+	}
 	gw := adnl.NewGateway(cfg.Key)
 	n := &Node{
 		cfg:         cfg,
 		name:        name,
 		gw:          gw,
 		room:        room.New(name, cfg.OverlayID),
-		peers:       newPeerTable(0),
+		peers:       newPeerTable(cfg.MaxLeaves),
 		dedup:       ov.NewDedup(deliveredCap),
 		penalties:   newPenaltyBox(),
 		sources:     newSourceLimits(),
@@ -76,6 +102,8 @@ func New(cfg Config) (*Node, error) {
 		certs:       newCertCache(),
 		devices:     newDeviceTable(),
 		wrappers:    newWrapperStore(),
+		ingress:     newDualLimiter(),
+		queries:     newTokenBucket(globalQueryBurst, globalQueryRefill),
 		dialSem:     make(chan struct{}, maxConcurrentDials),
 		myID:        hex.EncodeToString(gw.GetID()),
 		started:     time.Now(),
@@ -102,17 +130,19 @@ func (n *Node) onInbound(peer adnl.Peer) error {
 		return nil
 	}
 	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.room.OverlayID())
-	if n.peers.has(id) || n.peers.isKnown(id) {
-		p, added := n.peers.addInbound(id, w, peer)
-		if p == nil {
-			return fmt.Errorf("leaf capacity reached")
-		}
-		if added {
-			n.wirePeer(p)
-		}
+	if !n.peers.has(id) && !n.peers.isKnown(id) {
+		n.wireUntrackedPeer(id, w, peer)
 		return nil
 	}
-	n.wirePeer(newPeer(id, kindLeaf, w, peer, nil))
+	p, added := n.peers.addInbound(id, w, peer)
+	if p == nil {
+		return fmt.Errorf("peer capacity reached")
+	}
+	if added {
+		n.wirePeer(p)
+	} else if p.raw != peer {
+		peer.Close()
+	}
 	return nil
 }
 
@@ -144,6 +174,22 @@ func (n *Node) Status() control.Status {
 		Advertise: n.cfg.Advertise,
 		StartedAt: n.started.Unix(),
 		UptimeSec: int64(time.Since(n.started).Seconds()),
+		Limits: control.Limits{
+			MaxLeaves:       n.cfg.MaxLeaves,
+			MaxNodePeers:    MaxNodePeers,
+			MaxPendingPeers: MaxPendingPeers,
+		},
+		Stats: control.Stats{
+			Accepted:            n.stats.accepted.Load(),
+			DuplicateDrops:      n.stats.duplicateDrops.Load(),
+			InvalidDrops:        n.stats.invalidDrops.Load(),
+			PeerRateDrops:       n.stats.peerRateDrops.Load(),
+			GlobalRateDrops:     n.stats.globalRateDrops.Load(),
+			SourceRateDrops:     n.stats.sourceRateDrops.Load(),
+			QueryRateDrops:      n.stats.queryRateDrops.Load(),
+			SlowPeerDisconnects: n.stats.slowPeerDisconnects.Load(),
+			ReplayedItems:       n.stats.replayedItems.Load(),
+		},
 		Rooms: []control.RoomStatus{{
 			Name:       n.cfg.Room,
 			OverlayID:  base64.StdEncoding.EncodeToString(n.cfg.OverlayID),

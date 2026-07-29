@@ -95,6 +95,12 @@ func newStatusCmd() *cobra.Command {
 					r.Name, r.Members, r.Neighbours, r.Presence)
 				fmt.Printf("          overlay=%s\n", r.OverlayID)
 			}
+			fmt.Printf("limits    leaves=%d  nodes=%d  pending=%d\n",
+				s.Limits.MaxLeaves, s.Limits.MaxNodePeers, s.Limits.MaxPendingPeers)
+			fmt.Printf("traffic   accepted=%d  invalid=%d  duplicates=%d  rate=%d/%d/%d  query-rate=%d  slow=%d  replayed=%d\n",
+				s.Stats.Accepted, s.Stats.InvalidDrops, s.Stats.DuplicateDrops,
+				s.Stats.PeerRateDrops, s.Stats.GlobalRateDrops, s.Stats.SourceRateDrops, s.Stats.QueryRateDrops,
+				s.Stats.SlowPeerDisconnects, s.Stats.ReplayedItems)
 			return nil
 		},
 	}

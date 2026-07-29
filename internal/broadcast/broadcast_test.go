@@ -128,3 +128,31 @@ func TestFreshWindow(t *testing.T) {
 		t.Fatal("newer than the window must be rejected")
 	}
 }
+
+func TestChallengeConstructors(t *testing.T) {
+	query, err := tl.Serialize(GetChallenge{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytesToHex(query); got != "a270d948" {
+		t.Fatalf("getChallenge constructor = %s", got)
+	}
+	nonce := make([]byte, 32)
+	response, err := tl.Serialize(Challenge{Nonce: nonce, Expires: 123}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytesToHex(response[:4]); got != "4c34c713" {
+		t.Fatalf("challenge constructor = %s", got)
+	}
+}
+
+func bytesToHex(data []byte) string {
+	const digits = "0123456789abcdef"
+	out := make([]byte, len(data)*2)
+	for i, b := range data {
+		out[i*2] = digits[b>>4]
+		out[i*2+1] = digits[b&0x0f]
+	}
+	return string(out)
+}

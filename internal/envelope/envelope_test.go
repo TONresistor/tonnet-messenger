@@ -145,6 +145,22 @@ func TestFieldLimitsAndMalformedFields(t *testing.T) {
 	}
 }
 
+func TestRecipientPolicyIsTypeSpecificAndLowercase(t *testing.T) {
+	key := hex.EncodeToString(seededKey(7).Public().(ed25519.PublicKey))
+	if err := (Envelope{Type: "msg", Room: "tonnet:room", To: key}).validate(false); err != ErrBadTo {
+		t.Fatalf("msg recipient: want ErrBadTo, got %v", err)
+	}
+	if err := (Envelope{Type: "dm", Room: "tonnet:room"}).validate(false); err != ErrBadTo {
+		t.Fatalf("dm without recipient: want ErrBadTo, got %v", err)
+	}
+	if err := (Envelope{Type: "dm", Room: "tonnet:room", To: strings.ToUpper(key)}).validate(false); err != ErrBadTo {
+		t.Fatalf("uppercase recipient: want ErrBadTo, got %v", err)
+	}
+	if err := (Envelope{Type: "cert-grant", Room: "tonnet:room", To: key}).validate(false); err != nil {
+		t.Fatalf("valid cert-grant recipient rejected: %v", err)
+	}
+}
+
 func TestForgedKeyRejected(t *testing.T) {
 	victim := newKey(t)
 	e := signedV4(t, victim, false)
