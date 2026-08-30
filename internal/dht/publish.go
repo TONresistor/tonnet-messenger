@@ -21,12 +21,25 @@ import (
 const (
 	RepublishEach = 5 * time.Minute
 	RecordTTL     = 30 * time.Minute
+
+	// After a failed address publish, retry sooner than the regular TTL refresh.
+	// Clients join by FindAddresses; an overlay-only record leaves them unable to dial.
+	storeRetryEach = 20 * time.Second
+	publishTimeout = 45 * time.Second
+	verifyTimeout  = 15 * time.Second
 )
 
 var nonPublicADNLNets = parseNonPublicADNLNets()
 
+type dhtClient interface {
+	StoreAddress(ctx context.Context, addresses address.List, ttl time.Duration, ownerKey ed25519.PrivateKey) (int, []byte, error)
+	StoreOverlayNodes(ctx context.Context, overlayKey []byte, nodes *overlay.NodesList, ttl time.Duration) (int, []byte, error)
+	FindAddresses(ctx context.Context, key []byte) (*address.List, ed25519.PublicKey, error)
+	FindOverlayNodes(ctx context.Context, overlayKey []byte, continuation ...*tondht.Continuation) (*overlay.NodesList, *tondht.Continuation, error)
+}
+
 type Publisher struct {
-	d         *tondht.Client
+	d         dhtClient
 	gw        *adnl.Gateway
 	key       ed25519.PrivateKey
 	room      []byte
@@ -41,14 +54,80 @@ func NewPublisher(ctx context.Context, gw *adnl.Gateway, cfgURL string, key ed25
 	return &Publisher{d: d, gw: gw, key: key, room: room, overlayID: overlayID}, nil
 }
 
-func (p *Publisher) publish(ctx context.Context) {
-	cctx, cancel := context.WithTimeout(ctx, 45*time.Second)
-	defer cancel()
-
-	if _, _, err := p.d.StoreAddress(cctx, p.gw.GetAddressList(), RecordTTL, p.key); err != nil {
-		log.Printf("dht storeAddress: %v", err)
+func nextPublishDelay(addrOK, overlayOK bool) time.Duration {
+	if addrOK && overlayOK {
+		return RepublishEach
 	}
+	return storeRetryEach
+}
 
+func endpointKey(addr address.Address) string {
+	ip := address.IPValue(addr)
+	if ip == nil {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", address.PortValue(addr)))
+}
+
+func hasPublicEndpoint(list address.List) bool {
+	for _, addr := range list.Addresses {
+		if PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPublishedEndpoint(found, published address.List) bool {
+	want := make(map[string]struct{})
+	for _, addr := range published.Addresses {
+		if PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
+			want[endpointKey(addr)] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return false
+	}
+	for _, addr := range found.Addresses {
+		if _, ok := want[endpointKey(addr)]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Publisher) publishAddress(ctx context.Context) bool {
+	list := p.gw.GetAddressList()
+	if !hasPublicEndpoint(list) {
+		log.Printf("dht storeAddress: no public endpoint on the gateway")
+		return false
+	}
+	storeCtx, storeCancel := context.WithTimeout(ctx, publishTimeout)
+	n, _, err := p.d.StoreAddress(storeCtx, list, RecordTTL, p.key)
+	storeCancel()
+	if err != nil {
+		log.Printf("dht storeAddress: %v", err)
+		return false
+	}
+	if n < 1 {
+		log.Printf("dht storeAddress: stored 0 copies")
+		return false
+	}
+	findCtx, findCancel := context.WithTimeout(ctx, verifyTimeout)
+	found, _, findErr := p.d.FindAddresses(findCtx, p.gw.GetID())
+	findCancel()
+	if findErr != nil || found == nil || !containsPublishedEndpoint(*found, list) {
+		if findErr != nil {
+			log.Printf("dht storeAddress: stored %d copies but FindAddresses: %v", n, findErr)
+		} else {
+			log.Printf("dht storeAddress: stored %d copies but FindAddresses does not list this endpoint", n)
+		}
+		return false
+	}
+	return true
+}
+
+func (p *Publisher) publishOverlay(ctx context.Context) bool {
 	node := overlay.Node{
 		ID:      keys.PublicKeyED25519{Key: p.key.Public().(ed25519.PublicKey)},
 		Overlay: p.overlayID,
@@ -56,27 +135,48 @@ func (p *Publisher) publish(ctx context.Context) {
 	}
 	if err := node.Sign(p.key); err != nil {
 		log.Printf("sign overlay node: %v", err)
-		return
+		return false
 	}
-	nodes := &overlay.NodesList{List: []overlay.Node{node}}
-	if _, _, err := p.d.StoreOverlayNodes(cctx, p.room, nodes, RecordTTL); err != nil {
+	cctx, cancel := context.WithTimeout(ctx, publishTimeout)
+	defer cancel()
+	if _, _, err := p.d.StoreOverlayNodes(cctx, p.room, &overlay.NodesList{List: []overlay.Node{node}}, RecordTTL); err != nil {
 		log.Printf("dht storeOverlayNodes: %v", err)
-		return
+		return false
 	}
-	log.Printf("republished to DHT (address + overlay node)")
+	return true
+}
+
+func (p *Publisher) publish(ctx context.Context) (addrOK, overlayOK bool) {
+	addrOK = p.publishAddress(ctx)
+	overlayOK = p.publishOverlay(ctx)
+	switch {
+	case addrOK && overlayOK:
+		log.Printf("republished to DHT (address + overlay node)")
+	case overlayOK:
+		log.Printf("dht overlay published; address not yet findable — clients cannot connect")
+	case addrOK:
+		log.Printf("dht address published; overlay not yet findable")
+	}
+	return addrOK, overlayOK
 }
 
 func (p *Publisher) Run(ctx context.Context) {
-	p.publish(ctx)
-	t := time.NewTicker(RepublishEach)
-	defer t.Stop()
+	delay := time.Duration(0)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			p.publish(ctx)
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
 		}
+		if ctx.Err() != nil {
+			return
+		}
+		addrOK, overlayOK := p.publish(ctx)
+		delay = nextPublishDelay(addrOK, overlayOK)
 	}
 }
 
