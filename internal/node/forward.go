@@ -36,10 +36,14 @@ type outboundJob struct {
 // pending-leaf budget.
 func (n *Node) wireUntrackedPeer(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) {
 	promote := func() (*peer, bool) {
-		p, added := n.peers.addInbound(id, w, raw)
+		p, added, replaced := n.peers.addInbound(id, w, raw)
 		if p == nil {
 			raw.Close()
 			return nil, false
+		}
+		if replaced != nil {
+			n.devices.removePeer(id)
+			closePeerConnection(replaced)
 		}
 		if !added && p.raw != raw {
 			raw.Close()

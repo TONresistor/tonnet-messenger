@@ -134,9 +134,13 @@ func (n *Node) onInbound(peer adnl.Peer) error {
 		n.wireUntrackedPeer(id, w, peer)
 		return nil
 	}
-	p, added := n.peers.addInbound(id, w, peer)
+	p, added, replaced := n.peers.addInbound(id, w, peer)
 	if p == nil {
 		return fmt.Errorf("peer capacity reached")
+	}
+	if replaced != nil {
+		n.devices.removePeer(id)
+		closePeerConnection(replaced)
 	}
 	if added {
 		n.wirePeer(p)

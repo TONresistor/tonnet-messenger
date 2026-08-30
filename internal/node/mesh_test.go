@@ -103,7 +103,7 @@ func issueCert(t *testing.T, owner ed25519.PrivateKey, overlayID []byte, devPub 
 }
 
 func leafPeer(n *Node, id string) *peer {
-	p, _ := n.peers.addInbound(id, nil, nil)
+	p, _, _ := n.peers.addInbound(id, nil, nil)
 	return p
 }
 
@@ -422,6 +422,39 @@ func TestPeerTableLeafVsNodeCounting(t *testing.T) {
 	}
 }
 
+func TestInboundLeafReconnectCreatesFreshSession(t *testing.T) {
+	tbl := newPeerTable(0)
+	raw1 := &recordingPeer{id: []byte("leaf")}
+	first, added, replaced := tbl.addInbound("leaf", nil, raw1)
+	if first == nil || !added {
+		t.Fatal("first leaf session should be added")
+	}
+	if replaced != nil {
+		t.Fatal("first leaf session must not replace another session")
+	}
+	if !tbl.markMember("leaf") || !tbl.markReplayed("leaf") {
+		t.Fatal("first leaf session should join and receive replay once")
+	}
+
+	raw2 := &recordingPeer{id: []byte("leaf")}
+	second, added, replaced := tbl.addInbound("leaf", nil, raw2)
+	if second == nil || !added {
+		t.Fatal("a new transport for the same leaf must create a fresh session")
+	}
+	if replaced != first {
+		t.Fatal("the stale session must be returned for cleanup")
+	}
+	if second == first || second.raw != raw2 {
+		t.Fatal("the fresh session must replace the stale transport")
+	}
+	if !tbl.markReplayed("leaf") {
+		t.Fatal("the reconnected leaf must receive replay once")
+	}
+	if tbl.markReplayed("leaf") {
+		t.Fatal("replay must remain limited to once per connection")
+	}
+}
+
 func TestInvalidCustomMessageDoesNotPromoteLeaf(t *testing.T) {
 	n := newTestNode(t, "tonnet:test")
 	p := leafPeer(n, "leafBad")
@@ -483,7 +516,7 @@ func TestUnknownInboundAcceptedHelloTracksMember(t *testing.T) {
 	}
 	b := wrap(t, dev, nil, env, time.Now().Unix())
 	raw := detachedPeer("leafA")
-	p, added := n.peers.addInbound(raw.id, raw.w, raw.raw)
+	p, added, _ := n.peers.addInbound(raw.id, raw.w, raw.raw)
 	if p == nil || !added {
 		t.Fatal("first Tonnet frame must reserve a pending peer slot")
 	}
@@ -543,7 +576,7 @@ func TestNodeOnlyGoodSignalDoesNotPromoteLeaf(t *testing.T) {
 
 func TestNodePeerGetsAggregateTrafficBudget(t *testing.T) {
 	tbl := newPeerTable(0)
-	leaf, _ := tbl.addInbound("leaf", nil, nil)
+	leaf, _, _ := tbl.addInbound("leaf", nil, nil)
 	nodePeer, _ := tbl.addNode("node", nil, nil, nil)
 
 	for i := 0; i < leafPeerBurst; i++ {
@@ -563,7 +596,7 @@ func TestNodePeerGetsAggregateTrafficBudget(t *testing.T) {
 
 func TestPeerLimiterUpgradeIsSynchronized(t *testing.T) {
 	tbl := newPeerTable(0)
-	p, added := tbl.addInbound("upgrade", nil, nil)
+	p, added, _ := tbl.addInbound("upgrade", nil, nil)
 	if p == nil || !added {
 		t.Fatal("leaf should be admitted before limiter upgrade")
 	}
@@ -757,15 +790,15 @@ func TestInboundNodeReclassifiedNotDoubleCounted(t *testing.T) {
 
 func TestLeafCapRefusesButNodesBypass(t *testing.T) {
 	tbl := newPeerTable(2)
-	p1, added := tbl.addInbound("l1", nil, nil)
+	p1, added, _ := tbl.addInbound("l1", nil, nil)
 	if p1 == nil || !added {
 		t.Fatal("first leaf should be admitted")
 	}
-	p2, added := tbl.addInbound("l2", nil, nil)
+	p2, added, _ := tbl.addInbound("l2", nil, nil)
 	if p2 == nil || !added {
 		t.Fatal("second leaf should be admitted")
 	}
-	p3, added := tbl.addInbound("l3", nil, nil)
+	p3, added, _ := tbl.addInbound("l3", nil, nil)
 	if p3 == nil || !added {
 		t.Fatal("pending peers use their own cap and must not consume member slots")
 	}
@@ -779,14 +812,14 @@ func TestLeafCapRefusesButNodesBypass(t *testing.T) {
 		t.Fatal("third accepted member must be refused at the member cap")
 	}
 	tbl.markKnown("nodeX")
-	if p, added := tbl.addInbound("nodeX", nil, nil); p == nil || !added {
+	if p, added, _ := tbl.addInbound("nodeX", nil, nil); p == nil || !added {
 		t.Fatal("a known node must be admitted despite the leaf cap")
 	}
 }
 
 func TestDisconnectedPendingPeerCannotBeReinsertedByLateAdmission(t *testing.T) {
 	tbl := newPeerTable(2)
-	p, added := tbl.addInbound("late", nil, nil)
+	p, added, _ := tbl.addInbound("late", nil, nil)
 	if p == nil || !added {
 		t.Fatal("pending peer should be admitted")
 	}
@@ -835,11 +868,11 @@ func TestGlobalIngressLimiterChargesMessagesAndBytesAtomically(t *testing.T) {
 func TestPendingPeerCapIsSeparateFromMemberCap(t *testing.T) {
 	tbl := newPeerTable(1)
 	for i := 0; i < MaxPendingPeers; i++ {
-		if p, added := tbl.addInbound(fmt.Sprintf("pending-%d", i), nil, nil); p == nil || !added {
+		if p, added, _ := tbl.addInbound(fmt.Sprintf("pending-%d", i), nil, nil); p == nil || !added {
 			t.Fatalf("pending peer %d should fit", i)
 		}
 	}
-	if p, added := tbl.addInbound("overflow", nil, nil); p != nil || added {
+	if p, added, _ := tbl.addInbound("overflow", nil, nil); p != nil || added {
 		t.Fatal("pending peer past the cap must be refused")
 	}
 }
@@ -901,7 +934,7 @@ func TestDeviceTableSupportsMultiplePeersAndDisconnectCleanup(t *testing.T) {
 
 func TestDeviceBindingRequiresConnectionChallenge(t *testing.T) {
 	tbl := newPeerTable(2)
-	p, added := tbl.addInbound("leaf", nil, nil)
+	p, added, _ := tbl.addInbound("leaf", nil, nil)
 	if p == nil || !added {
 		t.Fatal("leaf should be pending")
 	}

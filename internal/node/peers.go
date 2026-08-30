@@ -108,25 +108,30 @@ func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adn
 	}
 }
 
-func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) (*peer, bool) {
+func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) (*peer, bool, *peer) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
-		return p, false
+		if p.kind != kindLeaf || p.raw == raw {
+			return p, false, nil
+		}
+		next := newPeer(id, kindLeaf, w, raw, nil)
+		t.m[id] = next
+		return next, true, p
 	}
 	kind := kindLeaf
 	if _, ok := t.known[id]; ok {
 		kind = kindNode
 	}
 	if kind == kindLeaf && t.pendingCountLocked() >= MaxPendingPeers {
-		return nil, false
+		return nil, false, nil
 	}
 	if kind == kindNode && t.nodeCountLocked() >= MaxNodePeers {
-		return nil, false
+		return nil, false, nil
 	}
 	p := newPeer(id, kind, w, raw, nil)
 	t.m[id] = p
-	return p, true
+	return p, true, nil
 }
 
 func (t *peerTable) has(id string) bool {
