@@ -1,7 +1,7 @@
 # Tonnet chat protocol
 
 **Spec version:** 0.3.1
-**Status:** implemented in the v0.3.1 working tree, not yet released. This
+**Status:** released as v0.3.1. This
 document is normative; the Go and TypeScript implementations MUST conform to
 it. Cross-language fixtures in
 `internal/broadcast/testdata/vectors.json`,
