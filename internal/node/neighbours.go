@@ -299,6 +299,16 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 			return nil
 		}
 		return n.answer(p, q, broadcast.Challenge{Nonce: nonce, Expires: int32(expires.Unix())})
+	case broadcast.GetSessionChallenge, *broadcast.GetSessionChallenge:
+		nonce := make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			return err
+		}
+		expires := now.Add(time.Minute)
+		if !n.peers.setSessionChallenge(p, nonce, expires) {
+			return nil
+		}
+		return n.answer(p, q, broadcast.Challenge{Nonce: nonce, Expires: int32(expires.Unix())})
 	case broadcast.GetBroadcast:
 		return n.answerGetBroadcast(p, q, req.Hash)
 	case *broadcast.GetBroadcast:

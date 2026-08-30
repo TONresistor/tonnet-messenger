@@ -147,6 +147,16 @@ func TestChallengeConstructors(t *testing.T) {
 	}
 }
 
+func TestSessionChallengeConstructor(t *testing.T) {
+	query, err := tl.Serialize(GetSessionChallenge{}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bytesToHex(query); got != "293e72b3" {
+		t.Fatalf("getSessionChallenge constructor = %s", got)
+	}
+}
+
 func bytesToHex(data []byte) string {
 	const digits = "0123456789abcdef"
 	out := make([]byte, len(data)*2)

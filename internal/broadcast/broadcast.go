@@ -46,6 +46,8 @@ type Time struct {
 
 type GetChallenge struct{}
 
+type GetSessionChallenge struct{}
+
 type Challenge struct {
 	Nonce   []byte `tl:"int256"`
 	Expires int32  `tl:"int"`
@@ -64,6 +66,7 @@ func init() {
 	tl.Register(GetTime{}, "tonnet.getTime = tonnet.Time")
 	tl.Register(Time{}, "tonnet.time now:int = tonnet.Time")
 	tl.Register(GetChallenge{}, "tonnet.getChallenge = tonnet.Challenge")
+	tl.Register(GetSessionChallenge{}, "tonnet.getSessionChallenge = tonnet.Challenge")
 	tl.Register(Challenge{}, "tonnet.challenge nonce:int256 expires:int = tonnet.Challenge")
 	tl.Register(GetBroadcast{}, "tonnet.getBroadcast hash:int256 = tonnet.Broadcast")
 	tl.Register(NotFound{}, "tonnet.broadcastNotFound = tonnet.Broadcast")

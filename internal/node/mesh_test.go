@@ -963,6 +963,41 @@ func TestDeviceBindingRequiresConnectionChallenge(t *testing.T) {
 	}
 }
 
+func TestSessionChallengeRearmsReplayOnSameConnection(t *testing.T) {
+	tbl := newPeerTable(2)
+	p, added, _ := tbl.addInbound("leaf", nil, nil)
+	if p == nil || !added {
+		t.Fatal("leaf should be pending")
+	}
+	now := time.Now()
+	if _, _, ok := tbl.acceptInbound(p, now); !ok {
+		t.Fatal("leaf should be admitted")
+	}
+	key := hex.EncodeToString(genKey(t).Public().(ed25519.PublicKey))
+	first := make([]byte, 32)
+	first[0] = 1
+	if !tbl.setChallenge(p, first, now.Add(time.Minute)) ||
+		!tbl.authenticateDevice(p, key, hex.EncodeToString(first), true, now) ||
+		!tbl.markReplayed("leaf") {
+		t.Fatal("first session should authenticate and receive replay")
+	}
+
+	next := make([]byte, 32)
+	next[0] = 2
+	if !tbl.setSessionChallenge(p, next, now.Add(time.Minute)) {
+		t.Fatal("session challenge should attach to the existing connection")
+	}
+	if !tbl.authenticateDevice(p, key, hex.EncodeToString(next), true, now) {
+		t.Fatal("existing device should authenticate the new logical session")
+	}
+	if !tbl.markReplayed("leaf") {
+		t.Fatal("new logical session should receive replay on the same connection")
+	}
+	if tbl.markReplayed("leaf") {
+		t.Fatal("replay must remain limited to once per logical session")
+	}
+}
+
 func TestPenaltyBoxExpires(t *testing.T) {
 	b := newPenaltyBox()
 	now := time.Now()

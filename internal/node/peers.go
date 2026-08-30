@@ -48,28 +48,29 @@ const (
 )
 
 type peer struct {
-	id             string
-	kind           peerKind
-	state          peerState
-	w              *tonoverlay.ADNLOverlayWrapper
-	raw            adnl.Peer
-	member         bool
-	replayed       bool
-	errs           int
-	badScore       int
-	failures       int
-	firstSeen      time.Time
-	lastSeen       time.Time
-	lastGood       time.Time
-	signed         *tonoverlay.Node
-	challenge      []byte
-	challengeUntil time.Time
-	boundKey       string
-	limiterMu      sync.RWMutex
-	limiter        *tokenBucket
-	out            chan outboundJob
-	stop           chan struct{}
-	stopOnce       sync.Once
+	id              string
+	kind            peerKind
+	state           peerState
+	w               *tonoverlay.ADNLOverlayWrapper
+	raw             adnl.Peer
+	member          bool
+	replayed        bool
+	errs            int
+	badScore        int
+	failures        int
+	firstSeen       time.Time
+	lastSeen        time.Time
+	lastGood        time.Time
+	signed          *tonoverlay.Node
+	challenge       []byte
+	challengeUntil  time.Time
+	challengeReplay bool
+	boundKey        string
+	limiterMu       sync.RWMutex
+	limiter         *tokenBucket
+	out             chan outboundJob
+	stop            chan struct{}
+	stopOnce        sync.Once
 }
 
 type peerTable struct {
@@ -195,6 +196,14 @@ func (t *peerTable) memberLeaf(id string) (*peer, bool) {
 }
 
 func (t *peerTable) setChallenge(candidate *peer, nonce []byte, until time.Time) bool {
+	return t.setChallengeMode(candidate, nonce, until, false)
+}
+
+func (t *peerTable) setSessionChallenge(candidate *peer, nonce []byte, until time.Time) bool {
+	return t.setChallengeMode(candidate, nonce, until, true)
+}
+
+func (t *peerTable) setChallengeMode(candidate *peer, nonce []byte, until time.Time, replay bool) bool {
 	if candidate == nil || len(nonce) != 32 {
 		return false
 	}
@@ -206,6 +215,7 @@ func (t *peerTable) setChallenge(candidate *peer, nonce []byte, until time.Time)
 	}
 	p.challenge = append(p.challenge[:0], nonce...)
 	p.challengeUntil = until
+	p.challengeReplay = replay
 	return true
 }
 
@@ -220,6 +230,17 @@ func (t *peerTable) authenticateDevice(candidate *peer, key, proof string, allow
 		return false
 	}
 	if p.boundKey == key {
+		if allowNew && proof != "" && p.challengeUntil.After(now) {
+			decoded, err := hex.DecodeString(proof)
+			if err == nil && bytes.Equal(decoded, p.challenge) {
+				if p.challengeReplay {
+					p.replayed = false
+				}
+				p.challenge = nil
+				p.challengeUntil = time.Time{}
+				p.challengeReplay = false
+			}
+		}
 		return true
 	}
 	if !allowNew || p.boundKey != "" || !p.challengeUntil.After(now) {
@@ -230,8 +251,12 @@ func (t *peerTable) authenticateDevice(candidate *peer, key, proof string, allow
 		return false
 	}
 	p.boundKey = key
+	if p.challengeReplay {
+		p.replayed = false
+	}
 	p.challenge = nil
 	p.challengeUntil = time.Time{}
+	p.challengeReplay = false
 	return true
 }
 
