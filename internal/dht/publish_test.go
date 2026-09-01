@@ -11,7 +11,9 @@ import (
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	tondht "github.com/xssnick/tonutils-go/adnl/dht"
+	"github.com/xssnick/tonutils-go/adnl/keys"
 	"github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 func udpAddr(t *testing.T, ip string, port int32) address.Address {
@@ -23,28 +25,38 @@ func udpAddr(t *testing.T, ip string, port int32) address.Address {
 	return a
 }
 
+func quicAddr(ip string, port int32) address.Address {
+	return &address.QUIC{IP: net.ParseIP(ip).To4(), Port: port}
+}
+
 func TestHasPublicEndpoint(t *testing.T) {
 	if hasPublicEndpoint(address.List{}) {
 		t.Fatal("empty list is not a public endpoint")
 	}
-	if hasPublicEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "127.0.0.1", 17400)}}) {
+	if hasPublicEndpoint(address.List{Addresses: []address.Address{quicAddr("127.0.0.1", 17400)}}) {
 		t.Fatal("loopback must not be published")
 	}
-	if !hasPublicEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}) {
-		t.Fatal("the advertised public UDP endpoint must be publishable")
+	if hasPublicEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}) {
+		t.Fatal("classic UDP ADNL must not satisfy the Messenger transport requirement")
+	}
+	if !hasPublicEndpoint(address.List{Addresses: []address.Address{quicAddr("159.195.83.116", 17400)}}) {
+		t.Fatal("the advertised public TON QUIC endpoint must be publishable")
 	}
 }
 
 func TestContainsPublishedEndpoint(t *testing.T) {
-	published := address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}
+	published := address.List{Addresses: []address.Address{quicAddr("159.195.83.116", 17400)}}
 	if containsPublishedEndpoint(address.List{}, published) {
 		t.Fatal("an empty FindAddresses result is not visible")
 	}
-	if containsPublishedEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "1.1.1.1", 17400)}}, published) {
+	if containsPublishedEndpoint(address.List{Addresses: []address.Address{quicAddr("1.1.1.1", 17400)}}, published) {
 		t.Fatal("a different IP is not this node")
 	}
-	if !containsPublishedEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}, published) {
-		t.Fatal("FindAddresses must accept the published UDP endpoint")
+	if containsPublishedEndpoint(address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}, published) {
+		t.Fatal("a UDP ADNL endpoint must not match a published TON QUIC endpoint")
+	}
+	if !containsPublishedEndpoint(address.List{Addresses: []address.Address{quicAddr("159.195.83.116", 17400)}}, published) {
+		t.Fatal("FindAddresses must accept the published TON QUIC endpoint")
 	}
 }
 
@@ -64,6 +76,7 @@ type fakeDHT struct {
 	storeAddrN   int
 	storeAddrErr error
 	findAddr     *address.List
+	findPub      ed25519.PublicKey
 	findAddrErr  error
 	storeOverN   int
 	storeOverErr error
@@ -82,7 +95,40 @@ func (f *fakeDHT) StoreOverlayNodes(context.Context, []byte, *overlay.NodesList,
 }
 func (f *fakeDHT) FindAddresses(context.Context, []byte) (*address.List, ed25519.PublicKey, error) {
 	f.findCalls++
-	return f.findAddr, nil, f.findAddrErr
+	return f.findAddr, f.findPub, f.findAddrErr
+}
+
+func TestResolveAllRequiresQUICAndMatchingADNLID(t *testing.T) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	public := key.Public().(ed25519.PublicKey)
+	id, err := tl.Hash(keys.PublicKeyED25519{Key: public})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addresses := &address.List{Addresses: []address.Address{
+		udpAddr(t, "1.1.1.1", 17400),
+		quicAddr("1.1.1.1", 17401),
+	}}
+	p := &Publisher{d: &fakeDHT{findAddr: addresses, findPub: public}}
+	resolved, gotPublic, err := p.ResolveAll(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolved) != 1 || resolved[0] != "1.1.1.1:17401" {
+		t.Fatalf("resolved = %v, want TON QUIC only", resolved)
+	}
+	if !gotPublic.Equal(public) {
+		t.Fatal("resolved public key changed")
+	}
+
+	wrongID := append([]byte(nil), id...)
+	wrongID[0] ^= 1
+	if _, _, err := p.ResolveAll(context.Background(), wrongID); err == nil {
+		t.Fatal("mismatched ADNL id was accepted")
+	}
 }
 func (f *fakeDHT) FindOverlayNodes(context.Context, []byte, ...*tondht.Continuation) (*overlay.NodesList, *tondht.Continuation, error) {
 	return nil, nil, nil
@@ -95,12 +141,12 @@ func testPublisher(t *testing.T, d dhtClient) *Publisher {
 		t.Fatal(err)
 	}
 	gw := adnl.NewGateway(key)
-	gw.SetAddressList([]address.Address{udpAddr(t, "159.195.83.116", 17400)})
+	gw.SetAddressList([]address.Address{quicAddr("159.195.83.116", 17400)})
 	return &Publisher{d: d, gw: gw, key: key, room: []byte("tonnet:groupchat"), overlayID: make([]byte, 32)}
 }
 
 func TestPublishAddressRequiresFindableEndpoint(t *testing.T) {
-	published := address.List{Addresses: []address.Address{udpAddr(t, "159.195.83.116", 17400)}}
+	published := address.List{Addresses: []address.Address{quicAddr("159.195.83.116", 17400)}}
 	ok := &fakeDHT{storeAddrN: 3, findAddr: &published, storeOverN: 1}
 	p := testPublisher(t, ok)
 	addrOK, overlayOK := p.publish(context.Background())
@@ -114,8 +160,8 @@ func TestPublishAddressRequiresFindableEndpoint(t *testing.T) {
 	if addrOK {
 		t.Fatal("StoreAddress without a findable record must not report address success")
 	}
-	if !overlayOK {
-		t.Fatal("overlay publish is independent of address visibility")
+	if overlayOK || missing.storeOver != 0 {
+		t.Fatal("overlay must not be published without a verified TON QUIC address")
 	}
 	if missing.storeAddr != 1 || missing.findCalls != 1 {
 		t.Fatalf("expected one store + one find, got store=%d find=%d", missing.storeAddr, missing.findCalls)

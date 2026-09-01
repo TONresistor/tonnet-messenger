@@ -9,12 +9,13 @@ import (
 	"log"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 const (
@@ -90,7 +91,7 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 	}
 
 	signed := *nd
-	if n.alreadyMeshed(idHex, adnlID, &signed) {
+	if n.alreadyMeshed(idHex, &signed) {
 		return
 	}
 
@@ -99,7 +100,7 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 	}
 	defer n.releaseDial()
 
-	if n.alreadyMeshed(idHex, adnlID, &signed) {
+	if n.alreadyMeshed(idHex, &signed) {
 		return
 	}
 
@@ -111,128 +112,55 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 		return
 	}
 	if dialPub != nil {
+		resolvedID, err := community.KeyID(dialPub)
+		if err != nil || !bytes.Equal(resolvedID, adnlID) {
+			log.Printf("discover: resolved key does not match %s…", short(idHex))
+			return
+		}
 		pubKey = dialPub
 	}
 
-	if n.alreadyMeshed(idHex, adnlID, &signed) {
+	if n.alreadyMeshed(idHex, &signed) {
 		return
 	}
 
-	peer, dialStr, reused, ok := pickLiveAddr(dctx, dialAddresses,
-		func() adnl.Peer { return n.liveMeshSession(adnlID) },
-		func() bool { return n.peers.has(idHex) },
-		func(addr string) (adnl.Peer, error) { return n.gw.RegisterClient(addr, pubKey) },
-	)
-	if reused {
+	n.peers.markKnown(idHex)
+	for _, dialAddress := range dialAddresses {
+		if _, err := n.qgw.DialDefault(dctx, pubKey, dialAddress); err != nil {
+			continue
+		}
+		p, ok := n.peers.get(idHex)
+		if !ok {
+			continue
+		}
 		n.peers.setSigned(idHex, &signed)
+		if nodes, ok := n.probeNode(ctx, p); ok {
+			for i := range capNodes(nodes) {
+				nd := nodes[i]
+				go n.considerNode(context.Background(), &nd)
+			}
+		}
+		log.Printf("meshed with node %s… at %s (%s)", short(idHex), dialAddress, n.countsString())
 		return
 	}
-	if !ok {
-		log.Printf("discover: no live address for %s…", short(idHex))
-		return
-	}
-
-	n.completeMesh(ctx, idHex, peer, dialStr, &signed)
+	log.Printf("discover: no live QUIC address for %s…", short(idHex))
 }
 
-func (n *Node) alreadyMeshed(idHex string, adnlID []byte, signed *tonoverlay.Node) bool {
+func (n *Node) alreadyMeshed(idHex string, signed *tonoverlay.Node) bool {
 	if _, ok := n.peers.get(idHex); ok {
-		n.peers.setSigned(idHex, signed)
-		return true
-	}
-	if n.liveMeshSession(adnlID) != nil {
 		n.peers.setSigned(idHex, signed)
 		return true
 	}
 	return false
 }
 
-func (n *Node) liveMeshSession(adnlID []byte) adnl.Peer {
-	if n == nil || n.gw == nil || len(adnlID) == 0 {
-		return nil
-	}
-	for _, p := range n.gw.GetActivePeers() {
-		if p != nil && bytes.Equal(p.GetID(), adnlID) {
-			return p
-		}
-	}
-	return nil
-}
-
-func pickLiveAddr(
-	ctx context.Context,
-	addrs []string,
-	live func() adnl.Peer,
-	tracked func() bool,
-	register func(addr string) (adnl.Peer, error),
-) (peer adnl.Peer, addr string, reused bool, ok bool) {
-	var ours adnl.Peer
-	for _, candidate := range addrs {
-		if tracked != nil && tracked() {
-			return nil, candidate, true, true
-		}
-		if live != nil {
-			if p := live(); p != nil && ours == nil {
-				return p, p.RemoteAddr(), true, true
-			}
-		}
-		if register == nil {
-			continue
-		}
-		p, err := register(candidate)
-		if err != nil || p == nil {
-			continue
-		}
-		if ours == nil {
-			ours = p
-		}
-		if tracked != nil && tracked() {
-			return p, candidate, true, true
-		}
-		pingCtx, pingCancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
-		_, pingErr := p.Ping(pingCtx)
-		pingCancel()
-		if pingErr != nil {
-			continue
-		}
-		return p, candidate, false, true
-	}
-	return nil, "", false, false
-}
-
-func (n *Node) completeMesh(ctx context.Context, idHex string, peer adnl.Peer, addr string, signed *tonoverlay.Node) {
-	if peer == nil {
-		return
-	}
-	if _, ok := n.peers.get(idHex); ok {
-		n.peers.setSigned(idHex, signed)
-		return
-	}
-	p, created := n.peers.addNode(idHex, nil, peer, signed)
-	if p == nil || !created {
-		return
-	}
-	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.cfg.OverlayID)
-	if !n.peers.installOverlay(p, w) {
-		return
-	}
-	n.wirePeer(p)
-	if nodes, ok := n.probeNode(ctx, p); ok {
-		for i := range capNodes(nodes) {
-			nd := nodes[i]
-			go n.considerNode(context.Background(), &nd)
-		}
-	}
-	log.Printf("meshed with node %s… at %s (%s)", short(idHex), addr, n.countsString())
-}
-
 func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool) {
-	if p == nil || p.w == nil {
+	if p == nil || p.conn == nil {
 		return nil, false
 	}
 	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
-	nodes, err := p.w.GetRandomPeers(gctx)
+	nodes, err := p.conn.GetRandomPeers(gctx)
 	if err != nil {
 		n.peerFailure(p, time.Now(), "peer probe failed")
 		return nil, false
@@ -266,7 +194,7 @@ func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error
 	return adnlID, pub.Key, nil
 }
 
-func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
+func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 	now := time.Now()
 	if n.penalties.banned(p.id, now) {
 		return nil
@@ -302,9 +230,7 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 	}
 	n.peers.markSeen(p.id, now)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := p.raw.Answer(ctx, q.ID, n.myNodesList()); err != nil {
+	if err := q.Answer(n.myNodesList()); err != nil {
 		n.peerFailure(p, time.Now(), "answer getRandomPeers failed")
 		return err
 	}
@@ -317,10 +243,8 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 	return nil
 }
 
-func (n *Node) answer(p *peer, q *adnl.MessageQuery, resp tl.Serializable) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := p.raw.Answer(ctx, q.ID, resp); err != nil {
+func (n *Node) answer(p *peer, q *roomnet.Query, resp tl.Serializable) error {
+	if err := q.Answer(resp); err != nil {
 		n.peerFailure(p, time.Now(), "answer query failed")
 		return err
 	}

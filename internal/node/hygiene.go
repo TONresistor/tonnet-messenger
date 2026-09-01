@@ -4,6 +4,8 @@ import (
 	"context"
 	"log"
 	"time"
+
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 )
 
 const (
@@ -32,12 +34,13 @@ func (n *Node) peerMaintenanceLoop(ctx context.Context) {
 }
 
 func (n *Node) keepalivePeer(ctx context.Context, p *peer) {
-	if p == nil || p.raw == nil {
+	if p == nil || p.conn == nil {
 		return
 	}
 	kctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
-	if _, err := p.raw.Ping(kctx); err != nil {
+	var remote broadcast.Time
+	if err := p.conn.Query(kctx, broadcast.GetTime{}, &remote); err != nil {
 		log.Printf("keepalive to %s… failed: %v", short(p.id), err)
 		n.peerFailure(p, time.Now(), "keepalive failed")
 		return
@@ -73,10 +76,7 @@ func closePeerConnection(p *peer) {
 		return
 	}
 	p.stopOnce.Do(func() { close(p.stop) })
-	if p.w != nil {
-		p.w.Close()
-	}
-	if p.raw != nil {
-		p.raw.Close()
+	if p.conn != nil {
+		p.conn.Close()
 	}
 }

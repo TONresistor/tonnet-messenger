@@ -5,8 +5,8 @@
 
 ## 1. Protocol overview
 
-Version 0.4 defines persistent public rooms over TON overlays and a standalone
-leaf client.
+Version 0.4 defines persistent public rooms over TON QUIC, DHT and overlays,
+plus a standalone leaf client.
 
 | Component | Responsibility |
 |---|---|
@@ -24,8 +24,8 @@ owner and administrators.
 | Name | Meaning |
 |---|---|
 | `room_key` | Permanent room identity and commit authority |
-| `node_key` | ADNL identity of the sequencer |
-| `identity_key` | Permanent client identity, ADNL key, author and DM endpoint |
+| `node_key` | Sequencer Ed25519 key; its key ID is the sequencer ADNL ID |
+| `identity_key` | Client Ed25519 key, author identity and DM endpoint |
 | `room_id` | Raw `room_key` |
 | `seqno` | Monotonic canonical event number |
 | `message_id` | Equal to `seqno` for messages, zero for other events |
@@ -44,6 +44,19 @@ identity_adnl  = keyid(identity_key)
 
 The client MAY use ephemeral ADNL keys for DHT discovery but MUST NOT publish
 its identity as a room node.
+
+### 2.1 TON QUIC transport
+
+Classic ADNL is used only to access the TON DHT. Every room node MUST publish a
+reachable `adnl.address.quic` endpoint. All room queries, responses, events and
+direct messages MUST use TON QUIC; clients MUST NOT silently downgrade to
+classic ADNL.
+
+Connections use QUIC v1, ALPN `ton`, TLS 1.3 with RFC 7250 raw public keys,
+mutual Ed25519 authentication and the native `quic.query`, `quic.answer` and
+`quic.message` TL framing. The presented public-key hash MUST equal the expected
+ADNL ID. Tonnet payloads remain boxed TL and all application signatures remain
+mandatory.
 
 ## 3. Canonical events
 
@@ -67,8 +80,8 @@ event_id  = H(TL(proposal))
 proposals MUST be within 300 seconds of calibrated sequencer time. Historical
 verification does not reapply this time window.
 
-For a direct leaf, `author_key` MUST equal the authenticated ADNL peer public
-key. A verified relay MAY forward the unchanged signed proposal.
+For a direct leaf, `author_key` MUST equal the authenticated TON QUIC peer
+public key. A verified relay MAY forward the unchanged signed proposal.
 
 The sequencer verifies the proposal and authorization, assigns the next
 `seqno`, links the previous commit hash, signs with `room_key`, persists the
@@ -92,8 +105,8 @@ principal and transfers no role.
 
 ## 5. Synchronization and relays
 
-Reads require only an authenticated ADNL connection; there is no application
-hello, challenge or binding.
+Reads require only an authenticated TON QUIC connection; there is no
+application hello, challenge or binding.
 
 - `getEvents` returns commits after `after_seqno`, ascending.
 - Recent and before queries return messages in display order.
@@ -154,8 +167,8 @@ stdin/stdout carry protocol messages only, stderr carries logs, EOF shuts down,
 and each line is limited to 64 KiB.
 
 Keys use base64url; `seqno` and message IDs use decimal strings; timestamps are
-Unix-second JSON numbers. Raw TL, ADNL operations and private keys are never
-exposed.
+Unix-second JSON numbers. Raw TL, DHT or QUIC operations and private keys are
+never exposed.
 
 | Area | Required methods |
 |---|---|
@@ -168,6 +181,8 @@ exposed.
 Required notifications are `client.ready`, `identity.changed`,
 `room.connection`, `room.state`, `room.event` and `dm.message`. They contain
 typed application data, never localized display text.
+
+`client.info` MUST report `room_transport: "ton-quic"`.
 
 Each state directory contains one private `identity.key` and a versioned SQLite
 cache. The client reconnects saved rooms, repairs gaps and persists verified
@@ -186,6 +201,8 @@ reconnects with a new identity. Backup and multi-device use are outside 0.4.
 | DM plaintext | 1400 UTF-8 bytes |
 | Admins / moderators / pins | 64 / 256 / 100 |
 | Query page / batch count / batch bytes | 256 / 16 / 8064 |
+| QUIC request or message payload / answer object | 64 KiB / 4 MiB including framing |
+| Concurrent incoming QUIC streams per peer | 4 |
 | Live timestamp skew / nonce retention | 300 seconds / 24 hours |
 
 | Code | Meaning |

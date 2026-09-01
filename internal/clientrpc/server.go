@@ -108,7 +108,10 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 
 	switch method {
 	case "client.info":
-		return map[string]any{"version": s.Version, "protocol": "0.4.0", "transport": "stdio-jsonrpc", "identity": s.Client.Identity()}, nil
+		return map[string]any{
+			"version": s.Version, "protocol": "0.4.0", "transport": "stdio-jsonrpc",
+			"room_transport": "ton-quic", "identity": s.Client.Identity(),
+		}, nil
 	case "identity.get":
 		return s.Client.Identity(), nil
 	case "identity.setName":
@@ -385,7 +388,7 @@ func classify(err error) *rpcError {
 			code, numeric = "INVALID_ARGUMENT", -32602
 		case strings.Contains(lower, "not connected") || strings.Contains(lower, "not joined"):
 			code, numeric = "NOT_CONNECTED", -32002
-		case strings.Contains(lower, "no live") || strings.Contains(lower, "unavailable"):
+		case strings.Contains(lower, "no live") || strings.Contains(lower, "no dialable") || strings.Contains(lower, "unavailable"):
 			code, numeric = "ROOM_UNAVAILABLE", -32003
 		}
 	}

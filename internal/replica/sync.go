@@ -7,17 +7,18 @@ import (
 	cryptorand "crypto/rand"
 	"fmt"
 	"math/rand/v2"
+	"net"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	tondht "github.com/xssnick/tonutils-go/adnl/dht"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
-	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	messengerdht "github.com/TONresistor/tonnet-messenger/internal/dht"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 )
 
@@ -42,7 +43,7 @@ type target struct {
 }
 
 func FetchGenesis(ctx context.Context, cfg Config) (community.Genesis, error) {
-	client, closeClient, err := connect(ctx, cfg, nil)
+	client, closeClient, err := connect(ctx, cfg, nil, true)
 	if err != nil {
 		return community.Genesis{}, err
 	}
@@ -51,7 +52,7 @@ func FetchGenesis(ctx context.Context, cfg Config) (community.Genesis, error) {
 }
 
 func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error) {
-	client, closeClient, err := connect(ctx, cfg, database)
+	client, closeClient, err := connect(ctx, cfg, database, true)
 	if err != nil {
 		return Result{}, err
 	}
@@ -63,7 +64,7 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 	for {
 		var page community.EventList
 		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := client.overlay.Query(queryCtx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		err := client.peer.Query(queryCtx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return Result{}, fmt.Errorf("replica: get events after %d: %w", head.Seqno, err)
@@ -86,7 +87,7 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 	}
 	var stateResult community.RoomStateResult
 	stateCtx, stateCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = client.overlay.Query(stateCtx, community.GetRoomState{}, &stateResult)
+	err = client.peer.Query(stateCtx, community.GetRoomState{}, &stateResult)
 	stateCancel()
 	if err != nil {
 		return Result{}, fmt.Errorf("replica: get room state: %w", err)
@@ -112,23 +113,31 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 
 type connected struct {
 	genesis community.Genesis
-	overlay *tonoverlay.ADNLOverlayWrapper
+	peer    *roomnet.Peer
 	done    <-chan struct{}
 }
 
 type Session struct {
 	Genesis community.Genesis
-	Overlay *tonoverlay.ADNLOverlayWrapper
+	Peer    *roomnet.Peer
 	Done    <-chan struct{}
 	close   func()
 }
 
 func DialSequencer(ctx context.Context, cfg Config) (*Session, error) {
-	connected, closeSession, err := connect(ctx, cfg, nil)
+	return dialRoom(ctx, cfg, true)
+}
+
+func DialRoom(ctx context.Context, cfg Config) (*Session, error) {
+	return dialRoom(ctx, cfg, false)
+}
+
+func dialRoom(ctx context.Context, cfg Config, requireSequencer bool) (*Session, error) {
+	connected, closeSession, err := connect(ctx, cfg, nil, requireSequencer)
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Genesis: connected.genesis, Overlay: connected.overlay, Done: connected.done, close: closeSession}, nil
+	return &Session{Genesis: connected.genesis, Peer: connected.peer, Done: connected.done, close: closeSession}, nil
 }
 
 func (s *Session) Close() {
@@ -138,7 +147,7 @@ func (s *Session) Close() {
 	}
 }
 
-func connect(ctx context.Context, cfg Config, database *store.Store) (*connected, func(), error) {
+func connect(ctx context.Context, cfg Config, database *store.Store, requireSequencer bool) (*connected, func(), error) {
 	if len(cfg.RoomID) != ed25519.PublicKeySize || len(cfg.NodeKey) != ed25519.PrivateKeySize {
 		return nil, nil, fmt.Errorf("replica: invalid room or node key")
 	}
@@ -168,34 +177,23 @@ func connect(ctx context.Context, cfg Config, database *store.Store) (*connected
 			return nil, nil, err
 		}
 	}
-	gateway := adnl.NewGateway(cfg.NodeKey)
-	if err := gateway.StartClient(); err != nil {
+	gateway, err := roomnet.NewGateway(cfg.NodeKey)
+	if err != nil {
 		return nil, nil, err
 	}
 	closeClient := func() { gateway.Close() }
-	overlayID, err := community.OverlayID(cfg.RoomID)
-	if err != nil {
-		closeClient()
-		return nil, nil, err
-	}
 	for _, candidate := range targets {
-		peer, err := gateway.RegisterClient(candidate.address, candidate.public)
+		peer, err := gateway.DialDefault(ctx, candidate.public, candidate.address)
 		if err != nil {
 			continue
 		}
-		pingCtx, pingCancel := context.WithTimeout(ctx, 3*time.Second)
-		_, pingErr := peer.Ping(pingCtx)
-		pingCancel()
-		if pingErr != nil {
-			peer.Close()
-			continue
-		}
-		wrapper := tonoverlay.CreateExtendedADNL(peer).WithOverlay(overlayID)
+		wrapper := roomnet.Wrap(peer)
 		var genesis community.Genesis
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
 		queryErr := wrapper.Query(queryCtx, community.GetRoomGenesis{}, &genesis)
 		queryCancel()
-		if queryErr != nil || genesis.Verify(time.Now()) != nil || !bytes.Equal(genesis.RoomKey, cfg.RoomID) || !bytes.Equal(genesis.NodeKey, candidate.public) {
+		if queryErr != nil || genesis.Verify(time.Now()) != nil || !bytes.Equal(genesis.RoomKey, cfg.RoomID) ||
+			(requireSequencer && !bytes.Equal(genesis.NodeKey, candidate.public)) {
 			peer.Close()
 			continue
 		}
@@ -205,9 +203,12 @@ func connect(ctx context.Context, cfg Config, database *store.Store) (*connected
 				continue
 			}
 		}
-		return &connected{genesis: genesis, overlay: wrapper, done: peer.GetCloserCtx().Done()}, closeClient, nil
+		return &connected{genesis: genesis, peer: wrapper, done: wrapper.Done()}, closeClient, nil
 	}
 	closeClient()
+	if !requireSequencer {
+		return nil, nil, fmt.Errorf("replica: no live room endpoint")
+	}
 	return nil, nil, fmt.Errorf("replica: no live authoritative endpoint")
 }
 
@@ -240,14 +241,24 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 		if err != nil || addresses == nil || len(public) != ed25519.PublicKeySize {
 			continue
 		}
+		resolvedID, err := community.KeyID(public)
+		if err != nil || !bytes.Equal(resolvedID, id) {
+			continue
+		}
 		for _, candidate := range addresses.Addresses {
-			if !messengerdht.PublicADNLIP(address.IPValue(candidate)) {
+			switch candidate.(type) {
+			case address.QUIC, *address.QUIC:
+			default:
 				continue
 			}
-			dialAddress, err := address.DialString(candidate)
-			if err == nil {
-				targets = append(targets, target{address: dialAddress, public: public})
+			ip := address.IPValue(candidate)
+			port := address.PortValue(candidate)
+			if !messengerdht.PublicADNLIP(ip) || port <= 0 {
+				continue
 			}
+			targets = append(targets, target{
+				address: net.JoinHostPort(ip.String(), fmt.Sprintf("%d", port)), public: public,
+			})
 		}
 	}
 	rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
@@ -255,7 +266,7 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 		targets = targets[:16]
 	}
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("replica: no dialable room nodes")
+		return nil, fmt.Errorf("replica: no dialable TON QUIC room nodes")
 	}
 	return targets, nil
 }

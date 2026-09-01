@@ -62,6 +62,9 @@ func nextPublishDelay(addrOK, overlayOK bool) time.Duration {
 }
 
 func endpointKey(addr address.Address) string {
+	if !isQUICAddress(addr) {
+		return ""
+	}
 	ip := address.IPValue(addr)
 	if ip == nil {
 		return ""
@@ -69,9 +72,18 @@ func endpointKey(addr address.Address) string {
 	return net.JoinHostPort(ip.String(), fmt.Sprintf("%d", address.PortValue(addr)))
 }
 
+func isQUICAddress(addr address.Address) bool {
+	switch addr.(type) {
+	case address.QUIC, *address.QUIC:
+		return true
+	default:
+		return false
+	}
+}
+
 func hasPublicEndpoint(list address.List) bool {
 	for _, addr := range list.Addresses {
-		if PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
+		if isQUICAddress(addr) && PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
 			return true
 		}
 	}
@@ -81,16 +93,18 @@ func hasPublicEndpoint(list address.List) bool {
 func containsPublishedEndpoint(found, published address.List) bool {
 	want := make(map[string]struct{})
 	for _, addr := range published.Addresses {
-		if PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
-			want[endpointKey(addr)] = struct{}{}
+		if key := endpointKey(addr); key != "" && PublicADNLIP(address.IPValue(addr)) && address.PortValue(addr) > 0 {
+			want[key] = struct{}{}
 		}
 	}
 	if len(want) == 0 {
 		return false
 	}
 	for _, addr := range found.Addresses {
-		if _, ok := want[endpointKey(addr)]; ok {
-			return true
+		if key := endpointKey(addr); key != "" {
+			if _, ok := want[key]; ok {
+				return true
+			}
 		}
 	}
 	return false
@@ -148,7 +162,9 @@ func (p *Publisher) publishOverlay(ctx context.Context) bool {
 
 func (p *Publisher) publish(ctx context.Context) (addrOK, overlayOK bool) {
 	addrOK = p.publishAddress(ctx)
-	overlayOK = p.publishOverlay(ctx)
+	if addrOK {
+		overlayOK = p.publishOverlay(ctx)
+	}
 	switch {
 	case addrOK && overlayOK:
 		log.Printf("republished to DHT (address + overlay node)")
@@ -201,18 +217,22 @@ func (p *Publisher) ResolveAll(ctx context.Context, adnlID []byte) ([]string, ed
 	if list == nil || len(list.Addresses) == 0 {
 		return nil, nil, fmt.Errorf("no addresses for node")
 	}
+	resolvedID, err := tl.Hash(keys.PublicKeyED25519{Key: pub})
+	if err != nil || !bytes.Equal(resolvedID, adnlID) {
+		return nil, nil, fmt.Errorf("resolved public key does not match ADNL id")
+	}
 	out := make([]string, 0, len(list.Addresses))
 	for _, candidate := range list.Addresses {
-		if !PublicADNLIP(address.IPValue(candidate)) {
+		if !isQUICAddress(candidate) || !PublicADNLIP(address.IPValue(candidate)) {
 			continue
 		}
-		dialStr, dialErr := address.DialString(candidate)
-		if dialErr == nil {
-			out = append(out, dialStr)
+		port := address.PortValue(candidate)
+		if port > 0 {
+			out = append(out, net.JoinHostPort(address.IPValue(candidate).String(), fmt.Sprintf("%d", port)))
 		}
 	}
 	if len(out) == 0 {
-		return nil, nil, fmt.Errorf("no dialable addresses for node")
+		return nil, nil, fmt.Errorf("no dialable TON QUIC addresses for node")
 	}
 	return out, pub, nil
 }

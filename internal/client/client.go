@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
@@ -400,7 +399,7 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 		return nil, err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = session.Overlay.SendCustomMessage(sendCtx, wrapper)
+	err = session.Peer.SendMessage(sendCtx, wrapper)
 	cancel()
 	if err != nil {
 		return nil, err
@@ -442,7 +441,7 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 	}
 	var response any
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = session.Overlay.Query(queryCtx, community.SubmitEvent{Proposal: proposal}, &response)
+	err = session.Peer.Query(queryCtx, community.SubmitEvent{Proposal: proposal}, &response)
 	cancel()
 	if err != nil {
 		return nil, err
@@ -555,7 +554,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	r.client.mu.RLock()
 	identity := append(ed25519.PrivateKey(nil), r.client.key...)
 	r.client.mu.RUnlock()
-	session, err := replica.DialSequencer(ctx, replica.Config{
+	session, err := replica.DialRoom(ctx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
 	})
 	if err != nil {
@@ -564,7 +563,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	started := time.Now()
 	var remoteTime broadcast.Time
 	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	err = session.Overlay.Query(queryCtx, broadcast.GetTime{}, &remoteTime)
+	err = session.Peer.Query(queryCtx, broadcast.GetTime{}, &remoteTime)
 	cancel()
 	if err != nil {
 		session.Close()
@@ -579,11 +578,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	r.session = session
 	r.timeOffset = offset
 	r.mu.Unlock()
-	session.Overlay.SetCustomMessageHandler(func(message *adnl.MessageCustom) error {
-		r.ingestSerializable(message.Data)
-		return nil
-	})
-	session.Overlay.SetBroadcastHandlerWithInfo(func(message tl.Serializable, _ tonoverlay.BroadcastInfo) error {
+	session.Peer.SetMessageHandler(func(message any) error {
 		r.ingestSerializable(message)
 		return nil
 	})
@@ -623,7 +618,7 @@ func (r *roomHandle) sync(ctx context.Context) error {
 	for {
 		var page community.EventList
 		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := session.Overlay.Query(queryCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: community.MaxPageLimit}, &page)
+		err := session.Peer.Query(queryCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
@@ -650,7 +645,7 @@ func (r *roomHandle) sync(ctx context.Context) error {
 	}
 	var state community.RoomStateResult
 	stateCtx, stateCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = session.Overlay.Query(stateCtx, community.GetRoomState{}, &state)
+	err = session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
 	stateCancel()
 	if err != nil {
 		return err
@@ -756,7 +751,7 @@ func (r *roomHandle) refreshState() error {
 	}
 	var state community.RoomStateResult
 	ctx, cancel := context.WithTimeout(r.client.ctx, 10*time.Second)
-	err := session.Overlay.Query(ctx, community.GetRoomState{}, &state)
+	err := session.Peer.Query(ctx, community.GetRoomState{}, &state)
 	cancel()
 	if err != nil {
 		return err

@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/TONresistor/tonnet-messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/TONresistor/tonnet-messenger/actions/workflows/ci.yml)
 
-Persistent public rooms and an independent client over TON ADNL, DHT and
+Persistent public rooms and an independent client over TON QUIC, DHT and
 overlays.
 
 Protocol 0.4 provides two binaries:
@@ -33,6 +33,10 @@ tonnet-messenger-server serve \
 ```
 
 Room creation is an operator action and is never available to clients.
+The advertised UDP port carries mandatory TON QUIC room traffic and must be
+publicly reachable. The node publishes it as `adnl.address.quic` through DHT.
+Sequencers, relays and clients must be upgraded together; legacy ADNL room
+endpoints are not compatible.
 
 ```bash
 tonnet-messenger-server room admin grant \
@@ -49,8 +53,9 @@ key as their complete value.
 
 ## Client
 
-The client owns one Ed25519 identity and joins rooms as an outbound ADNL leaf.
-It does not create rooms, sequence events or publish room-node records.
+The client owns one Ed25519 identity and joins rooms through mutually
+authenticated TON QUIC. Classic ADNL is used only for DHT discovery. The client
+does not create rooms, sequence events or publish room-node records.
 
 ```bash
 tonnet-messenger identity show

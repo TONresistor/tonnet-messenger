@@ -18,7 +18,8 @@ func TestStdioIdentityAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	input := strings.NewReader(
-		"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"identity.get\",\"params\":{}}\n" +
+		"{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"client.info\",\"params\":{}}\n" +
+			"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"identity.get\",\"params\":{}}\n" +
 			"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"identity.setName\",\"params\":{\"name\":\"alice\"}}\n",
 	)
 	var output bytes.Buffer
@@ -36,8 +37,12 @@ func TestStdioIdentityAPI(t *testing.T) {
 			responses[id] = value
 		}
 	}
-	if len(responses) != 2 {
+	if len(responses) != 3 {
 		t.Fatalf("responses = %s", output.String())
+	}
+	info := responses[0]["result"].(map[string]any)
+	if info["room_transport"] != "ton-quic" {
+		t.Fatalf("client info = %#v", info)
 	}
 	identity := responses[2]["result"].(map[string]any)
 	if identity["name"] != "alice" || len(identity["key"].(string)) != 43 {

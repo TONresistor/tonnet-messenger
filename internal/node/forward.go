@@ -6,9 +6,9 @@ import (
 	"log"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl"
-	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
+
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 const (
@@ -21,50 +21,15 @@ type outboundJob struct {
 	items []tl.Serializable
 }
 
-func (n *Node) wireUntrackedPeer(id string, wrapper *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) {
-	promote := func() (*peer, bool) {
-		p, added, replaced := n.peers.addInbound(id, wrapper, raw)
-		if p == nil {
-			raw.Close()
-			return nil, false
-		}
-		if replaced != nil {
-			closePeerConnection(replaced)
-		}
-		if !added && p.raw != raw {
-			raw.Close()
-			return nil, false
-		}
-		if added {
-			n.wirePeer(p)
-		}
-		return p, true
-	}
-	wrapper.SetCustomMessageHandler(func(message *adnl.MessageCustom) error {
-		p, ok := promote()
-		if ok {
-			n.handleCommunityMessage(p, message.Data, time.Now())
-		}
-		return nil
-	})
-	wrapper.SetQueryHandler(func(query *adnl.MessageQuery) error {
-		p, ok := promote()
-		if !ok {
-			return nil
-		}
-		return n.answerQuery(p, query)
-	})
-}
-
 func (n *Node) wirePeer(p *peer) {
 	id := p.id
 	go n.outboundWriter(p)
-	p.w.SetCustomMessageHandler(func(message *adnl.MessageCustom) error {
-		n.handleCommunityMessage(p, message.Data, time.Now())
+	p.conn.SetMessageHandler(func(message any) error {
+		n.handleCommunityMessage(p, message, time.Now())
 		return nil
 	})
-	p.w.SetQueryHandler(func(query *adnl.MessageQuery) error { return n.answerQuery(p, query) })
-	p.w.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
+	p.conn.SetQueryHandler(func(query *roomnet.Query) error { return n.answerQuery(p, query) })
+	p.conn.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
 		if n.peers.removePeer(id, p) {
 			p.stopOnce.Do(func() { close(p.stop) })
 			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
@@ -80,7 +45,7 @@ func (n *Node) outboundWriter(p *peer) {
 		case job := <-p.out:
 			for _, item := range job.items {
 				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
-				err := p.w.SendCustomMessage(ctx, item)
+				err := p.conn.SendMessage(ctx, item)
 				cancel()
 				if err != nil {
 					log.Printf("relay to %s… failed: %v", short(p.id), err)
@@ -93,7 +58,7 @@ func (n *Node) outboundWriter(p *peer) {
 }
 
 func (n *Node) enqueue(p *peer, items ...tl.Serializable) bool {
-	if p == nil || p.w == nil || len(items) == 0 {
+	if p == nil || p.conn == nil || len(items) == 0 {
 		return false
 	}
 	select {

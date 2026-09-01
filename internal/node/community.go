@@ -7,18 +7,18 @@ import (
 	"errors"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 )
 
 const maxCommunityBatchWireSize = 8*1024 - 128
 
-func (n *Node) answerCommunityQuery(p *peer, query *adnl.MessageQuery, now time.Time) (bool, error) {
+func (n *Node) answerCommunityQuery(p *peer, query *roomnet.Query, now time.Time) (bool, error) {
 	switch request := query.Data.(type) {
 	case community.GetRoomGenesis, *community.GetRoomGenesis:
 		return true, n.answer(p, query, n.genesis)
@@ -74,10 +74,10 @@ func (n *Node) communityStateResult(ctx context.Context, now time.Time) (communi
 }
 
 func (n *Node) requireReadIdentity(p *peer) bool {
-	return n.peers.isHealthyNode(p) || (p != nil && p.kind == kindLeaf && p.member && p.state == peerHealthy && p.raw != nil)
+	return n.peers.isHealthyNode(p) || (p != nil && p.kind == kindLeaf && p.member && p.state == peerHealthy && p.conn != nil)
 }
 
-func (n *Node) answerEvents(p *peer, query *adnl.MessageQuery, request community.GetEvents, now time.Time) error {
+func (n *Node) answerEvents(p *peer, query *roomnet.Query, request community.GetEvents, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -88,7 +88,7 @@ func (n *Node) answerEvents(p *peer, query *adnl.MessageQuery, request community
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerRecent(p *peer, query *adnl.MessageQuery, request community.GetMessagesRecent, now time.Time) error {
+func (n *Node) answerRecent(p *peer, query *roomnet.Query, request community.GetMessagesRecent, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -99,7 +99,7 @@ func (n *Node) answerRecent(p *peer, query *adnl.MessageQuery, request community
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerBefore(p *peer, query *adnl.MessageQuery, request community.GetMessagesBefore, now time.Time) error {
+func (n *Node) answerBefore(p *peer, query *roomnet.Query, request community.GetMessagesBefore, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -110,7 +110,7 @@ func (n *Node) answerBefore(p *peer, query *adnl.MessageQuery, request community
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerSubmit(p *peer, query *adnl.MessageQuery, request community.SubmitEvent, now time.Time) error {
+func (n *Node) answerSubmit(p *peer, query *roomnet.Query, request community.SubmitEvent, now time.Time) error {
 	if n.nodeRole != community.NodeRoleSequencer {
 		return n.forwardSubmit(p, query, request)
 	}
@@ -145,7 +145,7 @@ func (n *Node) answerSubmit(p *peer, query *adnl.MessageQuery, request community
 	return n.answer(p, query, community.SubmitAccepted{Event: result.Event})
 }
 
-func (n *Node) forwardSubmit(leaf *peer, query *adnl.MessageQuery, request community.SubmitEvent) error {
+func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community.SubmitEvent) error {
 	if !n.peers.acceptsAuthor(leaf, request.Proposal.AuthorKey) {
 		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectPermissionDenied, Message: "connection is not bound to author"})
 	}
@@ -155,7 +155,7 @@ func (n *Node) forwardSubmit(leaf *peer, query *adnl.MessageQuery, request commu
 	}
 	var response any
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := sequencer.w.Query(ctx, request, &response)
+	err := sequencer.conn.Query(ctx, request, &response)
 	cancel()
 	if err != nil {
 		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectSequencerUnavailable, Message: "sequencer unavailable"})
@@ -194,7 +194,7 @@ func (n *Node) sequencerPeer() (*peer, bool) {
 		return nil, false
 	}
 	peer, ok := n.peers.get(hex.EncodeToString(id))
-	if !ok || peer.w == nil || !n.peers.isHealthyNode(peer) {
+	if !ok || peer.conn == nil || !n.peers.isHealthyNode(peer) {
 		return nil, false
 	}
 	return peer, true
@@ -232,7 +232,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 	for {
 		var page community.EventList
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := source.w.Query(ctx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		err := source.conn.Query(ctx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
@@ -259,7 +259,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 func (n *Node) installStateFromPeer(source *peer) error {
 	var result community.RoomStateResult
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := source.w.Query(ctx, community.GetRoomState{}, &result)
+	err := source.conn.Query(ctx, community.GetRoomState{}, &result)
 	cancel()
 	if err != nil {
 		return err
@@ -292,7 +292,7 @@ func (n *Node) submitLocal(_ context.Context, rawProposal []byte) ([]byte, error
 	return community.Encode(community.SubmitAccepted{Event: result.Event})
 }
 
-func (n *Node) answerBatch(p *peer, query *adnl.MessageQuery, request community.Batch, now time.Time) error {
+func (n *Node) answerBatch(p *peer, query *roomnet.Query, request community.Batch, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -443,7 +443,7 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 	if !accepted {
 		return
 	}
-	if !fromNode && (p.raw == nil || !bytes.Equal(p.raw.GetPubKey(), direct.FromKey)) {
+	if !fromNode && (p.conn == nil || !bytes.Equal(p.conn.GetPubKey(), direct.FromKey)) {
 		return
 	}
 	if joined {

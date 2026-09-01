@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -16,12 +17,14 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
-	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
+	"github.com/xssnick/tonutils-go/adnl/quic"
+	"golang.org/x/net/ipv4"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/control"
 	"github.com/TONresistor/tonnet-messenger/internal/dht"
 	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
 )
@@ -61,6 +64,9 @@ type stats struct {
 type Node struct {
 	cfg         Config
 	gw          *adnl.Gateway
+	qgw         *quic.Gateway
+	quicPacket  net.PacketConn
+	quicErr     chan error
 	peers       *peerTable
 	dedup       *ov.Dedup
 	penalties   *penaltyBox
@@ -83,6 +89,30 @@ type Node struct {
 type identityDomainCache struct {
 	key     []byte
 	expires time.Time
+}
+
+type readyPacketConn struct {
+	*net.UDPConn
+	ready chan struct{}
+	once  sync.Once
+	batch *ipv4.PacketConn
+}
+
+func (c *readyPacketConn) markReady() { c.once.Do(func() { close(c.ready) }) }
+
+func (c *readyPacketConn) ReadFrom(buffer []byte) (int, net.Addr, error) {
+	c.markReady()
+	return c.UDPConn.ReadFrom(buffer)
+}
+
+func (c *readyPacketConn) ReadMsgUDP(buffer, oob []byte) (int, int, int, *net.UDPAddr, error) {
+	c.markReady()
+	return c.UDPConn.ReadMsgUDP(buffer, oob)
+}
+
+func (c *readyPacketConn) ReadBatch(messages []ipv4.Message, flags int) (int, error) {
+	c.markReady()
+	return c.batch.ReadBatch(messages, flags)
 }
 
 func New(cfg Config) (*Node, error) {
@@ -123,9 +153,19 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("max leaves must be between 1 and %d", MaxLeavesLimit)
 	}
 	gw := adnl.NewGateway(cfg.Key)
+	if err := gw.StartClient(); err != nil {
+		return nil, fmt.Errorf("start DHT client: %w", err)
+	}
+	qgw, err := roomnet.NewGateway(cfg.Key)
+	if err != nil {
+		gw.Close()
+		return nil, fmt.Errorf("create TON QUIC gateway: %w", err)
+	}
 	n := &Node{
 		cfg:         cfg,
 		gw:          gw,
+		qgw:         qgw,
+		quicErr:     make(chan error, 1),
 		peers:       newPeerTable(cfg.MaxLeaves),
 		dedup:       ov.NewDedup(deliveredCap),
 		penalties:   newPenaltyBox(),
@@ -133,27 +173,63 @@ func New(cfg Config) (*Node, error) {
 		queries:     newTokenBucket(globalQueryBurst, globalQueryRefill),
 		domainCache: make(map[string]identityDomainCache),
 		dialSem:     make(chan struct{}, maxConcurrentDials),
-		myID:        hex.EncodeToString(gw.GetID()),
+		myID:        hex.EncodeToString(qgw.ID()),
 		started:     time.Now(),
 		genesis:     *cfg.Genesis,
 		store:       cfg.Store,
 		roomKey:     cfg.RoomKey,
 		nodeRole:    cfg.NodeRole,
 	}
-	gw.SetConnectionHandler(n.onInbound)
+	qgw.SetConnectionHandler(func(peer *quic.Peer) error { return n.onInbound(roomnet.Wrap(peer)) })
 
 	if cfg.Advertise != "" {
 		addr, err := parseAddress(cfg.Advertise)
 		if err != nil {
+			qgw.Close()
+			gw.Close()
 			return nil, err
 		}
 		gw.SetAddressList([]address.Address{addr})
 	}
 
-	if err := gw.StartServer(cfg.Listen); err != nil {
-		return nil, fmt.Errorf("start server on %s: %w", cfg.Listen, err)
+	packet, err := listenQUIC(cfg.Listen)
+	if err != nil {
+		qgw.Close()
+		gw.Close()
+		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
+	}
+	n.quicPacket = packet
+	go func() { n.quicErr <- qgw.Serve(packet) }()
+	select {
+	case <-packet.ready:
+	case err := <-n.quicErr:
+		packet.Close()
+		qgw.Close()
+		gw.Close()
+		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
+	case <-time.After(5 * time.Second):
+		qgw.Close()
+		packet.Close()
+		gw.Close()
+		return nil, fmt.Errorf("start TON QUIC server on %s: timed out", cfg.Listen)
 	}
 	return n, nil
+}
+
+func listenQUIC(listen string) (*readyPacketConn, error) {
+	udpAddress, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		return nil, err
+	}
+	network := "udp6"
+	if udpAddress.IP == nil || udpAddress.IP.To4() != nil {
+		network = "udp4"
+	}
+	conn, err := net.ListenUDP(network, udpAddress)
+	if err != nil {
+		return nil, err
+	}
+	return &readyPacketConn{UDPConn: conn, ready: make(chan struct{}), batch: ipv4.NewPacketConn(conn)}, nil
 }
 
 func (n *Node) verifyIdentityDomain(ctx context.Context, domain string, key []byte, now time.Time) error {
@@ -177,17 +253,12 @@ func (n *Node) verifyIdentityDomain(ctx context.Context, domain string, key []by
 	return nil
 }
 
-func (n *Node) onInbound(peer adnl.Peer) error {
+func (n *Node) onInbound(peer *roomnet.Peer) error {
 	id := hex.EncodeToString(peer.GetID())
 	if id == n.myID {
 		return nil
 	}
-	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.cfg.OverlayID)
-	if !n.peers.has(id) && !n.peers.isKnown(id) {
-		n.wireUntrackedPeer(id, w, peer)
-		return nil
-	}
-	p, added, replaced := n.peers.addInbound(id, w, peer)
+	p, added, replaced := n.peers.addInbound(id, peer)
 	if p == nil {
 		return fmt.Errorf("peer capacity reached")
 	}
@@ -196,7 +267,7 @@ func (n *Node) onInbound(peer adnl.Peer) error {
 	}
 	if added {
 		n.wirePeer(p)
-	} else if p.raw != peer {
+	} else if p.conn != peer {
 		peer.Close()
 	}
 	return nil
@@ -215,9 +286,16 @@ func (n *Node) acquireDial() bool {
 
 func (n *Node) releaseDial() { <-n.dialSem }
 
-func (n *Node) ADNLID() []byte { return n.gw.GetID() }
+func (n *Node) ADNLID() []byte { return n.qgw.ID() }
 
-func (n *Node) Close() error { return n.gw.Close() }
+func (n *Node) Close() error {
+	quicErr := n.qgw.Close()
+	packetErr := n.quicPacket.Close()
+	if errors.Is(packetErr, net.ErrClosed) {
+		packetErr = nil
+	}
+	return errors.Join(quicErr, packetErr, n.gw.Close())
+}
 
 func (n *Node) countsString() string {
 	members, nodes := n.peers.counts()
@@ -240,7 +318,7 @@ func (n *Node) Status() control.Status {
 		ready = n.store.ReplicaReady(context.Background()) == nil
 	}
 	return control.Status{
-		ADNLID:    base64.StdEncoding.EncodeToString(n.gw.GetID()),
+		ADNLID:    base64.StdEncoding.EncodeToString(n.qgw.ID()),
 		Listen:    n.cfg.Listen,
 		Advertise: n.cfg.Advertise,
 		StartedAt: n.started.Unix(),
@@ -275,6 +353,9 @@ func (n *Node) Status() control.Status {
 }
 
 func (n *Node) Run(ctx context.Context) error {
+	if n.cfg.Advertise == "" {
+		return errors.New("public TON QUIC advertise address is required")
+	}
 	if n.nodeRole == community.NodeRoleSequencer {
 		ready := make(chan struct{})
 		serveErr := make(chan error, 1)
@@ -312,8 +393,15 @@ func (n *Node) Run(ctx context.Context) error {
 	go n.databaseMaintenanceLoop(ctx)
 	go n.peerMaintenanceLoop(ctx)
 
-	<-ctx.Done()
-	return ctx.Err()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-n.quicErr:
+		if err == nil {
+			return errors.New("TON QUIC server stopped")
+		}
+		return fmt.Errorf("TON QUIC server: %w", err)
+	}
 }
 
 func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
@@ -348,5 +436,15 @@ func parseAddress(hostPort string) (address.Address, error) {
 	if err != nil {
 		return nil, fmt.Errorf("invalid advertise port %q: %w", portStr, err)
 	}
-	return address.NewAddress(ip, int32(port))
+	if port < 1 || port > 65535 {
+		return nil, fmt.Errorf("advertise port must be between 1 and 65535")
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return nil, fmt.Errorf("TON QUIC advertisement requires an IPv4 address")
+	}
+	if !dht.PublicADNLIP(v4) {
+		return nil, fmt.Errorf("TON QUIC advertisement requires a public IPv4 address")
+	}
+	return &address.QUIC{IP: append(net.IP(nil), v4...), Port: int32(port)}, nil
 }

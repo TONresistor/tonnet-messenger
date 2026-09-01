@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -55,7 +54,7 @@ func newRelayCmd() *cobra.Command {
 			}
 			advertised, advertiseErr := resolveAdvertise(cmd.Context(), advertise, listen)
 			if advertiseErr != nil {
-				fmt.Fprintf(os.Stderr, "! %v\n! relay may be undiscoverable - pass --advertise <public-ip:port>\n", advertiseErr)
+				return fmt.Errorf("TON QUIC advertise address: %w", advertiseErr)
 			}
 			runtime, err := node.New(node.Config{
 				Key: relayState.NodePrivate, Listen: listen, Advertise: advertised,
@@ -65,6 +64,7 @@ func newRelayCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer runtime.Close()
 			fmt.Printf("✓ relay      %s\n", roomReference)
 			fmt.Printf("✓ synced     seqno %d\n", synced.Head.Seqno)
 			fmt.Printf("✓ database   %s\n", relayState.Paths.Database)
@@ -80,8 +80,8 @@ func newRelayCmd() *cobra.Command {
 	cmd.Flags().StringVar(&stateDir, "state", "", "relay state directory")
 	cmd.Flags().StringVar(&roomReference, "room", "", "canonical room public key")
 	cmd.Flags().StringVar(&bootstrap, "bootstrap", "", "optional authoritative ADNL id")
-	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:17400", "UDP bind address ip:port")
-	cmd.Flags().StringVar(&advertise, "advertise", "", "public ip:port to publish (default: autodetect)")
+	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:17400", "TON QUIC UDP bind address ip:port")
+	cmd.Flags().StringVar(&advertise, "advertise", "", "public TON QUIC ip:port to publish (default: autodetect)")
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
 	cmd.Flags().IntVar(&maxLeaves, "max-leaves", node.DefaultMaxLeaves, "maximum connected member leaves (1..2048)")
 	_ = cmd.MarkFlagRequired("state")

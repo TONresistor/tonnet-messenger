@@ -7,8 +7,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
+
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 const (
@@ -51,8 +52,7 @@ type peer struct {
 	id        string
 	kind      peerKind
 	state     peerState
-	w         *tonoverlay.ADNLOverlayWrapper
-	raw       adnl.Peer
+	conn      *roomnet.Peer
 	member    bool
 	errs      int
 	badScore  int
@@ -83,7 +83,7 @@ func newPeerTable(maxLeaves int) *peerTable {
 	return &peerTable{maxLeaves: maxLeaves, m: map[string]*peer{}, known: map[string]time.Time{}}
 }
 
-func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) *peer {
+func newPeer(id string, kind peerKind, conn *roomnet.Peer, signed *tonoverlay.Node) *peer {
 	now := time.Now()
 	burst, refill := float64(leafPeerBurst), float64(leafPeerRefillRate)
 	if kind == kindNode {
@@ -93,8 +93,7 @@ func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adn
 		id:        id,
 		kind:      kind,
 		state:     peerQuarantine,
-		w:         w,
-		raw:       raw,
+		conn:      conn,
 		signed:    signed,
 		firstSeen: now,
 		lastSeen:  now,
@@ -104,14 +103,14 @@ func newPeer(id string, kind peerKind, w *tonoverlay.ADNLOverlayWrapper, raw adn
 	}
 }
 
-func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer) (*peer, bool, *peer) {
+func (t *peerTable) addInbound(id string, conn *roomnet.Peer) (*peer, bool, *peer) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
-		if p.kind != kindLeaf || p.raw == raw {
+		if p.kind != kindLeaf || p.conn == conn {
 			return p, false, nil
 		}
-		next := newPeer(id, kindLeaf, w, raw, nil)
+		next := newPeer(id, kindLeaf, conn, nil)
 		t.m[id] = next
 		return next, true, p
 	}
@@ -125,23 +124,9 @@ func (t *peerTable) addInbound(id string, w *tonoverlay.ADNLOverlayWrapper, raw 
 	if kind == kindNode && t.nodeCountLocked() >= MaxNodePeers {
 		return nil, false, nil
 	}
-	p := newPeer(id, kind, w, raw, nil)
+	p := newPeer(id, kind, conn, nil)
 	t.m[id] = p
 	return p, true, nil
-}
-
-func (t *peerTable) has(id string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	_, ok := t.m[id]
-	return ok
-}
-
-func (t *peerTable) isKnown(id string) bool {
-	t.mu.RLock()
-	defer t.mu.RUnlock()
-	_, ok := t.known[id]
-	return ok
 }
 
 func (t *peerTable) acceptInbound(p *peer, now time.Time) (*peer, bool, bool) {
@@ -203,7 +188,7 @@ func (t *peerTable) acceptsAuthor(candidate *peer, authorKey []byte) bool {
 	if p.kind == kindNode {
 		return true
 	}
-	return p.member && p.raw != nil && bytes.Equal(p.raw.GetPubKey(), authorKey)
+	return p.member && p.conn != nil && bytes.Equal(p.conn.GetPubKey(), authorKey)
 }
 
 func (t *peerTable) identityLeaves(identityKey []byte, excludeID string) []*peer {
@@ -211,10 +196,10 @@ func (t *peerTable) identityLeaves(identityKey []byte, excludeID string) []*peer
 	defer t.mu.RUnlock()
 	var out []*peer
 	for _, p := range t.m {
-		if p.id == excludeID || p.kind != kindLeaf || !p.member || p.state != peerHealthy || p.raw == nil {
+		if p.id == excludeID || p.kind != kindLeaf || !p.member || p.state != peerHealthy || p.conn == nil {
 			continue
 		}
-		if bytes.Equal(p.raw.GetPubKey(), identityKey) {
+		if bytes.Equal(p.conn.GetPubKey(), identityKey) {
 			out = append(out, p)
 		}
 	}
@@ -229,47 +214,6 @@ func (t *peerTable) isHealthyNode(candidate *peer) bool {
 	defer t.mu.RUnlock()
 	p, ok := t.m[candidate.id]
 	return ok && p == candidate && p.kind == kindNode && p.state == peerHealthy
-}
-
-func (t *peerTable) addNode(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) (*peer, bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.markKnownLocked(id)
-	if p, ok := t.m[id]; ok {
-		if p.kind != kindNode && t.nodeCountLocked() >= MaxNodePeers {
-			return nil, false
-		}
-		if p.kind != kindNode {
-			p.kind = kindNode
-			p.useNodeLimiter()
-		}
-		p.member = false
-		p.lastSeen = time.Now()
-		if signed != nil {
-			p.signed = signed
-		}
-		return p, false
-	}
-	if t.nodeCountLocked() >= MaxNodePeers {
-		return nil, false
-	}
-	p := newPeer(id, kindNode, w, raw, signed)
-	t.m[id] = p
-	return p, true
-}
-
-func (t *peerTable) installOverlay(target *peer, w *tonoverlay.ADNLOverlayWrapper) bool {
-	if target == nil || w == nil {
-		return false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	p, ok := t.m[target.id]
-	if !ok || p != target || p.w != nil {
-		return false
-	}
-	p.w = w
-	return true
 }
 
 func (t *peerTable) markKnown(id string) {
