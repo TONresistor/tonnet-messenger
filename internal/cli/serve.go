@@ -7,98 +7,59 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/spf13/cobra"
 
-	"github.com/TONresistor/tonnet-messenger/internal/keys"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/node"
-	"github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/pubip"
-	roompkg "github.com/TONresistor/tonnet-messenger/internal/room"
+	"github.com/TONresistor/tonnet-messenger/internal/roomstate"
 )
 
 func newServeCmd() *cobra.Command {
-	var (
-		room      string
-		listen    string
-		advertise string
-		keyPath   string
-		cfgURL    string
-		socket    string
-		noSocket  bool
-		maxLeaves int
-		gated     bool
-	)
+	var stateDir, listen, advertise, cfgURL string
+	var maxLeaves int
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Run an overlay-node for a room (host or relay)",
-		Long: "Run the node. Hosting a room = being its first node; relaying = being an\n" +
-			"additional node of the same --room. Same command either way.\n\n" +
-			"The node binds --listen and publishes --advertise (auto-detected if omitted) to\n" +
-			"the DHT so clients and other nodes can find it.",
+		Short: "Run the authoritative sequencer for one persistent room",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			key := keys.LoadOrCreateKey(keyPath)
-
-			name, err := roompkg.ParseName(room)
+			authority, err := roomstate.LoadAuthority(cmd.Context(), stateDir, time.Now())
 			if err != nil {
-				return fmt.Errorf("invalid --room %q (gated rooms are NAME#o=<64 hex>): %w", room, err)
+				return err
 			}
-
-			oid, err := overlay.ID(room)
-			if err != nil {
-				return fmt.Errorf("overlay id: %w", err)
+			defer authority.Store.Close()
+			advertised, advertiseErr := resolveAdvertise(cmd.Context(), advertise, listen)
+			if advertiseErr != nil {
+				fmt.Fprintf(os.Stderr, "! %v\n! node may be undiscoverable - pass --advertise <public-ip:port>\n", advertiseErr)
 			}
-
-			adv, advErr := resolveAdvertise(cmd.Context(), advertise, listen)
-			if advErr != nil {
-				fmt.Fprintf(os.Stderr, "! %v\n! node may be undiscoverable - pass --advertise <public-ip:port>\n", advErr)
-			}
-
-			sock := socket
-			if noSocket {
-				sock = ""
-			}
-			if sock != "" {
-				_ = os.MkdirAll(filepath.Dir(sock), 0o700)
-			}
-
-			n, err := node.New(node.Config{
-				Key:               key,
-				Listen:            listen,
-				Advertise:         adv,
-				ConfigURL:         cfgURL,
-				Room:              room,
-				OverlayID:         oid,
-				Socket:            sock,
-				MaxLeaves:         maxLeaves,
-				ExperimentalGated: gated,
+			runtime, err := node.New(node.Config{
+				Key: authority.NodePrivate, Listen: listen, Advertise: advertised,
+				ConfigURL: cfgURL, Socket: authority.Paths.Socket, MaxLeaves: maxLeaves,
+				Genesis: &authority.Genesis, Store: authority.Store,
+				RoomKey: authority.RoomPrivate, NodeRole: community.NodeRoleSequencer,
 			})
 			if err != nil {
 				return err
 			}
-
-			printServeBanner(n.ADNLID(), name, listen, adv, oid, keyPath, sock)
-
+			printServeBanner(runtime.ADNLID(), authority, listen, advertised)
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
-			if err := n.Run(ctx); err != nil && err != context.Canceled {
+			if err := runtime.Run(ctx); err != nil && err != context.Canceled {
 				return err
 			}
 			fmt.Fprintln(os.Stderr, "node stopped")
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&room, "room", overlay.DefaultRoom, "room name (derives the overlay id)")
+	cmd.Flags().StringVar(&stateDir, "state", "", "authoritative room state directory")
 	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:17400", "UDP bind address ip:port")
 	cmd.Flags().StringVar(&advertise, "advertise", "", "public ip:port to publish (default: autodetect)")
-	cmd.Flags().StringVar(&keyPath, "key", keys.DefaultPath(), "node identity seed file")
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
-	cmd.Flags().StringVar(&socket, "socket", defaultSocket(), "local control socket for `tonnet status`")
-	cmd.Flags().BoolVar(&noSocket, "no-socket", false, "disable the control socket")
 	cmd.Flags().IntVar(&maxLeaves, "max-leaves", node.DefaultMaxLeaves, "maximum connected member leaves (1..2048)")
-	cmd.Flags().BoolVar(&gated, "experimental-gated-rooms", false, "enable experimental gated room mode")
+	_ = cmd.MarkFlagRequired("state")
 	return cmd
 }
 
@@ -120,25 +81,17 @@ func resolveAdvertise(ctx context.Context, advertise, listen string) (string, er
 	return net.JoinHostPort(ip.String(), port), nil
 }
 
-func printServeBanner(adnlID []byte, name roompkg.Name, listen, advertise string, oid []byte, keyPath, socket string) {
-	id := base64.StdEncoding.EncodeToString(adnlID)
-	oidB64 := base64.StdEncoding.EncodeToString(oid)
-
-	fmt.Printf("✓ identity   %s   (ADNL %s)\n", keyPath, shortB64(id))
+func printServeBanner(adnlID []byte, authority *roomstate.Authority, listen, advertise string) {
+	roomID, _ := community.RoomKeyText(authority.Genesis.RoomKey)
+	fmt.Printf("✓ identity   %s (ADNL %s)\n", authority.Paths.NodeKey, shortB64(base64.RawURLEncoding.EncodeToString(adnlID)))
 	if advertise != "" {
-		fmt.Printf("✓ listening  %s   (public %s)\n", listen, advertise)
+		fmt.Printf("✓ listening  %s (public %s)\n", listen, advertise)
 	} else {
-		fmt.Printf("! listening  %s   (no public address - pass --advertise)\n", listen)
+		fmt.Printf("! listening  %s (no public address - pass --advertise)\n", listen)
 	}
-	mode := "open"
-	if name.Mode == roompkg.ModeGated {
-		mode = "gated, owner " + shortB64(base64.StdEncoding.EncodeToString(name.OwnerKey))
-	}
-	fmt.Printf("✓ room       %q   (overlay %s, %s)\n", name.Display, shortB64(oidB64), mode)
-	fmt.Printf("→ point a .ton site record at %s to name it\n", id)
-	if socket != "" {
-		fmt.Println("node live · ctrl-C to stop · introspect: tonnet status")
-	} else {
-		fmt.Println("node live · ctrl-C to stop")
-	}
+	fmt.Printf("✓ room       %s (%s)\n", authority.Genesis.Name, roomID)
+	fmt.Printf("✓ overlay    %s\n", base64.RawURLEncoding.EncodeToString(authority.OverlayID))
+	fmt.Printf("✓ database   %s\n", authority.Paths.Database)
+	fmt.Printf("✓ control    %s\n", authority.Paths.Socket)
+	fmt.Println("sequencer live · ctrl-C to stop · reads are public")
 }

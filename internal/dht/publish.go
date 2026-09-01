@@ -272,6 +272,10 @@ func parseNonPublicADNLNets() []*net.IPNet {
 }
 
 func FindNodes(ctx context.Context, cfgURL, room string) (*overlay.NodesList, error) {
+	return FindNodesByKey(ctx, cfgURL, []byte(room))
+}
+
+func FindNodesByKey(ctx context.Context, cfgURL string, roomKey []byte) (*overlay.NodesList, error) {
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, err
@@ -284,11 +288,11 @@ func FindNodes(ctx context.Context, cfgURL, room string) (*overlay.NodesList, er
 	if err != nil {
 		return nil, err
 	}
-	list, _, err := d.FindOverlayNodes(ctx, []byte(room))
+	list, _, err := d.FindOverlayNodes(ctx, roomKey)
 	if err != nil || list == nil {
 		return list, err
 	}
-	return &overlay.NodesList{List: FilterOverlayNodes(list.List, []byte(room), time.Now())}, nil
+	return &overlay.NodesList{List: FilterOverlayNodes(list.List, roomKey, time.Now())}, nil
 }
 
 func FilterOverlayNodes(nodes []overlay.Node, room []byte, now time.Time) []overlay.Node {

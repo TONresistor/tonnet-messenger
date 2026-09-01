@@ -64,7 +64,6 @@ func (n *Node) closePeer(p *peer, reason string) {
 	if p == nil {
 		return
 	}
-	n.devices.removePeer(p.id)
 	log.Printf("peer evicted %s…: %s (%s)", short(p.id), reason, n.countsString())
 	closePeerConnection(p)
 }

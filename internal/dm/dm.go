@@ -11,7 +11,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/keys"
 )
 
-const domain = "tonnet-dm-v1"
+const domain = "tonnet-dm-v2"
 
 func sharedKey(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) ([]byte, error) {
 	s, err := keys.SharedKey(myPriv, peerPub)
@@ -34,14 +34,19 @@ func aead(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) (cipher.AEAD, er
 	return cipher.NewGCM(block)
 }
 
-func directionAAD(senderPub, recipientPub ed25519.PublicKey) []byte {
-	aad := make([]byte, 0, len(senderPub)+len(recipientPub))
+func directionAAD(roomID []byte, senderPub, recipientPub ed25519.PublicKey) []byte {
+	aad := make([]byte, 0, len(roomID)+len(senderPub)+len(recipientPub))
+	aad = append(aad, roomID...)
 	aad = append(aad, senderPub...)
 	aad = append(aad, recipientPub...)
 	return aad
 }
 
 func Seal(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, plaintext []byte) ([]byte, error) {
+	return SealForRoom(nil, myPriv, peerPub, plaintext)
+}
+
+func SealForRoom(roomID []byte, myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, plaintext []byte) ([]byte, error) {
 	gcm, err := aead(myPriv, peerPub)
 	if err != nil {
 		return nil, err
@@ -54,10 +59,14 @@ func Seal(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, plaintext []byte
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return gcm.Seal(nonce, nonce, plaintext, directionAAD(myPub, peerPub)), nil
+	return gcm.Seal(nonce, nonce, plaintext, directionAAD(roomID, myPub, peerPub)), nil
 }
 
 func Open(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, box []byte) ([]byte, error) {
+	return OpenForRoom(nil, myPriv, peerPub, box)
+}
+
+func OpenForRoom(roomID []byte, myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, box []byte) ([]byte, error) {
 	gcm, err := aead(myPriv, peerPub)
 	if err != nil {
 		return nil, err
@@ -70,5 +79,5 @@ func Open(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, box []byte) ([]b
 	if len(box) < ns {
 		return nil, fmt.Errorf("dm: ciphertext too short")
 	}
-	return gcm.Open(nil, box[:ns], box[ns:], directionAAD(peerPub, myPub))
+	return gcm.Open(nil, box[:ns], box[ns:], directionAAD(roomID, peerPub, myPub))
 }

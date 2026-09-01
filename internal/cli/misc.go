@@ -23,7 +23,7 @@ func newIDCmd() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) error {
 			key, err := keys.Load(keyPath)
 			if err != nil {
-				return fmt.Errorf("load key %s: %w (run `tonnet keygen` first)", keyPath, err)
+				return fmt.Errorf("load key %s: %w (run `tonnet-messenger-server keygen` first)", keyPath, err)
 			}
 			id, err := keys.ADNLID(key)
 			if err != nil {
@@ -91,8 +91,8 @@ func newStatusCmd() *cobra.Command {
 			}
 			fmt.Printf("uptime    %s\n", (time.Duration(s.UptimeSec) * time.Second).String())
 			for _, r := range s.Rooms {
-				fmt.Printf("room      %q  members=%d  neighbours=%d  presence=%d\n",
-					r.Name, r.Members, r.Neighbours, r.Presence)
+				fmt.Printf("room      %q  online=%d  neighbours=%d\n",
+					r.Name, r.Members, r.Neighbours)
 				fmt.Printf("          overlay=%s\n", r.OverlayID)
 			}
 			fmt.Printf("limits    leaves=%d  nodes=%d  pending=%d\n",
@@ -114,7 +114,7 @@ func newVersionCmd() *cobra.Command {
 		Use:   "version",
 		Short: "Print the tonnet version",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			fmt.Println("tonnet", Version)
+			fmt.Println("tonnet-messenger-server", Version)
 			return nil
 		},
 	}

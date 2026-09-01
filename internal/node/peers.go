@@ -2,7 +2,7 @@ package node
 
 import (
 	"bytes"
-	"encoding/hex"
+	"crypto/ed25519"
 	"math/rand"
 	"sync"
 	"time"
@@ -19,7 +19,7 @@ const (
 	maxKnownNodes    = 256
 	outboundQueueCap = 32
 
-	leafPeerBurst      = 4
+	leafPeerBurst      = 16
 	leafPeerRefillRate = 2
 	nodePeerBurst      = 32
 	nodePeerRefillRate = 16
@@ -48,29 +48,24 @@ const (
 )
 
 type peer struct {
-	id              string
-	kind            peerKind
-	state           peerState
-	w               *tonoverlay.ADNLOverlayWrapper
-	raw             adnl.Peer
-	member          bool
-	replayed        bool
-	errs            int
-	badScore        int
-	failures        int
-	firstSeen       time.Time
-	lastSeen        time.Time
-	lastGood        time.Time
-	signed          *tonoverlay.Node
-	challenge       []byte
-	challengeUntil  time.Time
-	challengeReplay bool
-	boundKey        string
-	limiterMu       sync.RWMutex
-	limiter         *tokenBucket
-	out             chan outboundJob
-	stop            chan struct{}
-	stopOnce        sync.Once
+	id        string
+	kind      peerKind
+	state     peerState
+	w         *tonoverlay.ADNLOverlayWrapper
+	raw       adnl.Peer
+	member    bool
+	errs      int
+	badScore  int
+	failures  int
+	firstSeen time.Time
+	lastSeen  time.Time
+	lastGood  time.Time
+	signed    *tonoverlay.Node
+	limiterMu sync.RWMutex
+	limiter   *tokenBucket
+	out       chan outboundJob
+	stop      chan struct{}
+	stopOnce  sync.Once
 }
 
 type peerTable struct {
@@ -195,69 +190,45 @@ func (t *peerTable) memberLeaf(id string) (*peer, bool) {
 	return p, true
 }
 
-func (t *peerTable) setChallenge(candidate *peer, nonce []byte, until time.Time) bool {
-	return t.setChallengeMode(candidate, nonce, until, false)
-}
-
-func (t *peerTable) setSessionChallenge(candidate *peer, nonce []byte, until time.Time) bool {
-	return t.setChallengeMode(candidate, nonce, until, true)
-}
-
-func (t *peerTable) setChallengeMode(candidate *peer, nonce []byte, until time.Time, replay bool) bool {
-	if candidate == nil || len(nonce) != 32 {
+func (t *peerTable) acceptsAuthor(candidate *peer, authorKey []byte) bool {
+	if candidate == nil || len(authorKey) != ed25519.PublicKeySize {
 		return false
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.mu.RLock()
+	defer t.mu.RUnlock()
 	p, ok := t.m[candidate.id]
-	if !ok || p != candidate {
+	if !ok || p != candidate || p.state != peerHealthy {
 		return false
 	}
-	p.challenge = append(p.challenge[:0], nonce...)
-	p.challengeUntil = until
-	p.challengeReplay = replay
-	return true
-}
-
-func (t *peerTable) authenticateDevice(candidate *peer, key, proof string, allowNew bool, now time.Time) bool {
-	if candidate == nil || key == "" {
-		return false
-	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	p, ok := t.m[candidate.id]
-	if !ok || p != candidate || p.kind != kindLeaf || !p.member || p.state != peerHealthy {
-		return false
-	}
-	if p.boundKey == key {
-		if allowNew && proof != "" && p.challengeUntil.After(now) {
-			decoded, err := hex.DecodeString(proof)
-			if err == nil && bytes.Equal(decoded, p.challenge) {
-				if p.challengeReplay {
-					p.replayed = false
-				}
-				p.challenge = nil
-				p.challengeUntil = time.Time{}
-				p.challengeReplay = false
-			}
-		}
+	if p.kind == kindNode {
 		return true
 	}
-	if !allowNew || p.boundKey != "" || !p.challengeUntil.After(now) {
+	return p.member && p.raw != nil && bytes.Equal(p.raw.GetPubKey(), authorKey)
+}
+
+func (t *peerTable) identityLeaves(identityKey []byte, excludeID string) []*peer {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	var out []*peer
+	for _, p := range t.m {
+		if p.id == excludeID || p.kind != kindLeaf || !p.member || p.state != peerHealthy || p.raw == nil {
+			continue
+		}
+		if bytes.Equal(p.raw.GetPubKey(), identityKey) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func (t *peerTable) isHealthyNode(candidate *peer) bool {
+	if candidate == nil {
 		return false
 	}
-	decoded, err := hex.DecodeString(proof)
-	if err != nil || !bytes.Equal(decoded, p.challenge) {
-		return false
-	}
-	p.boundKey = key
-	if p.challengeReplay {
-		p.replayed = false
-	}
-	p.challenge = nil
-	p.challengeUntil = time.Time{}
-	p.challengeReplay = false
-	return true
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	p, ok := t.m[candidate.id]
+	return ok && p == candidate && p.kind == kindNode && p.state == peerHealthy
 }
 
 func (t *peerTable) addNode(id string, w *tonoverlay.ADNLOverlayWrapper, raw adnl.Peer, signed *tonoverlay.Node) (*peer, bool) {
@@ -512,17 +483,6 @@ func (t *peerTable) nodeTargets(exclude string, max int) []*peer {
 	}
 	rand.Shuffle(len(out), func(i, j int) { out[i], out[j] = out[j], out[i] })
 	return out[:max]
-}
-
-func (t *peerTable) markReplayed(id string) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	p, ok := t.m[id]
-	if !ok || p.kind != kindLeaf || p.replayed {
-		return false
-	}
-	p.replayed = true
-	return true
 }
 
 func (t *peerTable) countError(id string) int {

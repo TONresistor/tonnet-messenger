@@ -1,18 +1,17 @@
 [Unit]
-Description=Tonnet overlay-node (experimental group-chat overlay peer)
+Description=Tonnet Messenger 0.4 authoritative room sequencer
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=tonnet
+Group=tonnet
 StateDirectory=tonnet
-RuntimeDirectory=tonnet
 ConfigurationDirectory=tonnet
-Environment=TONNET_ROOM=tonnet:groupchat:v1
 Environment=TONNET_MAX_LEAVES=256
 EnvironmentFile=/etc/tonnet/tonnet.env
-ExecStart=/usr/local/bin/tonnet serve --listen 0.0.0.0:17400 --advertise ${TONNET_ADVERTISE} --room ${TONNET_ROOM} --key /var/lib/tonnet/node.key --socket /run/tonnet/node.sock --max-leaves ${TONNET_MAX_LEAVES}
+ExecStart=/usr/local/bin/tonnet-messenger-server serve --state /var/lib/tonnet --listen 0.0.0.0:17400 --advertise ${TONNET_ADVERTISE} --max-leaves ${TONNET_MAX_LEAVES}
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20
@@ -22,7 +21,7 @@ NoNewPrivileges=yes
 PrivateDevices=yes
 PrivateTmp=yes
 ProtectControlGroups=yes
-ProtectHome=yes
+ProtectHome=read-only
 ProtectHostname=yes
 ProtectKernelModules=yes
 ProtectKernelTunables=yes

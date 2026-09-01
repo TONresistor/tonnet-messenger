@@ -44,32 +44,12 @@ type Time struct {
 	Now int32 `tl:"int"`
 }
 
-type GetChallenge struct{}
-
-type GetSessionChallenge struct{}
-
-type Challenge struct {
-	Nonce   []byte `tl:"int256"`
-	Expires int32  `tl:"int"`
-}
-
-type GetBroadcast struct {
-	Hash []byte `tl:"int256"`
-}
-
-type NotFound struct{}
-
 func init() {
 	tl.Register(Broadcast{}, "tonnet.broadcast src:PublicKey certificate:overlay.Certificate flags:int data:bytes date:int signature:bytes = tonnet.Broadcast")
 	tl.Register(broadcastID{}, "tonnet.broadcast.id src:int256 data_hash:int256 flags:int = tonnet.broadcast.Id")
 	tl.Register(toSign{}, "tonnet.broadcast.toSign hash:int256 date:int = tonnet.broadcast.ToSign")
 	tl.Register(GetTime{}, "tonnet.getTime = tonnet.Time")
 	tl.Register(Time{}, "tonnet.time now:int = tonnet.Time")
-	tl.Register(GetChallenge{}, "tonnet.getChallenge = tonnet.Challenge")
-	tl.Register(GetSessionChallenge{}, "tonnet.getSessionChallenge = tonnet.Challenge")
-	tl.Register(Challenge{}, "tonnet.challenge nonce:int256 expires:int = tonnet.Challenge")
-	tl.Register(GetBroadcast{}, "tonnet.getBroadcast hash:int256 = tonnet.Broadcast")
-	tl.Register(NotFound{}, "tonnet.broadcastNotFound = tonnet.Broadcast")
 }
 
 var (
@@ -176,4 +156,15 @@ func Fresh(date int32, now time.Time) bool {
 		return false
 	}
 	return !d.After(now.Add(FreshnessWindow))
+}
+
+func AsBroadcast(data tl.Serializable) (Broadcast, bool) {
+	switch value := data.(type) {
+	case Broadcast:
+		return value, true
+	case *Broadcast:
+		return *value, true
+	default:
+		return Broadcast{}, false
+	}
 }

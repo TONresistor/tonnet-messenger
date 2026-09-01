@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"log"
@@ -49,7 +48,7 @@ func (n *Node) discoverOnce(ctx context.Context) {
 	if pub == nil {
 		return
 	}
-	if list, err := pub.FindOverlayNodes(ctx, []byte(n.cfg.Room)); err != nil {
+	if list, err := pub.FindOverlayNodes(ctx, n.overlayKey()); err != nil {
 		log.Printf("discover: dht find: %v", err)
 	} else if list != nil {
 		for i := range capNodes(list.List) {
@@ -213,7 +212,7 @@ func (n *Node) completeMesh(ctx context.Context, idHex string, peer adnl.Peer, a
 	if p == nil || !created {
 		return
 	}
-	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.room.OverlayID())
+	w := tonoverlay.CreateExtendedADNL(peer).WithOverlay(n.cfg.OverlayID)
 	if !n.peers.installOverlay(p, w) {
 		return
 	}
@@ -243,7 +242,7 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 }
 
 func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
-	if !bytes.Equal(nd.Overlay, n.room.OverlayID()) {
+	if !bytes.Equal(nd.Overlay, n.cfg.OverlayID) {
 		return nil, nil, fmt.Errorf("node advertises a different overlay")
 	}
 	if err := nd.CheckSignature(); err != nil {
@@ -289,31 +288,16 @@ func (n *Node) answerQuery(p *peer, q *adnl.MessageQuery) error {
 		advertised = req.List
 	case broadcast.GetTime, *broadcast.GetTime:
 		return n.answer(p, q, broadcast.Time{Now: int32(time.Now().Unix())})
-	case broadcast.GetChallenge, *broadcast.GetChallenge:
-		nonce := make([]byte, 32)
-		if _, err := rand.Read(nonce); err != nil {
-			return err
-		}
-		expires := now.Add(time.Minute)
-		if !n.peers.setChallenge(p, nonce, expires) {
-			return nil
-		}
-		return n.answer(p, q, broadcast.Challenge{Nonce: nonce, Expires: int32(expires.Unix())})
-	case broadcast.GetSessionChallenge, *broadcast.GetSessionChallenge:
-		nonce := make([]byte, 32)
-		if _, err := rand.Read(nonce); err != nil {
-			return err
-		}
-		expires := now.Add(time.Minute)
-		if !n.peers.setSessionChallenge(p, nonce, expires) {
-			return nil
-		}
-		return n.answer(p, q, broadcast.Challenge{Nonce: nonce, Expires: int32(expires.Unix())})
-	case broadcast.GetBroadcast:
-		return n.answerGetBroadcast(p, q, req.Hash)
-	case *broadcast.GetBroadcast:
-		return n.answerGetBroadcast(p, q, req.Hash)
 	default:
+		acceptedPeer, _, accepted := n.peers.acceptInbound(p, now)
+		if !accepted {
+			return nil
+		}
+		p = acceptedPeer
+		handled, err := n.answerCommunityQuery(p, q, now)
+		if handled {
+			return err
+		}
 		return nil
 	}
 	n.peers.markSeen(p.id, now)
@@ -344,13 +328,6 @@ func (n *Node) answer(p *peer, q *adnl.MessageQuery, resp tl.Serializable) error
 	return nil
 }
 
-func (n *Node) answerGetBroadcast(p *peer, q *adnl.MessageQuery, hash []byte) error {
-	if b, ok := n.wrappers.get(hash); ok {
-		return n.answer(p, q, b)
-	}
-	return n.answer(p, q, broadcast.NotFound{})
-}
-
 func (n *Node) myNodesList() tonoverlay.NodesList {
 	list := make([]tonoverlay.Node, 0, 8)
 	if self, err := n.selfOverlayNode(); err == nil {
@@ -368,7 +345,7 @@ func (n *Node) myNodesList() tonoverlay.NodesList {
 func (n *Node) selfOverlayNode() (tonoverlay.Node, error) {
 	nd := tonoverlay.Node{
 		ID:      keys.PublicKeyED25519{Key: n.cfg.Key.Public().(ed25519.PublicKey)},
-		Overlay: n.room.OverlayID(),
+		Overlay: n.cfg.OverlayID,
 		Version: int32(time.Now().Unix()),
 	}
 	if err := nd.Sign(n.cfg.Key); err != nil {
