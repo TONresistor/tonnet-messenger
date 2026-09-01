@@ -52,6 +52,9 @@ func (s *Store) Commit(ctx context.Context, proposal community.EventProposal, ro
 		}
 		return CommitResult{}, reject(code, "proposal verification failed", err)
 	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM request_nonces WHERE expires_at<=?", now.Unix()); err != nil {
+		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot expire nonces", err)
+	}
 	var nonceExists int
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
 SELECT 1 FROM request_nonces WHERE author_key=? AND nonce=? AND expires_at>?)`,
@@ -110,9 +113,6 @@ VALUES (?, ?, ?, ?)`, proposal.AuthorKey, proposal.Nonce, now.Unix(), now.Add(co
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE replica_head SET latest_seqno=?, latest_hash=? WHERE singleton_id=1", commit.Seqno, commitHash); err != nil {
 		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot advance event head", err)
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM request_nonces WHERE expires_at<=?", now.Unix()); err != nil {
-		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot expire nonces", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot commit event", err)

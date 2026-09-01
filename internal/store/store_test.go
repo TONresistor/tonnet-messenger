@@ -140,6 +140,25 @@ func TestCommitIsDurableOrderedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestCommitAcceptsNonceAfterRetentionExpires(t *testing.T) {
+	f := newFixture(t)
+	nonce := randomNonce(t)
+	first := f.proposal(t, f.user, community.EventMessage{Text: "one"}, nonce, f.now)
+	if _, err := f.store.Commit(f.ctx, first, f.room, f.now); err != nil {
+		t.Fatal(err)
+	}
+
+	after := f.now.Add(community.NonceRetention)
+	second := f.proposal(t, f.user, community.EventMessage{Text: "two"}, nonce, after)
+	result, err := f.store.Commit(f.ctx, second, f.room, after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Event.Seqno != 2 {
+		t.Fatalf("seqno = %d", result.Event.Seqno)
+	}
+}
+
 func TestRolesPolicyPinsAndPagination(t *testing.T) {
 	f := newFixture(t)
 	commit := func(author ed25519.PrivateKey, body any) community.CommittedEvent {
