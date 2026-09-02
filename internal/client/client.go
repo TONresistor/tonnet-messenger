@@ -24,7 +24,15 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
 )
 
-const defaultConfigURL = "https://ton-blockchain.github.io/global.config.json"
+const (
+	defaultConfigURL            = "https://ton-blockchain.github.io/global.config.json"
+	canonicalEventQueueCapacity = 64
+)
+
+var (
+	errRoomSessionChanged = errors.New("room session changed")
+	errCanonicalQueueFull = errors.New("canonical event queue is full")
+)
 
 type Config struct {
 	StateDir  string
@@ -72,14 +80,24 @@ type roomHandle struct {
 	key    []byte
 	ref    string
 	boot   []byte
+	ctx    context.Context
 	cancel context.CancelFunc
 
 	mu         sync.RWMutex
 	connectMu  sync.Mutex
-	syncMu     sync.Mutex
+	historyMu  sync.Mutex
 	session    *replica.Session
 	state      community.RoomStateResult
 	timeOffset int64
+	events     chan canonicalEvent
+	workers    sync.WaitGroup
+	ingestDone bool
+}
+
+type canonicalEvent struct {
+	session *replica.Session
+	event   community.CommittedEvent
+	result  chan error
 }
 
 func Open(ctx context.Context, cfg Config) (*Client, error) {
@@ -146,12 +164,17 @@ func (c *Client) Close() error {
 	}
 	c.closed = true
 	c.cancel()
+	rooms := make([]*roomHandle, 0, len(c.rooms))
 	for _, room := range c.rooms {
+		rooms = append(rooms, room)
 		room.cancel()
 		room.closeSession()
 	}
 	c.rooms = map[string]*roomHandle{}
 	c.mu.Unlock()
+	for _, room := range rooms {
+		room.workers.Wait()
+	}
 	close(c.events)
 	err := c.store.Close()
 	releaseStateLock(c.lock)
@@ -294,6 +317,7 @@ func (c *Client) Leave(ctx context.Context, reference string) error {
 	if handle != nil {
 		handle.cancel()
 		handle.closeSession()
+		handle.workers.Wait()
 	}
 	return c.store.deleteRoom(ctx, roomKey)
 }
@@ -457,7 +481,8 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 	default:
 		return nil, fmt.Errorf("unexpected submit response %T", response)
 	}
-	if err := handle.ingestEvent(event); err != nil {
+	if err := handle.ingestCanonical(ctx, session, event); err != nil {
+		handle.closeSessionIf(session)
 		return nil, err
 	}
 	return eventView(event)
@@ -490,17 +515,35 @@ func (c *Client) startRoom(record RoomRecord, first chan<- error) *roomHandle {
 	key := keyText(record.RoomKey)
 	c.mu.Lock()
 	if existing := c.rooms[key]; existing != nil {
+		if first != nil {
+			existing.workers.Add(1)
+		}
 		c.mu.Unlock()
 		if first != nil {
-			go func() { first <- existing.connect(c.ctx) }()
+			go func() {
+				defer existing.workers.Done()
+				first <- existing.connect(existing.ctx)
+			}()
 		}
 		return existing
 	}
 	ctx, cancel := context.WithCancel(c.ctx)
-	handle := &roomHandle{client: c, key: append([]byte(nil), record.RoomKey...), ref: record.Reference, boot: append([]byte(nil), record.Bootstrap...), cancel: cancel}
+	handle := &roomHandle{
+		client: c, key: append([]byte(nil), record.RoomKey...), ref: record.Reference,
+		boot: append([]byte(nil), record.Bootstrap...), ctx: ctx, cancel: cancel,
+		events: make(chan canonicalEvent, canonicalEventQueueCapacity),
+	}
 	c.rooms[key] = handle
+	handle.workers.Add(2)
 	c.mu.Unlock()
-	go handle.run(ctx, first)
+	go func() {
+		defer handle.workers.Done()
+		handle.ingestLoop(ctx)
+	}()
+	go func() {
+		defer handle.workers.Done()
+		handle.run(ctx, first)
+	}()
 	return handle
 }
 
@@ -574,37 +617,39 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		session.Close()
 		return fmt.Errorf("sequencer clock skew")
 	}
+	r.historyMu.Lock()
 	r.mu.Lock()
 	r.session = session
 	r.timeOffset = offset
 	r.mu.Unlock()
 	session.Peer.SetMessageHandler(func(message any) error {
-		r.ingestSerializable(message)
+		r.ingestSerializable(session, message)
 		return nil
 	})
-	if err := r.sync(ctx); err != nil {
+	if err := r.syncSessionLocked(ctx, session); err != nil {
+		r.historyMu.Unlock()
 		r.closeSessionIf(session)
 		return err
 	}
+	r.historyMu.Unlock()
 	r.mu.RLock()
+	if r.session != session {
+		r.mu.RUnlock()
+		return errRoomSessionChanged
+	}
 	state := r.state
 	r.mu.RUnlock()
 	r.client.emit("room.connection", map[string]any{"room": keyText(r.key), "status": "connected", "state": stateView(state)})
 	return nil
 }
 
-func (r *roomHandle) sync(ctx context.Context) error {
-	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
+func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Session) error {
+	if session == nil || !r.isCurrentSession(session) {
+		return errRoomSessionChanged
+	}
 	record, err := r.client.store.room(ctx, r.key)
 	if err != nil {
 		return err
-	}
-	r.mu.RLock()
-	session := r.session
-	r.mu.RUnlock()
-	if session == nil {
-		return fmt.Errorf("room disconnected")
 	}
 	if record.HeadSeqno > 0 {
 		if err := r.client.store.auditRoom(ctx, r.key, session.Genesis); err != nil {
@@ -623,7 +668,13 @@ func (r *roomHandle) sync(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		if !r.isCurrentSession(session) {
+			return errRoomSessionChanged
+		}
 		for _, event := range page.Events {
+			if !r.isCurrentSession(session) {
+				return errRoomSessionChanged
+			}
 			if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
 				return err
 			}
@@ -632,7 +683,9 @@ func (r *roomHandle) sync(ctx context.Context) error {
 				return err
 			}
 			if inserted {
-				r.client.emitEvent(event)
+				if err := r.client.emitEvent(ctx, event); err != nil {
+					return err
+				}
 			}
 			record.HeadSeqno = event.Seqno
 		}
@@ -650,6 +703,9 @@ func (r *roomHandle) sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if !r.isCurrentSession(session) {
+		return errRoomSessionChanged
+	}
 	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return fmt.Errorf("invalid room state")
 	}
@@ -657,13 +713,19 @@ func (r *roomHandle) sync(ctx context.Context) error {
 		return err
 	}
 	r.mu.Lock()
+	if r.session != session {
+		r.mu.Unlock()
+		return errRoomSessionChanged
+	}
 	r.state = state
 	r.mu.Unlock()
-	r.client.emit("room.state", stateView(state))
-	return nil
+	return r.client.emitReliable(ctx, "room.state", stateView(state))
 }
 
-func (r *roomHandle) ingestSerializable(serialized tl.Serializable) {
+func (r *roomHandle) ingestSerializable(session *replica.Session, serialized tl.Serializable) {
+	if !r.isCurrentSession(session) {
+		return
+	}
 	wrapper, ok := broadcast.AsBroadcast(serialized)
 	if !ok || wrapper.Flags != 0 || wrapper.Verify() != nil || !broadcast.Fresh(wrapper.Date, time.Now()) {
 		return
@@ -674,9 +736,11 @@ func (r *roomHandle) ingestSerializable(serialized tl.Serializable) {
 	}
 	if bytes.Equal(source, r.key) {
 		event, err := community.DecodeCommittedEvent(wrapper.Data)
-		if err == nil {
-			go func() { _ = r.ingestEvent(event) }()
+		if err != nil {
+			r.closeSessionIf(session)
+			return
 		}
+		_ = r.enqueueCanonical(session, event, nil)
 		return
 	}
 	direct, err := community.DecodeDirectMessage(wrapper.Data)
@@ -693,6 +757,9 @@ func (r *roomHandle) ingestSerializable(serialized tl.Serializable) {
 	if err != nil {
 		return
 	}
+	if !r.isCurrentSession(session) {
+		return
+	}
 	id, _ := community.HashBoxed(direct)
 	view := map[string]any{
 		"room": keyText(r.key), "id": keyText(id), "peer_key": keyText(direct.FromKey),
@@ -707,82 +774,173 @@ func (r *roomHandle) ingestSerializable(serialized tl.Serializable) {
 	r.client.emit("dm.message", view)
 }
 
-func (r *roomHandle) ingestEvent(event community.CommittedEvent) error {
+func (r *roomHandle) enqueueCanonical(session *replica.Session, event community.CommittedEvent, result chan error) error {
 	r.mu.RLock()
-	session := r.session
-	r.mu.RUnlock()
-	if session == nil {
-		return fmt.Errorf("room disconnected")
+	if session == nil || r.session != session {
+		r.mu.RUnlock()
+		return errRoomSessionChanged
 	}
-	if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
-		return err
-	}
-	record, err := r.client.store.room(r.client.ctx, r.key)
-	if err != nil {
-		return err
-	}
-	if event.Seqno > record.HeadSeqno+1 {
-		if err := r.sync(r.client.ctx); err != nil {
+	if r.ingestDone {
+		r.mu.RUnlock()
+		if err := r.ctx.Err(); err != nil {
 			return err
 		}
+		return context.Canceled
 	}
-	inserted, err := r.client.store.appendEvent(r.client.ctx, r.key, event)
-	if err != nil {
+	item := canonicalEvent{session: session, event: event, result: result}
+	select {
+	case r.events <- item:
+		r.mu.RUnlock()
+		return nil
+	default:
+		r.mu.RUnlock()
+		r.closeSessionIf(session)
+		return errCanonicalQueueFull
+	}
+}
+
+func (r *roomHandle) ingestCanonical(ctx context.Context, session *replica.Session, event community.CommittedEvent) error {
+	result := make(chan error, 1)
+	if err := r.enqueueCanonical(session, event, result); err != nil {
 		return err
 	}
-	if inserted {
-		r.client.emitEvent(event)
-		if stateChanging(event.Proposal.Body) {
-			go r.refreshState(session)
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	}
+}
+
+func (r *roomHandle) ingestLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			r.stopIngest(ctx.Err())
+			return
+		case item := <-r.events:
+			durable, err := r.processCanonical(ctx, item.session, item.event)
+			if err != nil {
+				r.closeSessionIf(item.session)
+			}
+			if durable {
+				completeCanonical(item, nil)
+			} else {
+				completeCanonical(item, err)
+			}
 		}
 	}
-	return nil
 }
 
-func (r *roomHandle) refreshState(session *replica.Session) {
-	if err := r.refreshStateFor(session); err != nil {
-		r.closeSessionIf(session)
+func (r *roomHandle) stopIngest(err error) {
+	r.mu.Lock()
+	r.ingestDone = true
+	r.mu.Unlock()
+	for {
+		select {
+		case item := <-r.events:
+			completeCanonical(item, err)
+		default:
+			return
+		}
 	}
 }
 
-func (r *roomHandle) refreshStateFor(session *replica.Session) error {
-	if session == nil {
-		return nil
+func completeCanonical(item canonicalEvent, err error) {
+	if item.result == nil {
+		return
 	}
-	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
+	select {
+	case item.result <- err:
+	default:
+	}
+}
+
+func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Session, event community.CommittedEvent) (bool, error) {
+	r.historyMu.Lock()
+	defer r.historyMu.Unlock()
 	if !r.isCurrentSession(session) {
-		return nil
+		return false, errRoomSessionChanged
+	}
+	if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
+		return false, err
+	}
+	record, err := r.client.store.room(ctx, r.key)
+	if err != nil {
+		return false, err
+	}
+	if event.Seqno > record.HeadSeqno+1 {
+		if err := r.syncSessionLocked(ctx, session); err != nil {
+			durable, lookupErr := r.client.store.hasEvent(ctx, r.key, event)
+			if lookupErr != nil {
+				return false, errors.Join(err, lookupErr)
+			}
+			return durable, err
+		}
+	}
+	inserted, err := r.client.store.appendEvent(ctx, r.key, event)
+	if err != nil {
+		return false, err
+	}
+	if !inserted {
+		return true, nil
+	}
+	var state *community.RoomStateResult
+	if stateChanging(event.Proposal.Body) {
+		refreshed, err := r.refreshStateLocked(ctx, session)
+		if err != nil {
+			if notifyErr := r.client.emitEvent(ctx, event); notifyErr != nil {
+				return true, errors.Join(err, notifyErr)
+			}
+			return true, err
+		}
+		state = &refreshed
+	}
+	if err := r.client.emitEvent(ctx, event); err != nil {
+		return true, err
+	}
+	if state != nil {
+		if err := r.client.emitReliable(ctx, "room.state", stateView(*state)); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Session) (community.RoomStateResult, error) {
+	if !r.isCurrentSession(session) {
+		return community.RoomStateResult{}, errRoomSessionChanged
 	}
 	var state community.RoomStateResult
-	ctx, cancel := context.WithTimeout(r.client.ctx, 10*time.Second)
-	err := session.Peer.Query(ctx, community.GetRoomState{}, &state)
+	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	err := session.Peer.Query(queryCtx, community.GetRoomState{}, &state)
 	cancel()
 	if err != nil {
-		return err
+		return community.RoomStateResult{}, err
 	}
 	if !r.isCurrentSession(session) {
-		return nil
+		return community.RoomStateResult{}, errRoomSessionChanged
 	}
-	record, err := r.client.store.room(r.client.ctx, r.key)
+	record, err := r.client.store.room(ctx, r.key)
 	if err != nil {
-		return err
+		return community.RoomStateResult{}, err
 	}
 	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
-		return fmt.Errorf("invalid room state")
+		return community.RoomStateResult{}, fmt.Errorf("invalid room state")
 	}
-	if err := r.client.store.updateState(r.client.ctx, r.key, session.Genesis, state.State); err != nil {
-		return err
+	if err := r.client.store.updateState(ctx, r.key, session.Genesis, state.State); err != nil {
+		return community.RoomStateResult{}, err
 	}
 	r.mu.Lock()
 	if r.session != session {
 		r.mu.Unlock()
-		return nil
+		return community.RoomStateResult{}, errRoomSessionChanged
 	}
 	r.state = state
 	r.mu.Unlock()
-	r.client.emit("room.state", stateView(state))
-	return nil
+	return state, nil
 }
 
 func (r *roomHandle) closeSession() {
@@ -859,16 +1017,36 @@ func (c *Client) emitLocked(method string, params any) {
 	}
 }
 
-func (c *Client) emitEvent(event community.CommittedEvent) {
+func (c *Client) emitReliable(ctx context.Context, method string, params any) error {
+	c.mu.RLock()
+	if c.closed {
+		c.mu.RUnlock()
+		return context.Canceled
+	}
+	clientCtx := c.ctx
+	notifications := c.events
+	c.mu.RUnlock()
+	select {
+	case notifications <- Notification{Method: method, Params: params}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-clientCtx.Done():
+		return clientCtx.Err()
+	}
+}
+
+func (c *Client) emitEvent(ctx context.Context, event community.CommittedEvent) error {
 	if event.Proposal.AuthorDomain != "" {
 		c.mu.Lock()
 		c.profiles[keyText(event.Proposal.AuthorKey)] = event.Proposal.AuthorDomain
 		c.mu.Unlock()
 	}
 	view, err := eventView(event)
-	if err == nil {
-		c.emit("room.event", view)
+	if err != nil {
+		return err
 	}
+	return c.emitReliable(ctx, "room.event", view)
 }
 
 func keyText(key []byte) string { return base64.RawURLEncoding.EncodeToString(key) }

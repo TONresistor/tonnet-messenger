@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -306,11 +307,11 @@ func (s *clientStore) appendEvent(ctx context.Context, roomKey []byte, event com
 		return false, err
 	}
 	if event.Seqno <= head {
-		var existing []byte
-		if err := tx.QueryRowContext(ctx, "SELECT event_id FROM room_events WHERE room_key=? AND seqno=?", roomKey, event.Seqno).Scan(&existing); err != nil {
+		var existingRaw []byte
+		if err := tx.QueryRowContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno=?", roomKey, event.Seqno).Scan(&existingRaw); err != nil {
 			return false, err
 		}
-		if !bytes.Equal(existing, id) {
+		if !bytes.Equal(existingRaw, raw) {
 			return false, fmt.Errorf("client store: conflicting event at seqno %d", event.Seqno)
 		}
 		return false, nil
@@ -326,6 +327,25 @@ func (s *clientStore) appendEvent(ctx context.Context, roomKey []byte, event com
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
+	}
+	return true, nil
+}
+
+func (s *clientStore) hasEvent(ctx context.Context, roomKey []byte, event community.CommittedEvent) (bool, error) {
+	raw, err := community.Encode(event)
+	if err != nil {
+		return false, err
+	}
+	var storedRaw []byte
+	err = s.db.QueryRowContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno=?", roomKey, event.Seqno).Scan(&storedRaw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(storedRaw, raw) {
+		return false, fmt.Errorf("client store: conflicting event at seqno %d", event.Seqno)
 	}
 	return true, nil
 }
