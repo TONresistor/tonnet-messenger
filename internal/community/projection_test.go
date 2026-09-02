@@ -39,8 +39,18 @@ func TestProjectionAppliesCanonicalAuthorizationAndState(t *testing.T) {
 	if err := projection.Apply(commit(user, EventMessage{Text: "denied"})); !errors.Is(err, ErrProjectionUnauthorized) {
 		t.Fatalf("unauthorized message error = %v", err)
 	}
-	if err := projection.Apply(commit(admin, EventMessage{Text: "allowed"})); err != nil {
+	messageTransition, err := projection.Prepare(commit(admin, EventMessage{Text: "allowed"}))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if seqno, _ := projection.Head(); seqno != 0 {
+		t.Fatal("prepare mutated the projection")
+	}
+	if err := projection.Commit(messageTransition); err != nil {
+		t.Fatal(err)
+	}
+	if err := projection.Commit(messageTransition); err == nil {
+		t.Fatal("stale transition committed twice")
 	}
 	if err := projection.Apply(commit(admin, EventModeratorGrant{SubjectKey: moderator.Public().(ed25519.PublicKey)})); err != nil {
 		t.Fatal(err)
@@ -54,7 +64,14 @@ func TestProjectionAppliesCanonicalAuthorizationAndState(t *testing.T) {
 	if err := projection.Apply(commit(room, EventAdminRevoke{SubjectKey: moderator.Public().(ed25519.PublicKey)})); err != nil {
 		t.Fatal(err)
 	}
-	if err := projection.Apply(commit(admin, EventMetadata{Name: "Updated", Description: "Current"})); err != nil {
+	metadataTransition, err := projection.Prepare(commit(admin, EventMetadata{Name: "Updated", Description: "Current"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := projection.State(); state.Name != "Room" || state.Description != "Description" {
+		t.Fatalf("prepare mutated projected state = %+v", state)
+	}
+	if err := projection.Commit(metadataTransition); err != nil {
 		t.Fatal(err)
 	}
 

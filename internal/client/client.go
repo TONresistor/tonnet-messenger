@@ -808,8 +808,8 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 			if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
 				return err
 			}
-			nextProjection := projection.Clone()
-			if err := nextProjection.Apply(event); err != nil {
+			transition, err := projection.Prepare(event)
+			if err != nil {
 				return err
 			}
 			inserted, err := r.client.store.appendEvent(ctx, r.key, event)
@@ -817,7 +817,9 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 				return err
 			}
 			if inserted {
-				projection = nextProjection
+				if err := projection.Commit(transition); err != nil {
+					return err
+				}
 				if err := r.client.emitEvent(ctx, event); err != nil {
 					return err
 				}
@@ -1027,11 +1029,14 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 			return false, err
 		}
 	}
-	nextProjection := projection.Clone()
+	var transition community.Transition
+	prepared := false
 	if event.Seqno > record.HeadSeqno {
-		if err := nextProjection.Apply(event); err != nil {
+		transition, err = projection.Prepare(event)
+		if err != nil {
 			return false, err
 		}
+		prepared = true
 	}
 	inserted, err := r.client.store.appendEvent(ctx, r.key, event)
 	if err != nil {
@@ -1040,7 +1045,13 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	if !inserted {
 		return true, nil
 	}
-	r.projection = nextProjection
+	if !prepared {
+		return true, fmt.Errorf("canonical event inserted without a prepared projection transition")
+	}
+	if err := projection.Commit(transition); err != nil {
+		return true, err
+	}
+	r.projection = projection
 	var state *community.RoomStateResult
 	if stateChanging(event.Proposal.Body) {
 		refreshed, err := r.refreshStateLocked(ctx, session, epoch)

@@ -24,6 +24,19 @@ type Projection struct {
 	messages map[int64]struct{}
 }
 
+// Transition is a validated, immutable delta prepared against one projection
+// head. It can be committed only while that head is still current.
+type Transition struct {
+	owner        *Projection
+	baseSeq      int64
+	baseHash     []byte
+	nextSeq      int64
+	nextHash     []byte
+	stateChanged bool
+	nextState    RoomState
+	messageID    int64
+}
+
 func NewProjection(genesis Genesis) (*Projection, error) {
 	if err := genesis.VerifyNow(); err != nil {
 		return nil, err
@@ -44,20 +57,6 @@ func NewProjection(genesis Genesis) (*Projection, error) {
 	}, nil
 }
 
-func (p *Projection) Clone() *Projection {
-	if p == nil {
-		return nil
-	}
-	clone := &Projection{
-		genesis: p.genesis, state: copyProjectedState(p.state), headSeq: p.headSeq,
-		headHash: copyBytes(p.headHash), messages: make(map[int64]struct{}, len(p.messages)),
-	}
-	for id := range p.messages {
-		clone.messages[id] = struct{}{}
-	}
-	return clone
-}
-
 func (p *Projection) Head() (int64, []byte) {
 	if p == nil {
 		return 0, nil
@@ -73,30 +72,63 @@ func (p *Projection) State() RoomState {
 }
 
 func (p *Projection) Apply(event CommittedEvent) error {
-	if p == nil {
-		return errors.New("community: nil projection")
-	}
-	if err := event.Verify(p.genesis.RoomKey, p.genesis.NodeKey); err != nil {
-		return err
-	}
-	if event.Seqno != p.headSeq+1 || !bytes.Equal(event.PreviousHash, p.headHash) {
-		return fmt.Errorf("community: non-contiguous projected event at seqno %d", event.Seqno)
-	}
-	if !projectionAuthorized(p.genesis.RoomKey, p.state, event.Proposal) {
-		return ErrProjectionUnauthorized
-	}
-	if err := p.applyBody(event); err != nil {
-		return err
-	}
-	hash, err := event.Hash()
+	transition, err := p.Prepare(event)
 	if err != nil {
 		return err
 	}
-	p.headSeq = event.Seqno
-	p.headHash = hash
-	if _, message := asMessage(event.Proposal.Body); !message {
-		p.state.RevisionSeqno = event.Seqno
-		p.state.RevisionHash = copyBytes(hash)
+	return p.Commit(transition)
+}
+
+// Prepare validates event and builds its bounded in-memory delta without
+// mutating the projection.
+func (p *Projection) Prepare(event CommittedEvent) (Transition, error) {
+	if p == nil {
+		return Transition{}, errors.New("community: nil projection")
+	}
+	if err := event.Verify(p.genesis.RoomKey, p.genesis.NodeKey); err != nil {
+		return Transition{}, err
+	}
+	if event.Seqno != p.headSeq+1 || !bytes.Equal(event.PreviousHash, p.headHash) {
+		return Transition{}, fmt.Errorf("community: non-contiguous projected event at seqno %d", event.Seqno)
+	}
+	if !projectionAuthorized(p.genesis.RoomKey, p.state, event.Proposal) {
+		return Transition{}, ErrProjectionUnauthorized
+	}
+	hash, err := event.Hash()
+	if err != nil {
+		return Transition{}, err
+	}
+	transition := Transition{
+		owner: p, baseSeq: p.headSeq, baseHash: copyBytes(p.headHash),
+		nextSeq: event.Seqno, nextHash: hash,
+	}
+	if _, message := asMessage(event.Proposal.Body); message {
+		transition.messageID = event.MessageID
+		return transition, nil
+	}
+	transition.stateChanged = true
+	transition.nextState = copyProjectedState(p.state)
+	if err := applyProjectedStateBody(p.genesis.RoomKey, &transition.nextState, p.messages, event.Proposal.Body); err != nil {
+		return Transition{}, err
+	}
+	transition.nextState.RevisionSeqno = event.Seqno
+	transition.nextState.RevisionHash = copyBytes(hash)
+	return transition, nil
+}
+
+// Commit applies a prepared transition if the projection head has not changed.
+func (p *Projection) Commit(transition Transition) error {
+	if p == nil || transition.owner != p || transition.nextSeq != p.headSeq+1 ||
+		transition.baseSeq != p.headSeq || !bytes.Equal(transition.baseHash, p.headHash) {
+		return errors.New("community: stale projection transition")
+	}
+	p.headSeq = transition.nextSeq
+	p.headHash = copyBytes(transition.nextHash)
+	if transition.messageID > 0 {
+		p.messages[transition.messageID] = struct{}{}
+	}
+	if transition.stateChanged {
+		p.state = transition.nextState
 	}
 	return nil
 }
@@ -119,65 +151,61 @@ func (p *Projection) ValidateState(state RoomState) error {
 	return nil
 }
 
-func (p *Projection) applyBody(event CommittedEvent) error {
-	switch body := event.Proposal.Body.(type) {
-	case EventMessage:
-		p.messages[event.MessageID] = struct{}{}
-	case *EventMessage:
-		p.messages[event.MessageID] = struct{}{}
+func applyProjectedStateBody(roomKey []byte, state *RoomState, messages map[int64]struct{}, body any) error {
+	switch body := body.(type) {
 	case EventMetadata:
-		p.state.Name, p.state.Description = body.Name, body.Description
+		state.Name, state.Description = body.Name, body.Description
 	case *EventMetadata:
-		p.state.Name, p.state.Description = body.Name, body.Description
+		state.Name, state.Description = body.Name, body.Description
 	case EventWritePolicy:
-		p.state.WritePolicy.AnyoneCanWrite = body.AnyoneCanWrite
+		state.WritePolicy.AnyoneCanWrite = body.AnyoneCanWrite
 	case *EventWritePolicy:
-		p.state.WritePolicy.AnyoneCanWrite = body.AnyoneCanWrite
+		state.WritePolicy.AnyoneCanWrite = body.AnyoneCanWrite
 	case EventPin, *EventPin:
 		id, _ := targetMessageID(body)
-		if _, ok := p.messages[id]; !ok {
+		if _, ok := messages[id]; !ok {
 			return ErrProjectionMessage
 		}
-		if containsProjectedLong(p.state.PinnedMessages, id) {
+		if containsProjectedLong(state.PinnedMessages, id) {
 			return ErrProjectionConflict
 		}
-		if len(p.state.PinnedMessages) >= MaxPins {
+		if len(state.PinnedMessages) >= MaxPins {
 			return ErrProjectionLimit
 		}
-		p.state.PinnedMessages = append(p.state.PinnedMessages, id)
-		sort.Slice(p.state.PinnedMessages, func(i, j int) bool { return p.state.PinnedMessages[i] < p.state.PinnedMessages[j] })
+		state.PinnedMessages = append(state.PinnedMessages, id)
+		sort.Slice(state.PinnedMessages, func(i, j int) bool { return state.PinnedMessages[i] < state.PinnedMessages[j] })
 	case EventUnpin, *EventUnpin:
 		id, _ := targetMessageID(body)
 		var removed bool
-		p.state.PinnedMessages, removed = removeProjectedLong(p.state.PinnedMessages, id)
+		state.PinnedMessages, removed = removeProjectedLong(state.PinnedMessages, id)
 		if !removed {
 			return ErrProjectionConflict
 		}
 	case EventAdminGrant, *EventAdminGrant:
 		key, _ := subjectKey(body)
-		return p.grantRole(key, true)
+		return grantProjectedRole(roomKey, state, key, true)
 	case EventAdminRevoke, *EventAdminRevoke:
 		key, _ := subjectKey(body)
-		return p.revokeRole(key, true)
+		return revokeProjectedRole(roomKey, state, key, true)
 	case EventModeratorGrant, *EventModeratorGrant:
 		key, _ := subjectKey(body)
-		return p.grantRole(key, false)
+		return grantProjectedRole(roomKey, state, key, false)
 	case EventModeratorRevoke, *EventModeratorRevoke:
 		key, _ := subjectKey(body)
-		return p.revokeRole(key, false)
+		return revokeProjectedRole(roomKey, state, key, false)
 	default:
 		return ErrInvalidBody
 	}
 	return nil
 }
 
-func (p *Projection) grantRole(key []byte, admin bool) error {
-	if bytes.Equal(key, p.genesis.RoomKey) {
+func grantProjectedRole(roomKey []byte, state *RoomState, key []byte, admin bool) error {
+	if bytes.Equal(key, roomKey) {
 		return ErrProjectionConflict
 	}
-	roles, limit := &p.state.Moderators, MaxModerators
+	roles, limit := &state.Moderators, MaxModerators
 	if admin {
-		roles, limit = &p.state.Admins, MaxAdmins
+		roles, limit = &state.Admins, MaxAdmins
 	}
 	if containsProjectedKey(*roles, key) {
 		return ErrProjectionConflict
@@ -190,13 +218,13 @@ func (p *Projection) grantRole(key []byte, admin bool) error {
 	return nil
 }
 
-func (p *Projection) revokeRole(key []byte, admin bool) error {
-	if bytes.Equal(key, p.genesis.RoomKey) {
+func revokeProjectedRole(roomKey []byte, state *RoomState, key []byte, admin bool) error {
+	if bytes.Equal(key, roomKey) {
 		return ErrProjectionConflict
 	}
-	roles := &p.state.Moderators
+	roles := &state.Moderators
 	if admin {
-		roles = &p.state.Admins
+		roles = &state.Admins
 	}
 	var removed bool
 	*roles, removed = removeProjectedKey(*roles, key)
