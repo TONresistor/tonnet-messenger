@@ -132,16 +132,16 @@ func TestRoomHandleInvalidatesOnlyExpectedSession(t *testing.T) {
 	if handle.closeSessionIf(oldSession) {
 		t.Fatal("stale session closed its replacement")
 	}
-	if err := handle.enqueueCanonical(oldSession, community.CommittedEvent{}, nil); err != errRoomSessionChanged {
+	if err := handle.enqueueCanonical(oldSession, 0, community.CommittedEvent{}, nil); err != errRoomSessionChanged {
 		t.Fatalf("stale session enqueue error = %v", err)
 	}
 	if len(handle.events) != 0 {
 		t.Fatal("stale session queued an event")
 	}
-	if !handle.isCurrentSession(newSession) {
+	if !handle.isCurrentSession(newSession, 0) {
 		t.Fatal("replacement session was detached")
 	}
-	if !handle.closeSessionIf(newSession) || handle.isCurrentSession(newSession) {
+	if !handle.closeSessionIf(newSession) || handle.isCurrentSession(newSession, 0) {
 		t.Fatal("current session was not invalidated")
 	}
 }
@@ -160,7 +160,7 @@ func TestRoomHandleIngestFailureInvalidatesSession(t *testing.T) {
 		handle.ingestLoop(ctx)
 	}()
 	result := make(chan error, 1)
-	if err := handle.enqueueCanonical(session, community.CommittedEvent{}, result); err != nil {
+	if err := handle.enqueueCanonical(session, 0, community.CommittedEvent{}, result); err != nil {
 		t.Fatal(err)
 	}
 
@@ -168,7 +168,7 @@ func TestRoomHandleIngestFailureInvalidatesSession(t *testing.T) {
 		t.Fatal("invalid canonical event was accepted")
 	}
 
-	if handle.isCurrentSession(session) {
+	if handle.isCurrentSession(session, 0) {
 		t.Fatal("failed canonical ingestion left the session connected")
 	}
 	cancel()
@@ -182,13 +182,13 @@ func TestRoomHandleQueueOverflowInvalidatesSession(t *testing.T) {
 		ctx: ctx, session: session,
 		events: make(chan canonicalEvent, 1),
 	}
-	if err := handle.enqueueCanonical(session, community.CommittedEvent{}, nil); err != nil {
+	if err := handle.enqueueCanonical(session, 0, community.CommittedEvent{}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := handle.enqueueCanonical(session, community.CommittedEvent{}, nil); err != errCanonicalQueueFull {
+	if err := handle.enqueueCanonical(session, 0, community.CommittedEvent{}, nil); err != errCanonicalQueueFull {
 		t.Fatalf("queue overflow error = %v", err)
 	}
-	if handle.isCurrentSession(session) {
+	if handle.isCurrentSession(session, 0) {
 		t.Fatal("queue overflow left the session connected")
 	}
 }
@@ -203,7 +203,7 @@ func TestRoomHandleSerializesDuplicateCanonicalEvents(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			errs <- f.handle.ingestCanonical(f.ctx, f.session, event)
+			errs <- f.handle.ingestCanonical(f.ctx, f.session, 0, event)
 		}()
 	}
 	wait.Wait()
@@ -291,7 +291,7 @@ func TestRoomHandleRejectsUnrepairedGap(t *testing.T) {
 	f := newCanonicalIngestFixture(t)
 	event := f.event(t, 2, community.Zero256(), community.EventMessage{Text: "gap"})
 
-	if err := f.handle.ingestCanonical(f.ctx, f.session, event); err == nil {
+	if err := f.handle.ingestCanonical(f.ctx, f.session, 0, event); err == nil {
 		t.Fatal("event gap was accepted without repair")
 	}
 	items, _, err := f.store.timeline(f.ctx, f.genesis.RoomKey, 0, 10)
@@ -307,10 +307,10 @@ func TestRoomHandlePreservesDurableEventWhenStateValidationFails(t *testing.T) {
 	f := newCanonicalIngestFixture(t)
 	event := f.event(t, 1, community.Zero256(), community.EventMetadata{Name: "Updated", Description: "Current"})
 
-	if err := f.handle.ingestCanonical(f.ctx, f.session, event); err != nil {
+	if err := f.handle.ingestCanonical(f.ctx, f.session, 0, event); err != nil {
 		t.Fatalf("durable event reported as failed: %v", err)
 	}
-	if f.handle.isCurrentSession(f.session) {
+	if f.handle.isCurrentSession(f.session, 0) {
 		t.Fatal("state validation failure left the session connected")
 	}
 	items, _, err := f.store.timeline(f.ctx, f.genesis.RoomKey, 0, 10)
@@ -339,7 +339,7 @@ func TestRoomHandleAppliesNotificationBackpressure(t *testing.T) {
 	event := f.event(t, 1, community.Zero256(), community.EventMessage{Text: "backpressure"})
 	result := make(chan error, 1)
 	go func() {
-		result <- f.handle.ingestCanonical(f.ctx, f.session, event)
+		result <- f.handle.ingestCanonical(f.ctx, f.session, 0, event)
 	}()
 
 	deadline := time.Now().Add(time.Second)

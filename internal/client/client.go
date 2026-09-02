@@ -66,13 +66,14 @@ type Client struct {
 	store     *clientStore
 	lock      *stateLock
 
-	mu       sync.RWMutex
-	rooms    map[string]*roomHandle
-	name     string
-	domain   string
-	profiles map[string]string
-	events   chan Notification
-	closed   bool
+	mu            sync.RWMutex
+	rooms         map[string]*roomHandle
+	name          string
+	domain        string
+	profiles      map[string]string
+	events        chan Notification
+	closed        bool
+	identityEpoch uint64
 }
 
 type roomHandle struct {
@@ -83,22 +84,33 @@ type roomHandle struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu         sync.RWMutex
-	connectMu  sync.Mutex
-	historyMu  sync.Mutex
-	session    *replica.Session
-	state      community.RoomStateResult
-	projection *community.Projection
-	timeOffset int64
-	events     chan canonicalEvent
-	workers    sync.WaitGroup
-	ingestDone bool
+	mu           sync.RWMutex
+	connectMu    sync.Mutex
+	historyMu    sync.Mutex
+	session      *replica.Session
+	sessionEpoch uint64
+	state        community.RoomStateResult
+	projection   *community.Projection
+	timeOffset   int64
+	events       chan canonicalEvent
+	workers      sync.WaitGroup
+	ingestDone   bool
 }
 
 type canonicalEvent struct {
 	session *replica.Session
+	epoch   uint64
 	event   community.CommittedEvent
 	result  chan error
+}
+
+type roomIdentitySnapshot struct {
+	key     ed25519.PrivateKey
+	name    string
+	domain  string
+	session *replica.Session
+	epoch   uint64
+	offset  int64
 }
 
 func Open(ctx context.Context, cfg Config) (*Client, error) {
@@ -113,6 +125,9 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		cfg.ConfigURL = defaultConfigURL
 	}
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(cfg.StateDir, 0o700); err != nil {
 		return nil, err
 	}
 	lock, err := acquireStateLock(filepath.Join(cfg.StateDir, "client.lock"))
@@ -140,7 +155,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	c := &Client{
 		ctx: clientCtx, cancel: cancel, stateDir: cfg.StateDir, configURL: cfg.ConfigURL,
 		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
-		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256),
+		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 	}
 	return c, nil
 }
@@ -210,12 +225,19 @@ func (c *Client) ConfirmDomain(ctx context.Context, domain string) (Identity, er
 	if err != nil {
 		return Identity{}, err
 	}
+	c.mu.RLock()
+	key := append(ed25519.PublicKey(nil), c.key.Public().(ed25519.PublicKey)...)
+	epoch := c.identityEpoch
+	c.mu.RUnlock()
 	resolved, err := tondns.ResolveIdentity(ctx, c.configURL, normalized)
-	if err != nil || !bytes.Equal(resolved, c.key.Public().(ed25519.PublicKey)) {
+	if err != nil || !bytes.Equal(resolved, key) {
 		return Identity{}, fmt.Errorf("identity domain does not resolve to this identity")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.identityEpoch != epoch || !bytes.Equal(c.key.Public().(ed25519.PublicKey), key) {
+		return Identity{}, errRoomSessionChanged
+	}
 	if err := c.store.setMeta(ctx, "author_domain", normalized); err != nil {
 		return Identity{}, err
 	}
@@ -251,23 +273,27 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	if expected != current {
 		return Identity{}, fmt.Errorf("expected identity does not match current identity")
 	}
-	for _, room := range c.rooms {
-		room.closeSession()
-	}
-	key, err := replaceIdentity(c.keyPath)
+	key, stagedPath, err := stageIdentity(c.keyPath)
 	if err != nil {
 		return Identity{}, err
 	}
+	defer os.Remove(stagedPath)
+	previousDomain := c.domain
 	if err := c.store.setMeta(ctx, "author_domain", ""); err != nil {
+		return Identity{}, err
+	}
+	for _, room := range c.rooms {
+		room.closeSession()
+	}
+	if err := commitStagedIdentity(c.keyPath, stagedPath); err != nil {
+		if rollbackErr := c.store.setMeta(context.Background(), "author_domain", previousDomain); rollbackErr != nil {
+			return Identity{}, errors.Join(err, rollbackErr)
+		}
 		return Identity{}, err
 	}
 	c.key = key
 	c.domain = ""
-	for _, room := range c.rooms {
-		room.mu.Lock()
-		room.session = nil
-		room.mu.Unlock()
-	}
+	c.identityEpoch++
 	identity := Identity{Key: keyText(key.Public().(ed25519.PublicKey)), Name: c.name}
 	c.emitLocked("identity.changed", identity)
 	return identity, nil
@@ -387,10 +413,11 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 	if err != nil {
 		return nil, err
 	}
-	c.mu.RLock()
-	key := append(ed25519.PrivateKey(nil), c.key...)
-	name := c.name
-	c.mu.RUnlock()
+	snapshot, err := c.snapshotRoomIdentity(handle)
+	if err != nil {
+		return nil, err
+	}
+	key, name := snapshot.key, snapshot.name
 	from := key.Public().(ed25519.PublicKey)
 	if bytes.Equal(from, to) {
 		return nil, fmt.Errorf("cannot send a direct message to this identity")
@@ -398,12 +425,7 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 	if len([]byte(text)) > community.MaxDMPlaintextBytes {
 		return nil, fmt.Errorf("direct message exceeds %d bytes", community.MaxDMPlaintextBytes)
 	}
-	handle.mu.RLock()
-	session, offset := handle.session, handle.timeOffset
-	handle.mu.RUnlock()
-	if session == nil {
-		return nil, fmt.Errorf("room is not connected")
-	}
+	session, offset := snapshot.session, snapshot.offset
 	box, err := dm.SealForRoom(handle.key, key, ed25519.PublicKey(to), []byte(text))
 	if err != nil {
 		return nil, err
@@ -443,16 +465,12 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 	if err != nil {
 		return nil, err
 	}
-	c.mu.RLock()
-	key := append(ed25519.PrivateKey(nil), c.key...)
-	name, domain := c.name, c.domain
-	c.mu.RUnlock()
-	handle.mu.RLock()
-	session, offset := handle.session, handle.timeOffset
-	handle.mu.RUnlock()
-	if session == nil {
-		return nil, fmt.Errorf("room is not connected")
+	snapshot, err := c.snapshotRoomIdentity(handle)
+	if err != nil {
+		return nil, err
 	}
+	key, name, domain := snapshot.key, snapshot.name, snapshot.domain
+	session, offset := snapshot.session, snapshot.offset
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
@@ -482,11 +500,25 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 	default:
 		return nil, fmt.Errorf("unexpected submit response %T", response)
 	}
-	if err := handle.ingestCanonical(ctx, session, event); err != nil {
+	if err := handle.ingestCanonical(ctx, session, snapshot.epoch, event); err != nil {
 		handle.closeSessionIf(session)
 		return nil, err
 	}
 	return eventView(event)
+}
+
+func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot, error) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	handle.mu.RLock()
+	defer handle.mu.RUnlock()
+	if c.closed || handle.session == nil || handle.sessionEpoch != c.identityEpoch {
+		return roomIdentitySnapshot{}, fmt.Errorf("room is not connected")
+	}
+	return roomIdentitySnapshot{
+		key: append(ed25519.PrivateKey(nil), c.key...), name: c.name, domain: c.domain,
+		session: handle.session, epoch: c.identityEpoch, offset: handle.timeOffset,
+	}, nil
 }
 
 type RejectedError struct {
@@ -597,6 +629,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	}
 	r.client.mu.RLock()
 	identity := append(ed25519.PrivateKey(nil), r.client.key...)
+	identityEpoch := r.client.identityEpoch
 	r.client.mu.RUnlock()
 	session, err := replica.DialRoom(ctx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
@@ -619,22 +652,23 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		return fmt.Errorf("sequencer clock skew")
 	}
 	r.historyMu.Lock()
-	r.mu.Lock()
-	r.session = session
-	r.timeOffset = offset
-	r.mu.Unlock()
+	if err := r.installSession(session, identity, identityEpoch, offset); err != nil {
+		r.historyMu.Unlock()
+		session.Close()
+		return err
+	}
 	session.Peer.SetMessageHandler(func(message any) error {
-		r.ingestSerializable(session, message)
+		r.ingestSerializable(session, identityEpoch, message)
 		return nil
 	})
-	if err := r.syncSessionLocked(ctx, session); err != nil {
+	if err := r.syncSessionLocked(ctx, session, identityEpoch); err != nil {
 		r.historyMu.Unlock()
 		r.closeSessionIf(session)
 		return err
 	}
 	r.historyMu.Unlock()
 	r.mu.RLock()
-	if r.session != session {
+	if r.session != session || r.sessionEpoch != identityEpoch {
 		r.mu.RUnlock()
 		return errRoomSessionChanged
 	}
@@ -644,8 +678,23 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	return nil
 }
 
-func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Session) error {
-	if session == nil || !r.isCurrentSession(session) {
+func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64, offset int64) error {
+	r.client.mu.RLock()
+	defer r.client.mu.RUnlock()
+	if r.client.closed || r.client.identityEpoch != epoch ||
+		!bytes.Equal(r.client.key.Public().(ed25519.PublicKey), identity.Public().(ed25519.PublicKey)) {
+		return errRoomSessionChanged
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.session = session
+	r.sessionEpoch = epoch
+	r.timeOffset = offset
+	return nil
+}
+
+func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Session, epoch uint64) error {
+	if session == nil || !r.isCurrentSession(session, epoch) {
 		return errRoomSessionChanged
 	}
 	if err := r.client.store.pinGenesis(ctx, r.key, session.Genesis); err != nil {
@@ -677,11 +726,11 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 		if err != nil {
 			return err
 		}
-		if !r.isCurrentSession(session) {
+		if !r.isCurrentSession(session, epoch) {
 			return errRoomSessionChanged
 		}
 		for _, event := range page.Events {
-			if !r.isCurrentSession(session) {
+			if !r.isCurrentSession(session, epoch) {
 				return errRoomSessionChanged
 			}
 			if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
@@ -717,7 +766,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if err != nil {
 		return err
 	}
-	if !r.isCurrentSession(session) {
+	if !r.isCurrentSession(session, epoch) {
 		return errRoomSessionChanged
 	}
 	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
@@ -737,8 +786,8 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	return r.client.emitReliable(ctx, "room.state", stateView(state))
 }
 
-func (r *roomHandle) ingestSerializable(session *replica.Session, serialized tl.Serializable) {
-	if !r.isCurrentSession(session) {
+func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, serialized tl.Serializable) {
+	if !r.isCurrentSession(session, epoch) {
 		return
 	}
 	wrapper, ok := broadcast.AsBroadcast(serialized)
@@ -755,7 +804,7 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, serialized tl.
 			r.closeSessionIf(session)
 			return
 		}
-		_ = r.enqueueCanonical(session, event, nil)
+		_ = r.enqueueCanonical(session, epoch, event, nil)
 		return
 	}
 	direct, err := community.DecodeDirectMessage(wrapper.Data)
@@ -772,7 +821,7 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, serialized tl.
 	if err != nil {
 		return
 	}
-	if !r.isCurrentSession(session) {
+	if !r.isCurrentSession(session, epoch) {
 		return
 	}
 	id, _ := community.HashBoxed(direct)
@@ -789,9 +838,9 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, serialized tl.
 	r.client.emit("dm.message", view)
 }
 
-func (r *roomHandle) enqueueCanonical(session *replica.Session, event community.CommittedEvent, result chan error) error {
+func (r *roomHandle) enqueueCanonical(session *replica.Session, epoch uint64, event community.CommittedEvent, result chan error) error {
 	r.mu.RLock()
-	if session == nil || r.session != session {
+	if session == nil || r.session != session || r.sessionEpoch != epoch {
 		r.mu.RUnlock()
 		return errRoomSessionChanged
 	}
@@ -802,7 +851,7 @@ func (r *roomHandle) enqueueCanonical(session *replica.Session, event community.
 		}
 		return context.Canceled
 	}
-	item := canonicalEvent{session: session, event: event, result: result}
+	item := canonicalEvent{session: session, epoch: epoch, event: event, result: result}
 	select {
 	case r.events <- item:
 		r.mu.RUnlock()
@@ -814,9 +863,9 @@ func (r *roomHandle) enqueueCanonical(session *replica.Session, event community.
 	}
 }
 
-func (r *roomHandle) ingestCanonical(ctx context.Context, session *replica.Session, event community.CommittedEvent) error {
+func (r *roomHandle) ingestCanonical(ctx context.Context, session *replica.Session, epoch uint64, event community.CommittedEvent) error {
 	result := make(chan error, 1)
-	if err := r.enqueueCanonical(session, event, result); err != nil {
+	if err := r.enqueueCanonical(session, epoch, event, result); err != nil {
 		return err
 	}
 	select {
@@ -836,7 +885,7 @@ func (r *roomHandle) ingestLoop(ctx context.Context) {
 			r.stopIngest(ctx.Err())
 			return
 		case item := <-r.events:
-			durable, err := r.processCanonical(ctx, item.session, item.event)
+			durable, err := r.processCanonical(ctx, item.session, item.epoch, item.event)
 			if err != nil {
 				r.closeSessionIf(item.session)
 			}
@@ -873,10 +922,10 @@ func completeCanonical(item canonicalEvent, err error) {
 	}
 }
 
-func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Session, event community.CommittedEvent) (bool, error) {
+func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Session, epoch uint64, event community.CommittedEvent) (bool, error) {
 	r.historyMu.Lock()
 	defer r.historyMu.Unlock()
-	if !r.isCurrentSession(session) {
+	if !r.isCurrentSession(session, epoch) {
 		return false, errRoomSessionChanged
 	}
 	if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
@@ -887,7 +936,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 		return false, err
 	}
 	if event.Seqno > record.HeadSeqno+1 {
-		if err := r.syncSessionLocked(ctx, session); err != nil {
+		if err := r.syncSessionLocked(ctx, session, epoch); err != nil {
 			durable, lookupErr := r.client.store.hasEvent(ctx, r.key, event)
 			if lookupErr != nil {
 				return false, errors.Join(err, lookupErr)
@@ -922,7 +971,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	r.projection = nextProjection
 	var state *community.RoomStateResult
 	if stateChanging(event.Proposal.Body) {
-		refreshed, err := r.refreshStateLocked(ctx, session)
+		refreshed, err := r.refreshStateLocked(ctx, session, epoch)
 		if err != nil {
 			if notifyErr := r.client.emitEvent(ctx, event); notifyErr != nil {
 				return true, errors.Join(err, notifyErr)
@@ -942,8 +991,8 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	return true, nil
 }
 
-func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Session) (community.RoomStateResult, error) {
-	if !r.isCurrentSession(session) {
+func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Session, epoch uint64) (community.RoomStateResult, error) {
+	if !r.isCurrentSession(session, epoch) {
 		return community.RoomStateResult{}, errRoomSessionChanged
 	}
 	var state community.RoomStateResult
@@ -953,7 +1002,7 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 	if err != nil {
 		return community.RoomStateResult{}, err
 	}
-	if !r.isCurrentSession(session) {
+	if !r.isCurrentSession(session, epoch) {
 		return community.RoomStateResult{}, errRoomSessionChanged
 	}
 	record, err := r.client.store.room(ctx, r.key)
@@ -971,7 +1020,7 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 		return community.RoomStateResult{}, err
 	}
 	r.mu.Lock()
-	if r.session != session {
+	if r.session != session || r.sessionEpoch != epoch {
 		r.mu.Unlock()
 		return community.RoomStateResult{}, errRoomSessionChanged
 	}
@@ -992,6 +1041,7 @@ func (r *roomHandle) closeSessionIf(expected *replica.Session) bool {
 		return false
 	}
 	r.session = nil
+	r.sessionEpoch = 0
 	r.mu.Unlock()
 	if session != nil {
 		session.Close()
@@ -1000,10 +1050,10 @@ func (r *roomHandle) closeSessionIf(expected *replica.Session) bool {
 	return false
 }
 
-func (r *roomHandle) isCurrentSession(session *replica.Session) bool {
+func (r *roomHandle) isCurrentSession(session *replica.Session, epoch uint64) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.session == session
+	return r.session == session && r.sessionEpoch == epoch
 }
 
 func (c *Client) resolveRoom(ctx context.Context, reference string) ([]byte, error) {
@@ -1195,62 +1245,141 @@ func stateChanging(body any) bool {
 }
 
 func loadOrCreateIdentity(path string) (ed25519.PrivateKey, error) {
+	if err := recoverIdentitySwap(path); err != nil {
+		return nil, err
+	}
 	seed, err := os.ReadFile(path)
 	if err == nil {
 		if len(seed) != ed25519.SeedSize {
 			return nil, fmt.Errorf("identity key has invalid size")
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return nil, err
 		}
 		return ed25519.NewKeyFromSeed(seed), nil
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	return replaceIdentity(path)
-}
-
-func replaceIdentity(path string) (ed25519.PrivateKey, error) {
-	seed := make([]byte, ed25519.SeedSize)
-	if _, err := rand.Read(seed); err != nil {
-		return nil, err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".identity-*")
+	key, stagedPath, err := stageIdentity(path)
 	if err != nil {
 		return nil, err
 	}
+	defer os.Remove(stagedPath)
+	if err := commitStagedIdentity(path, stagedPath); err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+func stageIdentity(path string) (ed25519.PrivateKey, string, error) {
+	seed := make([]byte, ed25519.SeedSize)
+	if _, err := rand.Read(seed); err != nil {
+		return nil, "", err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".identity-*")
+	if err != nil {
+		return nil, "", err
+	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
-		return nil, err
+		os.Remove(tmpPath)
+		return nil, "", err
 	}
 	if _, err := tmp.Write(seed); err != nil {
 		tmp.Close()
-		return nil, err
+		os.Remove(tmpPath)
+		return nil, "", err
 	}
 	if err := tmp.Sync(); err != nil {
 		tmp.Close()
-		return nil, err
+		os.Remove(tmpPath)
+		return nil, "", err
 	}
 	if err := tmp.Close(); err != nil {
-		return nil, err
+		os.Remove(tmpPath)
+		return nil, "", err
 	}
+	return ed25519.NewKeyFromSeed(seed), tmpPath, nil
+}
+
+func commitStagedIdentity(path, stagedPath string) error {
 	backup := path + ".previous"
-	_ = os.Remove(backup)
+	if err := os.Remove(backup); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	hadExisting := false
 	if _, err := os.Stat(path); err == nil {
 		if err := os.Rename(path, backup); err != nil {
-			return nil, err
+			return err
 		}
 		hadExisting = true
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return err
 	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := os.Rename(stagedPath, path); err != nil {
 		if hadExisting {
-			_ = os.Rename(backup, path)
+			if restoreErr := os.Rename(backup, path); restoreErr != nil {
+				return errors.Join(err, restoreErr)
+			}
 		}
-		return nil, err
+		return err
 	}
+	syncIdentityDir(path)
 	_ = os.Remove(backup)
-	return ed25519.NewKeyFromSeed(seed), nil
+	syncIdentityDir(path)
+	return nil
+}
+
+func recoverIdentitySwap(path string) error {
+	backup := path + ".previous"
+	seed, err := os.ReadFile(path)
+	if err == nil {
+		if len(seed) != ed25519.SeedSize {
+			return fmt.Errorf("identity key has invalid size")
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return err
+		}
+		_ = os.Remove(backup)
+		cleanupIdentityTemps(path)
+		return nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	backupSeed, backupErr := os.ReadFile(backup)
+	if backupErr == nil {
+		if len(backupSeed) != ed25519.SeedSize {
+			return fmt.Errorf("previous identity key has invalid size")
+		}
+		if err := os.Rename(backup, path); err != nil {
+			return err
+		}
+		if err := os.Chmod(path, 0o600); err != nil {
+			return err
+		}
+		syncIdentityDir(path)
+	} else if !errors.Is(backupErr, os.ErrNotExist) {
+		return backupErr
+	}
+	cleanupIdentityTemps(path)
+	return nil
+}
+
+func cleanupIdentityTemps(path string) {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), ".identity-*"))
+	for _, match := range matches {
+		_ = os.Remove(match)
+	}
+}
+
+func syncIdentityDir(path string) {
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return
+	}
+	_ = dir.Sync()
+	_ = dir.Close()
 }
