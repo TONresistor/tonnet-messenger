@@ -27,6 +27,11 @@ type clientStore struct {
 	db *sql.DB
 }
 
+type clientQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -120,17 +125,107 @@ func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis c
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=?,raw_state=? WHERE room_key=?", rawGenesis, rawState, roomKey)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validateRoomState(ctx, tx, roomKey, genesis, state); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=?,raw_state=? WHERE room_key=?", rawGenesis, rawState, roomKey); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
-func (s *clientStore) updateState(ctx context.Context, roomKey []byte, state community.RoomState) error {
+func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
 	raw, err := community.Encode(state)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", raw, roomKey)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := validateRoomState(ctx, tx, roomKey, genesis, state); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", raw, roomKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
+	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	return validateRoomState(ctx, tx, roomKey, genesis, state)
+}
+
+func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
+	if err := state.Verify(); err != nil {
+		return fmt.Errorf("client store: invalid room state: %w", err)
+	}
+	if !bytes.Equal(genesis.RoomKey, roomKey) || !bytes.Equal(state.RoomID, roomKey) {
+		return fmt.Errorf("client store: room state belongs to another room")
+	}
+	record, err := queryRoom(ctx, query, roomKey)
+	if err != nil {
+		return err
+	}
+	if state.RevisionSeqno > record.HeadSeqno {
+		return fmt.Errorf("client store: room state revision is ahead of event head")
+	}
+
+	expectedHash, err := genesis.Hash()
+	if err != nil {
+		return err
+	}
+	if state.RevisionSeqno > 0 {
+		var raw []byte
+		if err := query.QueryRowContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno=?", roomKey, state.RevisionSeqno).Scan(&raw); err != nil {
+			return err
+		}
+		event, err := community.DecodeCommittedEvent(raw)
+		if err != nil {
+			return err
+		}
+		if !stateChanging(event.Proposal.Body) {
+			return fmt.Errorf("client store: room state revision is not a state-changing event")
+		}
+		expectedHash, err = event.Hash()
+		if err != nil {
+			return err
+		}
+	}
+	if !bytes.Equal(state.RevisionHash, expectedHash) {
+		return fmt.Errorf("client store: room state revision hash mismatch")
+	}
+
+	rows, err := query.QueryContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno>? ORDER BY seqno", roomKey, state.RevisionSeqno)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return err
+		}
+		event, err := community.DecodeCommittedEvent(raw)
+		if err != nil {
+			return err
+		}
+		if stateChanging(event.Proposal.Body) {
+			return fmt.Errorf("client store: stale room state")
+		}
+	}
+	return rows.Err()
 }
 
 func (s *clientStore) rooms(ctx context.Context) ([]RoomRecord, error) {
@@ -164,9 +259,13 @@ func (s *clientStore) rooms(ctx context.Context) ([]RoomRecord, error) {
 }
 
 func (s *clientStore) room(ctx context.Context, roomKey []byte) (RoomRecord, error) {
+	return queryRoom(ctx, s.db, roomKey)
+}
+
+func queryRoom(ctx context.Context, query clientQueryer, roomKey []byte) (RoomRecord, error) {
 	var record RoomRecord
 	var rawGenesis, rawState []byte
-	err := s.db.QueryRowContext(ctx, "SELECT room_key,reference,bootstrap,raw_genesis,raw_state,head_seqno,head_hash FROM joined_rooms WHERE room_key=?", roomKey).
+	err := query.QueryRowContext(ctx, "SELECT room_key,reference,bootstrap,raw_genesis,raw_state,head_seqno,head_hash FROM joined_rooms WHERE room_key=?", roomKey).
 		Scan(&record.RoomKey, &record.Reference, &record.Bootstrap, &rawGenesis, &rawState, &record.HeadSeqno, &record.HeadHash)
 	if err != nil {
 		return RoomRecord{}, err

@@ -650,10 +650,7 @@ func (r *roomHandle) sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := state.State.Verify(); err != nil {
-		return err
-	}
-	if !bytes.Equal(state.State.RoomID, r.key) || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
+	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return fmt.Errorf("invalid room state")
 	}
 	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, state.State); err != nil {
@@ -756,10 +753,14 @@ func (r *roomHandle) refreshState() error {
 	if err != nil {
 		return err
 	}
-	if err := state.State.Verify(); err != nil {
+	record, err := r.client.store.room(r.client.ctx, r.key)
+	if err != nil {
 		return err
 	}
-	if err := r.client.store.updateState(r.client.ctx, r.key, state.State); err != nil {
+	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
+		return fmt.Errorf("invalid room state")
+	}
+	if err := r.client.store.updateState(r.client.ctx, r.key, session.Genesis, state.State); err != nil {
 		return err
 	}
 	r.mu.Lock()
