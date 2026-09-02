@@ -225,6 +225,30 @@ func TestRolesPolicyPinsAndPagination(t *testing.T) {
 	}
 }
 
+func TestAdminRevokePreservesModeratorRole(t *testing.T) {
+	f := newFixture(t)
+	subject := f.admin.Public().(ed25519.PublicKey)
+	commit := func(body any) {
+		t.Helper()
+		proposal := f.proposal(t, f.room, body, randomNonce(t), f.now)
+		if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	commit(community.EventModeratorGrant{SubjectKey: subject})
+	commit(community.EventAdminGrant{SubjectKey: subject})
+	commit(community.EventAdminRevoke{SubjectKey: subject})
+
+	state, err := f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Admins) != 0 || len(state.Moderators) != 1 || !bytes.Equal(state.Moderators[0], subject) {
+		t.Fatalf("roles after admin revoke: admins=%x moderators=%x", state.Admins, state.Moderators)
+	}
+}
+
 func rejectionCode(err error) int32 {
 	var rejection *Rejection
 	if errors.As(err, &rejection) {

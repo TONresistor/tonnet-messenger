@@ -183,9 +183,9 @@ func applyProjection(ctx context.Context, tx *sql.Tx, genesis community.Genesis,
 	case *community.EventAdminGrant:
 		return grantRole(ctx, tx, genesis, event.Seqno, body.SubjectKey, author, "admin")
 	case community.EventAdminRevoke:
-		return revokeAdmin(ctx, tx, genesis, body.SubjectKey)
+		return revokeRole(ctx, tx, genesis, body.SubjectKey, "admin")
 	case *community.EventAdminRevoke:
-		return revokeAdmin(ctx, tx, genesis, body.SubjectKey)
+		return revokeRole(ctx, tx, genesis, body.SubjectKey, "admin")
 	case community.EventModeratorGrant:
 		return grantRole(ctx, tx, genesis, event.Seqno, body.SubjectKey, author, "moderator")
 	case *community.EventModeratorGrant:
@@ -265,27 +265,6 @@ func grantRole(ctx context.Context, tx *sql.Tx, genesis community.Genesis, seqno
 		if isConstraint(err) {
 			return reject(community.RejectRoleConflict, "role already granted", err)
 		}
-		return persistenceProjection(err)
-	}
-	return nil
-}
-
-func revokeAdmin(ctx context.Context, tx *sql.Tx, genesis community.Genesis, subject []byte) error {
-	if bytes.Equal(subject, genesis.RoomKey) {
-		return reject(community.RejectRoleConflict, "owner cannot be revoked", nil)
-	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM roles WHERE subject_key=? AND role='admin'", subject)
-	if err != nil {
-		return persistenceProjection(err)
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return persistenceProjection(err)
-	}
-	if rows == 0 {
-		return reject(community.RejectRoleConflict, "administrator role is not granted", nil)
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM roles WHERE subject_key=? AND role='moderator'", subject); err != nil {
 		return persistenceProjection(err)
 	}
 	return nil
