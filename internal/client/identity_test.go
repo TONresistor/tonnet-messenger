@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
@@ -63,6 +64,37 @@ func TestLoadIdentityKeepsCompletedSwapAndPermissions(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("identity permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestIdentitySwapRollsBackWhenDirectorySyncFails(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "identity.key")
+	oldSeed := identityTestSeed(t)
+	if err := os.WriteFile(path, oldSeed, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, stagedPath, err := stageIdentity(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncCalls := 0
+	err = commitStagedIdentityWithSync(path, stagedPath, func(string) error {
+		syncCalls++
+		if syncCalls == 1 {
+			return os.ErrInvalid
+		}
+		return nil
+	})
+	if err == nil {
+		t.Fatal("identity swap succeeded without a durable directory entry")
+	}
+	seed, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if !bytes.Equal(seed, oldSeed) {
+		t.Fatal("failed identity swap did not restore the previous key")
 	}
 }
 
@@ -134,6 +166,100 @@ func TestSessionInstallRejectsStaleIdentityEpoch(t *testing.T) {
 	}
 	if !handle.isCurrentSession(session, 2) || handle.timeOffset != 7 {
 		t.Fatal("current identity session was not installed")
+	}
+}
+
+func TestClientNotificationBackpressureDoesNotDropDM(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &Client{ctx: ctx, events: make(chan Notification, 1)}
+	client.events <- Notification{Method: "occupied"}
+	result := make(chan error, 1)
+	go func() {
+		result <- client.notify(ctx, "dm.message", "hello")
+	}()
+
+	select {
+	case err := <-result:
+		t.Fatalf("notification bypassed backpressure: %v", err)
+	default:
+	}
+	<-client.events
+	if err := <-result; err != nil {
+		t.Fatal(err)
+	}
+	notification := <-client.events
+	if notification.Method != "dm.message" || notification.Params != "hello" {
+		t.Fatalf("notification = %+v", notification)
+	}
+}
+
+func TestSessionNotificationRejectsStaleIdentityEpoch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &Client{ctx: ctx, events: make(chan Notification, 1), identityEpoch: 2}
+	session := &replica.Session{}
+	handle := &roomHandle{client: client, session: session, sessionEpoch: 2}
+
+	if err := handle.notifyForSession(ctx, session, 1, "room.connection", "stale"); err != errRoomSessionChanged {
+		t.Fatalf("stale notification error = %v", err)
+	}
+	if len(client.events) != 0 {
+		t.Fatal("stale identity notification was published")
+	}
+	if err := handle.notifyForSession(ctx, session, 2, "room.connection", "current"); err != nil {
+		t.Fatal(err)
+	}
+	if notification := <-client.events; notification.Params != "current" {
+		t.Fatalf("notification = %+v", notification)
+	}
+}
+
+func TestConnectedNotificationRejectsClosedSession(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &Client{ctx: ctx, events: make(chan Notification, 1), identityEpoch: 1}
+	done := make(chan struct{})
+	close(done)
+	session := &replica.Session{Done: done}
+	handle := &roomHandle{client: client, session: session, sessionEpoch: 1}
+
+	if err := handle.notifyLiveSession(ctx, session, 1, "room.connection", "connected"); err != errRoomSessionChanged {
+		t.Fatalf("closed session notification error = %v", err)
+	}
+	if len(client.events) != 0 {
+		t.Fatal("closed session was announced as connected")
+	}
+}
+
+func TestClientCloseRejectsQueuedIdentityMutation(t *testing.T) {
+	c, err := Open(context.Background(), Config{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.identityOps.Lock()
+	mutation := make(chan error, 1)
+	go func() {
+		_, err := c.SetName(context.Background(), "after-close")
+		mutation <- err
+	}()
+	closed := make(chan error, 1)
+	go func() { closed <- c.Close() }()
+	for {
+		c.mu.RLock()
+		closing := c.closed
+		c.mu.RUnlock()
+		if closing {
+			break
+		}
+		runtime.Gosched()
+	}
+	c.identityOps.Unlock()
+	if err := <-mutation; err == nil {
+		t.Fatal("identity mutation started after close")
+	}
+	if err := <-closed; err != nil {
+		t.Fatal(err)
 	}
 }
 
