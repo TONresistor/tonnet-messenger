@@ -146,6 +146,26 @@ func TestRoomHandleInvalidatesOnlyExpectedSession(t *testing.T) {
 	}
 }
 
+func TestSyncFailureDetachesSessionBeforeHistoryUnlock(t *testing.T) {
+	ctx := context.Background()
+	session := &replica.Session{}
+	handle := &roomHandle{session: session, sessionEpoch: 3}
+	handle.historyMu.Lock()
+	result := make(chan error, 1)
+	go func() {
+		_, err := handle.processCanonical(ctx, session, 3, community.CommittedEvent{})
+		result <- err
+	}()
+	detached := handle.detachSessionIf(session)
+	if detached != session {
+		t.Fatal("sync failure did not detach its current session")
+	}
+	handle.historyMu.Unlock()
+	if err := <-result; err != errRoomSessionChanged {
+		t.Fatalf("queued event after failed sync = %v", err)
+	}
+}
+
 func TestRoomHandleIngestFailureInvalidatesSession(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

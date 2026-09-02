@@ -662,8 +662,11 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		return nil
 	})
 	if err := r.syncSessionLocked(ctx, session, identityEpoch); err != nil {
+		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
-		r.closeSessionIf(session)
+		if detached != nil {
+			detached.Close()
+		}
 		return err
 	}
 	r.historyMu.Unlock()
@@ -1034,20 +1037,25 @@ func (r *roomHandle) closeSession() {
 }
 
 func (r *roomHandle) closeSessionIf(expected *replica.Session) bool {
-	r.mu.Lock()
-	session := r.session
-	if expected != nil && session != expected {
-		r.mu.Unlock()
-		return false
-	}
-	r.session = nil
-	r.sessionEpoch = 0
-	r.mu.Unlock()
+	session := r.detachSessionIf(expected)
 	if session != nil {
 		session.Close()
 		return true
 	}
 	return false
+}
+
+func (r *roomHandle) detachSessionIf(expected *replica.Session) *replica.Session {
+	r.mu.Lock()
+	session := r.session
+	if expected != nil && session != expected {
+		r.mu.Unlock()
+		return nil
+	}
+	r.session = nil
+	r.sessionEpoch = 0
+	r.mu.Unlock()
+	return session
 }
 
 func (r *roomHandle) isCurrentSession(session *replica.Session, epoch uint64) bool {
