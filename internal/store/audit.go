@@ -23,6 +23,10 @@ func (s *Store) Audit(ctx context.Context) error {
 	if err != nil || !bytes.Equal(storedGenesisHash, computedGenesisHash) {
 		return fmt.Errorf("store: genesis hash mismatch")
 	}
+	projection, err := community.NewProjection(genesis)
+	if err != nil {
+		return fmt.Errorf("store: initialize canonical projection: %w", err)
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT seqno,event_id,commit_hash,previous_hash,raw_commit
 FROM events ORDER BY seqno ASC`)
 	if err != nil {
@@ -48,6 +52,10 @@ FROM events ORDER BY seqno ASC`)
 		if err != nil || event.Verify(genesis.RoomKey, genesis.NodeKey) != nil {
 			rows.Close()
 			return fmt.Errorf("store: invalid committed event at seqno %d", seqno)
+		}
+		if err := projection.Apply(event); err != nil {
+			rows.Close()
+			return fmt.Errorf("store: invalid projected event at seqno %d: %w", seqno, err)
 		}
 		computedEventID, _ := event.Proposal.ID()
 		computedCommitHash, _ := event.Hash()
@@ -91,6 +99,9 @@ FROM events ORDER BY seqno ASC`)
 	}
 	if err := state.Verify(); err != nil {
 		return fmt.Errorf("store: signed state audit: %w", err)
+	}
+	if err := projection.ValidateState(state); err != nil {
+		return fmt.Errorf("store: canonical state projection mismatch: %w", err)
 	}
 	if !bytes.Equal(state.RoomID, genesis.RoomKey) || state.RevisionSeqno > head.Seqno ||
 		!bytes.Equal(state.RevisionHash, hashes[state.RevisionSeqno]) {

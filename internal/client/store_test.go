@@ -61,8 +61,22 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, current); err != nil {
+	projection, err := store.projectRoom(ctx, genesis.RoomKey, genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, current); err != nil {
 		t.Fatalf("valid state rejected: %v", err)
+	}
+	inconsistent, err := community.SignRoomState(room, community.RoomState{
+		RoomID: genesis.RoomKey, RevisionSeqno: 1, RevisionHash: eventHash,
+		Name: "Forged", Description: "Current", WritePolicy: genesis.WritePolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, inconsistent); err == nil {
+		t.Fatal("state content inconsistent with canonical events was accepted")
 	}
 
 	genesisHash, err := genesis.Hash()
@@ -76,7 +90,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, stale); err == nil {
+	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, stale); err == nil {
 		t.Fatal("stale state accepted")
 	}
 
@@ -89,7 +103,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, wrongRoom); err == nil {
+	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, wrongRoom); err == nil {
 		t.Fatal("state from another room accepted")
 	}
 }

@@ -117,7 +117,7 @@ VALUES (?,?,?,?) ON CONFLICT(room_key) DO UPDATE SET reference=excluded.referenc
 	return err
 }
 
-func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
+func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
 	rawGenesis, err := community.Encode(genesis)
 	if err != nil {
 		return err
@@ -131,7 +131,7 @@ func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis c
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateRoomState(ctx, tx, roomKey, genesis, state); err != nil {
+	if err := validateRoomState(ctx, tx, roomKey, genesis, projection, state); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=?,raw_state=? WHERE room_key=?", rawGenesis, rawState, roomKey); err != nil {
@@ -140,7 +140,7 @@ func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis c
 	return tx.Commit()
 }
 
-func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
+func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
 	raw, err := community.Encode(state)
 	if err != nil {
 		return err
@@ -150,7 +150,7 @@ func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis c
 		return err
 	}
 	defer tx.Rollback()
-	if err := validateRoomState(ctx, tx, roomKey, genesis, state); err != nil {
+	if err := validateRoomState(ctx, tx, roomKey, genesis, projection, state); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", raw, roomKey); err != nil {
@@ -159,19 +159,16 @@ func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis c
 	return tx.Commit()
 }
 
-func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
+func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	return validateRoomState(ctx, tx, roomKey, genesis, state)
+	return validateRoomState(ctx, tx, roomKey, genesis, projection, state)
 }
 
-func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte, genesis community.Genesis, state community.RoomState) error {
-	if err := state.Verify(); err != nil {
-		return fmt.Errorf("client store: invalid room state: %w", err)
-	}
+func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
 	if !bytes.Equal(genesis.RoomKey, roomKey) || !bytes.Equal(state.RoomID, roomKey) {
 		return fmt.Errorf("client store: room state belongs to another room")
 	}
@@ -179,54 +176,54 @@ func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte,
 	if err != nil {
 		return err
 	}
-	if state.RevisionSeqno > record.HeadSeqno {
-		return fmt.Errorf("client store: room state revision is ahead of event head")
+	if projection == nil {
+		return fmt.Errorf("client store: room projection is unavailable")
 	}
+	headSeqno, headHash := projection.Head()
+	if headSeqno != record.HeadSeqno || !bytes.Equal(headHash, record.HeadHash) {
+		return fmt.Errorf("client store: projection head disagrees with event cache")
+	}
+	if err := projection.ValidateState(state); err != nil {
+		return fmt.Errorf("client store: invalid room state projection: %w", err)
+	}
+	return nil
+}
 
-	expectedHash, err := genesis.Hash()
+func (s *clientStore) projectRoom(ctx context.Context, roomKey []byte, genesis community.Genesis) (*community.Projection, error) {
+	projection, err := community.NewProjection(genesis)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if state.RevisionSeqno > 0 {
-		var raw []byte
-		if err := query.QueryRowContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno=?", roomKey, state.RevisionSeqno).Scan(&raw); err != nil {
-			return err
-		}
-		event, err := community.DecodeCommittedEvent(raw)
-		if err != nil {
-			return err
-		}
-		if !stateChanging(event.Proposal.Body) {
-			return fmt.Errorf("client store: room state revision is not a state-changing event")
-		}
-		expectedHash, err = event.Hash()
-		if err != nil {
-			return err
-		}
-	}
-	if !bytes.Equal(state.RevisionHash, expectedHash) {
-		return fmt.Errorf("client store: room state revision hash mismatch")
-	}
-
-	rows, err := query.QueryContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? AND seqno>? ORDER BY seqno", roomKey, state.RevisionSeqno)
+	rows, err := s.db.QueryContext(ctx, "SELECT raw_event FROM room_events WHERE room_key=? ORDER BY seqno", roomKey)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var raw []byte
 		if err := rows.Scan(&raw); err != nil {
-			return err
+			return nil, err
 		}
 		event, err := community.DecodeCommittedEvent(raw)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if stateChanging(event.Proposal.Body) {
-			return fmt.Errorf("client store: stale room state")
+		if err := projection.Apply(event); err != nil {
+			return nil, err
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	record, err := s.room(ctx, roomKey)
+	if err != nil {
+		return nil, err
+	}
+	headSeqno, headHash := projection.Head()
+	if headSeqno != record.HeadSeqno || !bytes.Equal(headHash, record.HeadHash) {
+		return nil, fmt.Errorf("client store: projected event head mismatch")
+	}
+	return projection, nil
 }
 
 func (s *clientStore) rooms(ctx context.Context) ([]RoomRecord, error) {
@@ -407,50 +404,6 @@ func (s *clientStore) resetRoomCache(ctx context.Context, roomKey []byte) error 
 		return err
 	}
 	return tx.Commit()
-}
-
-func (s *clientStore) auditRoom(ctx context.Context, roomKey []byte, genesis community.Genesis) error {
-	rows, err := s.db.QueryContext(ctx, "SELECT seqno,raw_event FROM room_events WHERE room_key=? ORDER BY seqno", roomKey)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	expectedSeqno := int64(1)
-	previous := community.Zero256()
-	for rows.Next() {
-		var seqno int64
-		var raw []byte
-		if err := rows.Scan(&seqno, &raw); err != nil {
-			return err
-		}
-		event, err := community.DecodeCommittedEvent(raw)
-		if err != nil || seqno != expectedSeqno || event.Seqno != expectedSeqno || !bytes.Equal(event.PreviousHash, previous) {
-			return fmt.Errorf("client store: invalid cached event at seqno %d", seqno)
-		}
-		if err := event.Verify(roomKey, genesis.NodeKey); err != nil {
-			return err
-		}
-		previous, err = event.Hash()
-		if err != nil {
-			return err
-		}
-		expectedSeqno++
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	if err := rows.Close(); err != nil {
-		return err
-	}
-	var head int64
-	var headHash []byte
-	if err := s.db.QueryRowContext(ctx, "SELECT head_seqno,head_hash FROM joined_rooms WHERE room_key=?", roomKey).Scan(&head, &headHash); err != nil {
-		return err
-	}
-	if head != expectedSeqno-1 || !bytes.Equal(headHash, previous) {
-		return fmt.Errorf("client store: cached head mismatch")
-	}
-	return nil
 }
 
 func nullableBytes(value []byte) any {

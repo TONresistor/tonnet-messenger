@@ -88,6 +88,7 @@ type roomHandle struct {
 	historyMu  sync.Mutex
 	session    *replica.Session
 	state      community.RoomStateResult
+	projection *community.Projection
 	timeOffset int64
 	events     chan canonicalEvent
 	workers    sync.WaitGroup
@@ -651,13 +652,18 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if err != nil {
 		return err
 	}
-	if record.HeadSeqno > 0 {
-		if err := r.client.store.auditRoom(ctx, r.key, session.Genesis); err != nil {
+	projection, projectionErr := r.client.store.projectRoom(ctx, r.key, session.Genesis)
+	if projectionErr != nil {
+		if record.HeadSeqno > 0 {
 			if resetErr := r.client.store.resetRoomCache(ctx, r.key); resetErr != nil {
 				return resetErr
 			}
 			record.HeadSeqno = 0
 			record.HeadHash = community.Zero256()
+			projection, projectionErr = community.NewProjection(session.Genesis)
+		}
+		if projectionErr != nil {
+			return projectionErr
 		}
 	}
 	for {
@@ -678,11 +684,16 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 			if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
 				return err
 			}
+			nextProjection := projection.Clone()
+			if err := nextProjection.Apply(event); err != nil {
+				return err
+			}
 			inserted, err := r.client.store.appendEvent(ctx, r.key, event)
 			if err != nil {
 				return err
 			}
 			if inserted {
+				projection = nextProjection
 				if err := r.client.emitEvent(ctx, event); err != nil {
 					return err
 				}
@@ -709,7 +720,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return fmt.Errorf("invalid room state")
 	}
-	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, state.State); err != nil {
+	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, projection, state.State); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -718,6 +729,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 		return errRoomSessionChanged
 	}
 	r.state = state
+	r.projection = projection
 	r.mu.Unlock()
 	return r.client.emitReliable(ctx, "room.state", stateView(state))
 }
@@ -879,6 +891,23 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 			}
 			return durable, err
 		}
+		record, err = r.client.store.room(ctx, r.key)
+		if err != nil {
+			return false, err
+		}
+	}
+	projection := r.projection
+	if projection == nil {
+		projection, err = r.client.store.projectRoom(ctx, r.key, session.Genesis)
+		if err != nil {
+			return false, err
+		}
+	}
+	nextProjection := projection.Clone()
+	if event.Seqno > record.HeadSeqno {
+		if err := nextProjection.Apply(event); err != nil {
+			return false, err
+		}
 	}
 	inserted, err := r.client.store.appendEvent(ctx, r.key, event)
 	if err != nil {
@@ -887,6 +916,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	if !inserted {
 		return true, nil
 	}
+	r.projection = nextProjection
 	var state *community.RoomStateResult
 	if stateChanging(event.Proposal.Body) {
 		refreshed, err := r.refreshStateLocked(ctx, session)
@@ -930,7 +960,11 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return community.RoomStateResult{}, fmt.Errorf("invalid room state")
 	}
-	if err := r.client.store.updateState(ctx, r.key, session.Genesis, state.State); err != nil {
+	projection := r.projection
+	if projection == nil {
+		return community.RoomStateResult{}, fmt.Errorf("room projection is unavailable")
+	}
+	if err := r.client.store.updateState(ctx, r.key, session.Genesis, projection, state.State); err != nil {
 		return community.RoomStateResult{}, err
 	}
 	r.mu.Lock()
