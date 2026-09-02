@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/replica"
 )
 
 func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
@@ -99,4 +100,31 @@ func clientTestPrivateKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	return private
+}
+
+func TestRoomHandleInvalidatesOnlyExpectedSession(t *testing.T) {
+	oldSession := &replica.Session{}
+	newSession := &replica.Session{}
+	handle := &roomHandle{session: newSession}
+
+	if handle.closeSessionIf(oldSession) {
+		t.Fatal("stale session closed its replacement")
+	}
+	if !handle.isCurrentSession(newSession) {
+		t.Fatal("replacement session was detached")
+	}
+	if !handle.closeSessionIf(newSession) || handle.isCurrentSession(newSession) {
+		t.Fatal("current session was not invalidated")
+	}
+}
+
+func TestRoomHandleRefreshFailureInvalidatesSession(t *testing.T) {
+	session := &replica.Session{}
+	handle := &roomHandle{client: &Client{ctx: context.Background()}, session: session}
+
+	handle.refreshState(session)
+
+	if handle.isCurrentSession(session) {
+		t.Fatal("failed state refresh left the session connected")
+	}
 }

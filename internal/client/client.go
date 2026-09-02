@@ -534,10 +534,10 @@ func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 		}
 		select {
 		case <-ctx.Done():
-			r.closeSession()
+			r.closeSessionIf(session)
 			return
 		case <-session.Done:
-			r.closeSession()
+			r.closeSessionIf(session)
 		}
 	}
 }
@@ -583,7 +583,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		return nil
 	})
 	if err := r.sync(ctx); err != nil {
-		r.closeSession()
+		r.closeSessionIf(session)
 		return err
 	}
 	r.mu.RLock()
@@ -733,17 +733,25 @@ func (r *roomHandle) ingestEvent(event community.CommittedEvent) error {
 	if inserted {
 		r.client.emitEvent(event)
 		if stateChanging(event.Proposal.Body) {
-			go func() { _ = r.refreshState() }()
+			go r.refreshState(session)
 		}
 	}
 	return nil
 }
 
-func (r *roomHandle) refreshState() error {
-	r.mu.RLock()
-	session := r.session
-	r.mu.RUnlock()
+func (r *roomHandle) refreshState(session *replica.Session) {
+	if err := r.refreshStateFor(session); err != nil {
+		r.closeSessionIf(session)
+	}
+}
+
+func (r *roomHandle) refreshStateFor(session *replica.Session) error {
 	if session == nil {
+		return nil
+	}
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+	if !r.isCurrentSession(session) {
 		return nil
 	}
 	var state community.RoomStateResult
@@ -752,6 +760,9 @@ func (r *roomHandle) refreshState() error {
 	cancel()
 	if err != nil {
 		return err
+	}
+	if !r.isCurrentSession(session) {
+		return nil
 	}
 	record, err := r.client.store.room(r.client.ctx, r.key)
 	if err != nil {
@@ -764,6 +775,10 @@ func (r *roomHandle) refreshState() error {
 		return err
 	}
 	r.mu.Lock()
+	if r.session != session {
+		r.mu.Unlock()
+		return nil
+	}
 	r.state = state
 	r.mu.Unlock()
 	r.client.emit("room.state", stateView(state))
@@ -771,13 +786,29 @@ func (r *roomHandle) refreshState() error {
 }
 
 func (r *roomHandle) closeSession() {
+	r.closeSessionIf(nil)
+}
+
+func (r *roomHandle) closeSessionIf(expected *replica.Session) bool {
 	r.mu.Lock()
 	session := r.session
+	if expected != nil && session != expected {
+		r.mu.Unlock()
+		return false
+	}
 	r.session = nil
 	r.mu.Unlock()
 	if session != nil {
 		session.Close()
+		return true
 	}
+	return false
+}
+
+func (r *roomHandle) isCurrentSession(session *replica.Session) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.session == session
 }
 
 func (c *Client) resolveRoom(ctx context.Context, reference string) ([]byte, error) {
