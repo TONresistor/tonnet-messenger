@@ -117,11 +117,39 @@ VALUES (?,?,?,?) ON CONFLICT(room_key) DO UPDATE SET reference=excluded.referenc
 	return err
 }
 
-func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
-	rawGenesis, err := community.Encode(genesis)
+func (s *clientStore) pinGenesis(ctx context.Context, roomKey []byte, genesis community.Genesis) error {
+	if err := genesis.VerifyNow(); err != nil {
+		return fmt.Errorf("client store: invalid genesis: %w", err)
+	}
+	raw, err := community.Encode(genesis)
 	if err != nil {
 		return err
 	}
+	if !bytes.Equal(genesis.RoomKey, roomKey) {
+		return fmt.Errorf("client store: genesis belongs to another room")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var pinned []byte
+	if err := tx.QueryRowContext(ctx, "SELECT raw_genesis FROM joined_rooms WHERE room_key=?", roomKey).Scan(&pinned); err != nil {
+		return err
+	}
+	if len(pinned) > 0 {
+		if !bytes.Equal(pinned, raw) {
+			return fmt.Errorf("client store: genesis mismatch")
+		}
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=? WHERE room_key=?", raw, roomKey); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
 	rawState, err := community.Encode(state)
 	if err != nil {
 		return err
@@ -134,7 +162,7 @@ func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis c
 	if err := validateRoomState(ctx, tx, roomKey, genesis, projection, state); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=?,raw_state=? WHERE room_key=?", rawGenesis, rawState, roomKey); err != nil {
+	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", rawState, roomKey); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -172,6 +200,13 @@ func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte,
 	if !bytes.Equal(genesis.RoomKey, roomKey) || !bytes.Equal(state.RoomID, roomKey) {
 		return fmt.Errorf("client store: room state belongs to another room")
 	}
+	rawGenesis, err := community.Encode(genesis)
+	if err != nil {
+		return err
+	}
+	if err := validatePinnedGenesis(ctx, query, roomKey, rawGenesis); err != nil {
+		return err
+	}
 	record, err := queryRoom(ctx, query, roomKey)
 	if err != nil {
 		return err
@@ -185,6 +220,17 @@ func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte,
 	}
 	if err := projection.ValidateState(state); err != nil {
 		return fmt.Errorf("client store: invalid room state projection: %w", err)
+	}
+	return nil
+}
+
+func validatePinnedGenesis(ctx context.Context, query clientQueryer, roomKey, expected []byte) error {
+	var pinned []byte
+	if err := query.QueryRowContext(ctx, "SELECT raw_genesis FROM joined_rooms WHERE room_key=?", roomKey).Scan(&pinned); err != nil {
+		return err
+	}
+	if len(pinned) == 0 || !bytes.Equal(pinned, expected) {
+		return fmt.Errorf("client store: genesis mismatch")
 	}
 	return nil
 }
@@ -400,7 +446,7 @@ func (s *clientStore) resetRoomCache(ctx context.Context, roomKey []byte) error 
 	if _, err := tx.ExecContext(ctx, "DELETE FROM room_events WHERE room_key=?", roomKey); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE joined_rooms SET raw_genesis=NULL,raw_state=NULL,head_seqno=0,head_hash=? WHERE room_key=?`, community.Zero256(), roomKey); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE joined_rooms SET raw_state=NULL,head_seqno=0,head_hash=? WHERE room_key=?`, community.Zero256(), roomKey); err != nil {
 		return err
 	}
 	return tx.Commit()

@@ -1,6 +1,7 @@
 package client
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -29,6 +30,9 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
 		t.Fatal(err)
 	}
 
@@ -240,6 +244,49 @@ func TestClientStoreRejectsConflictingCommitForSameProposal(t *testing.T) {
 	}
 }
 
+func TestClientStorePinsGenesisAcrossCacheReset(t *testing.T) {
+	ctx := context.Background()
+	store, err := openClientStore(ctx, filepath.Join(t.TempDir(), "client.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	room := clientTestPrivateKey(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	genesis, err := community.NewGenesis(room, clientTestPrivateKey(t), now, "Room", "Description", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatalf("identical genesis rejected: %v", err)
+	}
+	conflict, err := community.NewGenesis(room, clientTestPrivateKey(t), now, "Other", "Fork", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, conflict); err == nil {
+		t.Fatal("conflicting genesis accepted")
+	}
+	if err := store.resetRoomCache(ctx, genesis.RoomKey); err != nil {
+		t.Fatal(err)
+	}
+	record, err := store.room(ctx, genesis.RoomKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, _ := community.Encode(genesis)
+	got, _ := community.Encode(record.Genesis)
+	if !bytes.Equal(got, want) {
+		t.Fatal("cache reset replaced pinned genesis")
+	}
+}
+
 func TestRoomHandleRejectsUnrepairedGap(t *testing.T) {
 	f := newCanonicalIngestFixture(t)
 	event := f.event(t, 2, community.Zero256(), community.EventMessage{Text: "gap"})
@@ -420,6 +467,9 @@ func newCanonicalIngestFixture(t *testing.T) *canonicalIngestFixture {
 		t.Fatal(err)
 	}
 	if err := store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
 		t.Fatal(err)
 	}
 	session := &replica.Session{Genesis: genesis}

@@ -648,6 +648,9 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if session == nil || !r.isCurrentSession(session) {
 		return errRoomSessionChanged
 	}
+	if err := r.client.store.pinGenesis(ctx, r.key, session.Genesis); err != nil {
+		return err
+	}
 	record, err := r.client.store.room(ctx, r.key)
 	if err != nil {
 		return err
