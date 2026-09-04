@@ -11,6 +11,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/quic"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
@@ -21,6 +22,45 @@ func testKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	return key
+}
+
+func TestOversizedAnswerIsRejectedBeforeTransport(t *testing.T) {
+	serverKey, clientKey := testKey(t), testKey(t)
+	serverGateway, err := roomnet.NewGateway(serverKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer serverGateway.Close()
+	clientGateway, err := roomnet.NewGateway(clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer clientGateway.Close()
+	serverGateway.SetConnectionHandler(func(raw *quic.Peer) error {
+		roomnet.Wrap(raw).SetQueryHandler(func(query *roomnet.Query) error {
+			return query.Answer(community.BatchResult{Items: []community.BatchItem{{
+				Data: make([]byte, roomnet.MaxAnswerPayloadSize),
+			}}})
+		})
+		return nil
+	})
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	go serverGateway.Serve(packet)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	rawPeer, err := clientGateway.DialDefault(ctx, serverKey.Public().(ed25519.PublicKey), packet.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var response community.BatchResult
+	if err := roomnet.Wrap(rawPeer).Query(ctx, broadcast.GetTime{}, &response); err == nil {
+		t.Fatal("oversized answer was delivered")
+	}
 }
 
 func TestQueryAndMessageUseAuthenticatedTONQUIC(t *testing.T) {

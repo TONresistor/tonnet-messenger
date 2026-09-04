@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
@@ -43,14 +44,14 @@ func newRoot() *cobra.Command {
 	return root
 }
 
-func open(cmd *cobra.Command, opts *options) (*client.Client, context.CancelFunc, error) {
-	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt)
+func open(cmd *cobra.Command, opts *options) (*client.Client, context.Context, context.CancelFunc, error) {
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	c, err := client.Open(ctx, client.Config{StateDir: opts.stateDir, ConfigURL: opts.configURL})
 	if err != nil {
 		stop()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return c, stop, nil
+	return c, ctx, stop, nil
 }
 
 func newRun(opts *options) *cobra.Command {
@@ -61,12 +62,12 @@ func newRun(opts *options) *cobra.Command {
 			if !stdio {
 				return fmt.Errorf("only --stdio transport is supported")
 			}
-			c, stop, err := open(cmd, opts)
+			c, runCtx, stop, err := open(cmd, opts)
 			if err != nil {
 				return err
 			}
 			defer stop()
-			return (&clientrpc.Server{Client: c, Version: Version}).Serve(cmd.Context(), os.Stdin, os.Stdout)
+			return (&clientrpc.Server{Client: c, Version: Version}).Serve(runCtx, os.Stdin, os.Stdout)
 		},
 	}
 	cmd.Flags().BoolVar(&stdio, "stdio", true, "serve newline-delimited JSON-RPC on stdin/stdout")
@@ -209,7 +210,7 @@ func newDM(opts *options) *cobra.Command {
 }
 
 func withClient(cmd *cobra.Command, opts *options, operation func(*client.Client) error) error {
-	c, stop, err := open(cmd, opts)
+	c, _, stop, err := open(cmd, opts)
 	if err != nil {
 		return err
 	}

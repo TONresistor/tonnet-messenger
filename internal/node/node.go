@@ -35,18 +35,23 @@ const databaseCheckpointEach = 5 * time.Minute
 
 const deliveredCap = 8192
 
+const replicaReconcileEach = 30 * time.Second
+
+type IdentityResolver func(context.Context, string) ([]byte, error)
+
 type Config struct {
-	Key       ed25519.PrivateKey
-	Listen    string
-	Advertise string
-	ConfigURL string
-	OverlayID []byte
-	Socket    string
-	MaxLeaves int
-	Genesis   *community.Genesis
-	Store     *store.Store
-	RoomKey   ed25519.PrivateKey
-	NodeRole  int32
+	Key             ed25519.PrivateKey
+	Listen          string
+	Advertise       string
+	ConfigURL       string
+	OverlayID       []byte
+	Socket          string
+	MaxLeaves       int
+	Genesis         *community.Genesis
+	Store           *store.Store
+	RoomKey         ed25519.PrivateKey
+	NodeRole        int32
+	ResolveIdentity IdentityResolver
 }
 
 type stats struct {
@@ -62,28 +67,30 @@ type stats struct {
 }
 
 type Node struct {
-	cfg         Config
-	gw          *adnl.Gateway
-	qgw         *quic.Gateway
-	quicPacket  net.PacketConn
-	quicErr     chan error
-	peers       *peerTable
-	dedup       *ov.Dedup
-	penalties   *penaltyBox
-	sources     *sourceLimits
-	queries     *tokenBucket
-	stats       stats
-	pub         atomic.Pointer[dht.Publisher]
-	dialSem     chan struct{}
-	myID        string
-	started     time.Time
-	genesis     community.Genesis
-	store       *store.Store
-	roomKey     ed25519.PrivateKey
-	nodeRole    int32
-	replicaMu   sync.Mutex
-	domainMu    sync.Mutex
-	domainCache map[string]identityDomainCache
+	cfg             Config
+	gw              *adnl.Gateway
+	qgw             *quic.Gateway
+	quicPacket      net.PacketConn
+	quicErr         chan error
+	peers           *peerTable
+	dedup           *ov.Dedup
+	penalties       *penaltyBox
+	sources         *sourceLimits
+	queries         *tokenBucket
+	messages        *tokenBucket
+	stats           stats
+	pub             atomic.Pointer[dht.Publisher]
+	dialSem         chan struct{}
+	myID            string
+	started         time.Time
+	genesis         community.Genesis
+	store           *store.Store
+	roomKey         ed25519.PrivateKey
+	nodeRole        int32
+	replicaMu       sync.Mutex
+	domainMu        sync.Mutex
+	domainCache     map[string]identityDomainCache
+	resolveIdentity IdentityResolver
 }
 
 type identityDomainCache struct {
@@ -171,6 +178,7 @@ func New(cfg Config) (*Node, error) {
 		penalties:   newPenaltyBox(),
 		sources:     newSourceLimits(),
 		queries:     newTokenBucket(globalQueryBurst, globalQueryRefill),
+		messages:    newTokenBucket(globalMessageBurst, globalMessageRefill),
 		domainCache: make(map[string]identityDomainCache),
 		dialSem:     make(chan struct{}, maxConcurrentDials),
 		myID:        hex.EncodeToString(qgw.ID()),
@@ -179,6 +187,13 @@ func New(cfg Config) (*Node, error) {
 		store:       cfg.Store,
 		roomKey:     cfg.RoomKey,
 		nodeRole:    cfg.NodeRole,
+	}
+	if cfg.ResolveIdentity != nil {
+		n.resolveIdentity = cfg.ResolveIdentity
+	} else {
+		n.resolveIdentity = func(ctx context.Context, domain string) ([]byte, error) {
+			return tondns.ResolveIdentity(ctx, cfg.ConfigURL, domain)
+		}
 	}
 	qgw.SetConnectionHandler(func(peer *quic.Peer) error { return n.onInbound(roomnet.Wrap(peer)) })
 
@@ -243,7 +258,7 @@ func (n *Node) verifyIdentityDomain(ctx context.Context, domain string, key []by
 	}
 	n.domainMu.Unlock()
 
-	resolved, err := tondns.ResolveIdentity(ctx, n.cfg.ConfigURL, domain)
+	resolved, err := n.resolveIdentity(ctx, domain)
 	if err != nil || !bytes.Equal(resolved, key) {
 		return fmt.Errorf("identity domain does not resolve to author")
 	}
@@ -392,6 +407,9 @@ func (n *Node) Run(ctx context.Context) error {
 	go n.discoveryLoop(ctx)
 	go n.databaseMaintenanceLoop(ctx)
 	go n.peerMaintenanceLoop(ctx)
+	if n.nodeRole == community.NodeRoleRelay {
+		go n.replicaReconcileLoop(ctx)
+	}
 
 	select {
 	case <-ctx.Done():
@@ -402,6 +420,32 @@ func (n *Node) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("TON QUIC server: %w", err)
 	}
+}
+
+func (n *Node) replicaReconcileLoop(ctx context.Context) {
+	ticker := time.NewTicker(replicaReconcileEach)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		err := n.reconcileReplicaOnce()
+		if err != nil && ctx.Err() == nil {
+			log.Printf("replica reconcile: %v", err)
+		}
+	}
+}
+
+func (n *Node) reconcileReplicaOnce() error {
+	sequencer, ok := n.sequencerPeer()
+	if !ok {
+		return nil
+	}
+	n.replicaMu.Lock()
+	defer n.replicaMu.Unlock()
+	return n.syncReplicaLocked(sequencer)
 }
 
 func (n *Node) databaseMaintenanceLoop(ctx context.Context) {

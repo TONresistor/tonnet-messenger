@@ -18,7 +18,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
-const schemaVersion = 1
+const schemaVersion = 2
 
 var (
 	ErrAlreadyInitialized = errors.New("store: room is already initialized")
@@ -202,6 +202,7 @@ CREATE TABLE IF NOT EXISTS request_nonces (
 CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id);
 CREATE INDEX IF NOT EXISTS idx_messages_creation ON messages(creation_seqno);
 CREATE INDEX IF NOT EXISTS idx_nonces_expiry ON request_nonces(expires_at);
+CREATE INDEX IF NOT EXISTS idx_events_state_change ON events(seqno DESC) WHERE body_type <> 'message';
 `); err != nil {
 		return fmt.Errorf("store: migrate schema: %w", err)
 	}

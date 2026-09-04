@@ -223,6 +223,24 @@ func (s *Store) ReplicaReady(ctx context.Context) error {
 	if state.RevisionSeqno > head.Seqno {
 		return fmt.Errorf("store: state is ahead of replica")
 	}
+	_, genesisHash, err := s.Genesis(ctx)
+	if err != nil {
+		return err
+	}
+	expectedSeqno := int64(0)
+	expectedHash := genesisHash
+	var latestSeqno int64
+	var latestHash []byte
+	err = s.db.QueryRowContext(ctx, `SELECT seqno,commit_hash FROM events
+WHERE body_type <> 'message' ORDER BY seqno DESC LIMIT 1`).Scan(&latestSeqno, &latestHash)
+	if err == nil {
+		expectedSeqno, expectedHash = latestSeqno, latestHash
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if state.RevisionSeqno != expectedSeqno || !bytes.Equal(state.RevisionHash, expectedHash) {
+		return fmt.Errorf("store: signed state does not cover latest state transition")
+	}
 	return nil
 }
 

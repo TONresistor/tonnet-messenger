@@ -9,8 +9,10 @@ const (
 	sigPenalty   = 5 * time.Second
 	maxPenalties = 4096
 
-	globalQueryBurst  = 128
-	globalQueryRefill = 64.0
+	globalQueryBurst    = 128
+	globalQueryRefill   = 64.0
+	globalMessageBurst  = 1536
+	globalMessageRefill = 768.0
 
 	sourceMsgsPerMinute  = 30
 	sourceBytesPerMinute = 64 * 1024

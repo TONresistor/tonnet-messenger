@@ -160,6 +160,11 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		releaseStateLock(lock)
 		return nil, err
 	}
+	if err := store.validateOrRepairRooms(ctx); err != nil {
+		store.Close()
+		releaseStateLock(lock)
+		return nil, err
+	}
 	name, domain, err := store.profile(ctx)
 	if err != nil {
 		store.Close()

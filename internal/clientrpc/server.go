@@ -44,54 +44,180 @@ type rpcError struct {
 	Data    map[string]any `json:"data,omitempty"`
 }
 
-func (s *Server) Serve(ctx context.Context, input io.Reader, output io.Writer) error {
+type scanResult struct {
+	line []byte
+	err  error
+	done bool
+}
+
+func (s *Server) Serve(ctx context.Context, input io.ReadCloser, output io.Writer) (returnErr error) {
 	if s.Client == nil {
 		return fmt.Errorf("clientrpc: client is required")
 	}
+	if input == nil {
+		return fmt.Errorf("clientrpc: input is required")
+	}
 	if err := s.Client.Start(); err != nil {
+		_ = s.Client.Close()
 		return err
 	}
+	serveCtx, cancel := context.WithCancel(ctx)
 	notifyDone := make(chan struct{})
+	notifyErr := make(chan error, 1)
 	go func() {
 		defer close(notifyDone)
 		for notification := range s.Client.Notifications() {
-			_ = s.write(output, map[string]any{"jsonrpc": "2.0", "method": notification.Method, "params": notification.Params})
+			if err := s.write(output, map[string]any{"jsonrpc": "2.0", "method": notification.Method, "params": notification.Params}); err != nil {
+				select {
+				case notifyErr <- err:
+				default:
+				}
+				cancel()
+				return
+			}
 		}
 	}()
+	defer func() {
+		cancel()
+		_ = input.Close()
+		returnErr = errors.Join(returnErr, s.Client.Close())
+		<-notifyDone
+	}()
 
-	scanner := bufio.NewScanner(input)
-	scanner.Buffer(make([]byte, 4096), maxLineBytes)
-	for scanner.Scan() {
-		line := scanner.Bytes()
+	scans := scanLines(serveCtx, input)
+	for {
+		var scanned scanResult
+		select {
+		case <-serveCtx.Done():
+			select {
+			case err := <-notifyErr:
+				return err
+			default:
+				return nil
+			}
+		case err := <-notifyErr:
+			return err
+		case result, ok := <-scans:
+			if !ok {
+				return nil
+			}
+			scanned = result
+		}
+		if scanned.done {
+			if scanned.err == nil {
+				return nil
+			}
+			if errors.Is(scanned.err, bufio.ErrTooLong) {
+				return fmt.Errorf("clientrpc: request exceeds %d bytes", maxLineBytes)
+			}
+			return scanned.err
+		}
+		line := scanned.line
 		if len(strings.TrimSpace(string(line))) == 0 {
 			continue
 		}
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			_ = s.write(output, response{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error", Data: map[string]any{"code": "PARSE_ERROR"}}})
+			if err := s.write(output, response{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error", Data: map[string]any{"code": "PARSE_ERROR"}}}); err != nil {
+				return err
+			}
 			continue
 		}
 		if req.JSONRPC != "2.0" || req.Method == "" {
-			_ = s.write(output, response{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32600, Message: "invalid request", Data: map[string]any{"code": "INVALID_REQUEST"}}})
+			value := fitResponse("", response{JSONRPC: "2.0", ID: req.ID, Error: &rpcError{Code: -32600, Message: "invalid request", Data: map[string]any{"code": "INVALID_REQUEST"}}})
+			if err := s.write(output, value); err != nil {
+				return err
+			}
 			continue
 		}
-		result, rpcErr := s.dispatch(ctx, req.Method, req.Params)
+		result, rpcErr := s.dispatch(serveCtx, req.Method, req.Params)
 		if len(req.ID) == 0 || string(req.ID) == "null" {
 			continue
 		}
-		if err := s.write(output, response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rpcErr}); err != nil {
+		value := fitResponse(req.Method, response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rpcErr})
+		if err := s.write(output, value); err != nil {
 			return err
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		if errors.Is(err, bufio.ErrTooLong) {
-			return fmt.Errorf("clientrpc: request exceeds %d bytes", maxLineBytes)
+}
+
+func scanLines(ctx context.Context, input io.Reader) <-chan scanResult {
+	results := make(chan scanResult, 1)
+	go func() {
+		defer close(results)
+		scanner := bufio.NewScanner(input)
+		scanner.Buffer(make([]byte, 4096), maxLineBytes)
+		for scanner.Scan() {
+			line := append([]byte(nil), scanner.Bytes()...)
+			select {
+			case results <- scanResult{line: line}:
+			case <-ctx.Done():
+				return
+			}
 		}
-		return err
+		select {
+		case results <- scanResult{err: scanner.Err(), done: true}:
+		case <-ctx.Done():
+		}
+	}()
+	return results
+}
+
+func fitResponse(method string, value response) response {
+	if responseFits(value) {
+		return value
 	}
-	_ = s.Client.Close()
-	<-notifyDone
-	return nil
+	if value.Error != nil {
+		return responseTooLarge(value.ID)
+	}
+	switch result := value.Result.(type) {
+	case client.JoinResult:
+		for {
+			items, ok := result.Timeline["items"].([]map[string]any)
+			if !ok || len(items) == 0 {
+				return responseTooLarge(value.ID)
+			}
+			result.Timeline["items"] = items[1:]
+			result.Timeline["has_more"] = true
+			value.Result = result
+			if responseFits(value) {
+				return value
+			}
+		}
+	case map[string]any:
+		if method != "room.getTimeline" {
+			return responseTooLarge(value.ID)
+		}
+		for {
+			items, ok := result["items"].([]map[string]any)
+			if !ok || len(items) == 0 {
+				return responseTooLarge(value.ID)
+			}
+			result["items"] = items[1:]
+			result["has_more"] = true
+			value.Result = result
+			if responseFits(value) {
+				return value
+			}
+		}
+	default:
+		return responseTooLarge(value.ID)
+	}
+}
+
+func responseFits(value any) bool {
+	encoded, err := json.Marshal(value)
+	return err == nil && len(encoded)+1 <= maxLineBytes
+}
+
+func responseTooLarge(id json.RawMessage) response {
+	value := response{JSONRPC: "2.0", ID: id, Error: &rpcError{
+		Code: -32004, Message: "response exceeds stdio limit", Data: map[string]any{"code": "RESPONSE_TOO_LARGE"},
+	}}
+	if !responseFits(value) {
+		value.ID = nil
+	}
+	return value
 }
 
 func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessage) (any, *rpcError) {

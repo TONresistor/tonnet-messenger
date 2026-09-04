@@ -54,6 +54,10 @@ func (n *Node) answerCommunityQuery(p *peer, query *roomnet.Query, now time.Time
 }
 
 func (n *Node) communityStateResult(ctx context.Context, now time.Time) (community.RoomStateResult, error) {
+	if n.nodeRole == community.NodeRoleRelay {
+		n.replicaMu.Lock()
+		defer n.replicaMu.Unlock()
+	}
 	state, err := n.store.State(ctx)
 	if err != nil {
 		return community.RoomStateResult{}, err
@@ -117,15 +121,7 @@ func (n *Node) answerSubmit(p *peer, query *roomnet.Query, request community.Sub
 	if !n.peers.acceptsAuthor(p, request.Proposal.AuthorKey) {
 		return n.answer(p, query, community.SubmitRejected{Code: community.RejectPermissionDenied, Message: "connection is not bound to author"})
 	}
-	if request.Proposal.AuthorDomain != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := n.verifyIdentityDomain(ctx, request.Proposal.AuthorDomain, request.Proposal.AuthorKey, now)
-		cancel()
-		if err != nil {
-			return n.answer(p, query, community.SubmitRejected{Code: community.RejectInvalidIdentityDomain, Message: "invalid identity domain"})
-		}
-	}
-	result, err := n.store.Commit(context.Background(), request.Proposal, n.roomKey, now)
+	result, err := n.commitProposal(context.Background(), request.Proposal, now)
 	if err != nil {
 		var rejection *store.Rejection
 		if errors.As(err, &rejection) {
@@ -208,7 +204,7 @@ func (n *Node) persistReplicaEvent(source *peer, event community.CommittedEvent)
 		if source == nil {
 			return err
 		}
-		if syncErr := n.syncReplicaLocked(source); syncErr != nil {
+		if syncErr := n.syncReplicaFromPeers(source); syncErr != nil {
 			return syncErr
 		}
 		appended, err = n.store.AppendReplica(context.Background(), event)
@@ -216,12 +212,42 @@ func (n *Node) persistReplicaEvent(source *peer, event community.CommittedEvent)
 			return err
 		}
 	}
-	if appended && stateChangingBody(event.Proposal.Body) && source != nil {
-		if err := n.installStateFromPeer(source); err != nil {
-			return n.syncReplicaLocked(source)
+	if stateChangingBody(event.Proposal.Body) && source != nil {
+		readyErr := n.store.ReplicaReady(context.Background())
+		if !appended && readyErr == nil {
+			return nil
 		}
+		if n.peers.isHealthyNode(source) {
+			if err := n.installStateFromPeer(source); err == nil {
+				return nil
+			}
+		}
+		return n.syncReplicaFromPeers(source)
 	}
 	return nil
+}
+
+func (n *Node) syncReplicaFromPeers(source *peer) error {
+	var failures []error
+	if source != nil && source.conn != nil && n.peers.isHealthyNode(source) {
+		if err := n.syncReplicaLocked(source); err == nil {
+			return nil
+		} else {
+			failures = append(failures, err)
+		}
+	}
+	sequencer, ok := n.sequencerPeer()
+	if ok && sequencer != source {
+		if err := n.syncReplicaLocked(sequencer); err == nil {
+			return nil
+		} else {
+			failures = append(failures, err)
+		}
+	}
+	if len(failures) == 0 {
+		return errors.New("no replica synchronization source")
+	}
+	return errors.Join(failures...)
 }
 
 func (n *Node) syncReplicaLocked(source *peer) error {
@@ -238,8 +264,12 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 			return err
 		}
 		for _, event := range page.Events {
-			if _, err := n.store.AppendReplica(context.Background(), event); err != nil {
+			appended, err := n.store.AppendReplica(context.Background(), event)
+			if err != nil {
 				return err
+			}
+			if appended {
+				n.stats.replayedItems.Add(1)
 			}
 			head, err = n.store.Head(context.Background())
 			if err != nil {
@@ -264,18 +294,15 @@ func (n *Node) installStateFromPeer(source *peer) error {
 	if err != nil {
 		return err
 	}
-	if result.Stats.NodeRole != community.NodeRoleSequencer || !result.Stats.Ready {
-		return errors.New("state source is not the ready sequencer")
-	}
 	return n.store.InstallReplicaState(context.Background(), result.State)
 }
 
-func (n *Node) submitLocal(_ context.Context, rawProposal []byte) ([]byte, error) {
+func (n *Node) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, error) {
 	proposal, err := community.DecodeProposal(rawProposal)
 	if err != nil {
 		return community.Encode(community.SubmitRejected{Code: community.RejectMalformedRequest, Message: "malformed proposal"})
 	}
-	result, err := n.store.Commit(context.Background(), proposal, n.roomKey, time.Now())
+	result, err := n.commitProposal(ctx, proposal, time.Now())
 	if err != nil {
 		var rejection *store.Rejection
 		if errors.As(err, &rejection) {
@@ -292,6 +319,20 @@ func (n *Node) submitLocal(_ context.Context, rawProposal []byte) ([]byte, error
 	return community.Encode(community.SubmitAccepted{Event: result.Event})
 }
 
+func (n *Node) commitProposal(ctx context.Context, proposal community.EventProposal, now time.Time) (store.CommitResult, error) {
+	if proposal.AuthorDomain != "" {
+		resolveCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := n.verifyIdentityDomain(resolveCtx, proposal.AuthorDomain, proposal.AuthorKey, now)
+		cancel()
+		if err != nil {
+			return store.CommitResult{}, &store.Rejection{
+				Code: community.RejectInvalidIdentityDomain, Message: "invalid identity domain", Err: err,
+			}
+		}
+	}
+	return n.store.Commit(ctx, proposal, n.roomKey, now)
+}
+
 func (n *Node) answerBatch(p *peer, query *roomnet.Query, request community.Batch, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
@@ -302,10 +343,25 @@ func (n *Node) answerBatch(p *peer, query *roomnet.Query, request community.Batc
 		return n.answer(p, query, community.BatchResult{Items: items})
 	}
 	items := make([]community.BatchItem, len(request.Queries))
+	for i := range items {
+		items[i].Code = community.RejectLimitExceeded
+	}
 	for i, raw := range request.Queries {
-		items[i] = n.batchItem(raw, now)
+		if !setBatchItem(items, i, n.batchItem(raw, now)) {
+			break
+		}
 	}
 	return n.answer(p, query, community.BatchResult{Items: items})
+}
+
+func setBatchItem(items []community.BatchItem, index int, candidate community.BatchItem) bool {
+	items[index] = candidate
+	encoded, err := community.Encode(community.BatchResult{Items: items})
+	if err == nil && len(encoded) <= roomnet.MaxAnswerPayloadSize {
+		return true
+	}
+	items[index] = community.BatchItem{Code: community.RejectLimitExceeded}
+	return false
 }
 
 func (n *Node) batchItem(raw []byte, now time.Time) community.BatchItem {
@@ -374,14 +430,23 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 		n.stats.peerRateDrops.Add(1)
 		return
 	}
+	if !n.messages.allow() {
+		n.stats.globalRateDrops.Add(1)
+		return
+	}
 	wrapper, ok := broadcast.AsBroadcast(data)
 	if !ok || wrapper.Flags != 0 || !broadcast.Fresh(wrapper.Date, now) {
 		n.stats.invalidDrops.Add(1)
 		return
 	}
 	raw, err := tl.Serialize(wrapper, true)
-	if err != nil || len(raw) > broadcast.MaxSize || wrapper.Verify() != nil {
+	if err != nil || len(raw) > broadcast.MaxSize {
 		n.stats.invalidDrops.Add(1)
+		return
+	}
+	if err := wrapper.Verify(); err != nil {
+		n.stats.invalidDrops.Add(1)
+		n.penalties.punish(p.id, now)
 		return
 	}
 	id, err := wrapper.ID()

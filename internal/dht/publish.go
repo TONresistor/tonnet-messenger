@@ -304,6 +304,7 @@ func FindNodesByKey(ctx context.Context, cfgURL string, roomKey []byte) (*overla
 	if err := gw.StartClient(); err != nil {
 		return nil, err
 	}
+	defer gw.Close()
 	d, err := tondht.NewClientFromConfigUrl(ctx, gw, cfgURL)
 	if err != nil {
 		return nil, err

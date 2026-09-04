@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +111,123 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	}
 	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, wrongRoom); err == nil {
 		t.Fatal("state from another room accepted")
+	}
+}
+
+func TestClientStoreRejectsFutureSchemaVersion(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "client.db")
+	store, err := openClientStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, "UPDATE client_meta SET value='999' WHERE key='schema_version'"); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openClientStore(ctx, path); err == nil || !strings.Contains(err.Error(), "newer than supported") {
+		t.Fatalf("openClientStore error = %v", err)
+	}
+}
+
+func TestClientOpenRepairsDerivedCacheButPinsGenesis(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	path := filepath.Join(stateDir, "client.db")
+	store, err := openClientStore(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, node := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	genesis, err := community.NewGenesis(room, node, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := community.NewProjection(genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesisHash, err := genesis.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := community.SignRoomState(room, community.RoomState{
+		RoomID: genesis.RoomKey, RevisionHash: genesisHash, Name: genesis.Name,
+		Description: genesis.Description, WritePolicy: genesis.WritePolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.installRoom(ctx, genesis.RoomKey, genesis, projection, state); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", []byte{1, 2, 3}, genesis.RoomKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	clientInstance, err := Open(ctx, Config{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := clientInstance.store.room(ctx, genesis.RoomKey)
+	if err != nil {
+		clientInstance.Close()
+		t.Fatal(err)
+	}
+	if !bytes.Equal(record.Genesis.RoomKey, genesis.RoomKey) || len(record.State.RoomID) != 0 || record.HeadSeqno != 0 {
+		clientInstance.Close()
+		t.Fatalf("repaired record = %#v", record)
+	}
+	if err := clientInstance.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestClientOpenRejectsCorruptPinnedGenesis(t *testing.T) {
+	ctx := context.Background()
+	stateDir := t.TempDir()
+	store, err := openClientStore(ctx, filepath.Join(stateDir, "client.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	room, node := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	genesis, err := community.NewGenesis(room, node, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_genesis=? WHERE room_key=?", []byte{1, 2, 3}, genesis.RoomKey); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(ctx, Config{StateDir: stateDir}); err == nil || !strings.Contains(err.Error(), "invalid pinned genesis") {
+		t.Fatalf("Open error = %v", err)
 	}
 }
 

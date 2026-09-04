@@ -47,6 +47,9 @@ func TestReplicaAppendAndSignedStateInstallation(t *testing.T) {
 			t.Fatalf("append seqno %d: appended=%v err=%v", event.Seqno, appended, err)
 		}
 	}
+	if err := replica.ReplicaReady(context.Background()); err == nil {
+		t.Fatal("replica with an uncovered state transition reported ready")
+	}
 	if appended, err := replica.AppendReplica(context.Background(), events[len(events)-1]); err != nil || appended {
 		t.Fatalf("duplicate append: appended=%v err=%v", appended, err)
 	}

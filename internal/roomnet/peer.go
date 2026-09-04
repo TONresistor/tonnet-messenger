@@ -13,9 +13,11 @@ import (
 )
 
 const (
-	MaxWireObjectSize  = 64 << 10
-	MaxIncomingStreams = 4
-	maxQUICObjectSize  = MaxWireObjectSize + 8
+	MaxWireObjectSize    = 64 << 10
+	MaxIncomingStreams   = 4
+	MaxAnswerObjectSize  = quic.DefaultMaxObjectSize
+	MaxAnswerPayloadSize = MaxAnswerObjectSize - 8
+	maxQUICObjectSize    = MaxWireObjectSize + 8
 )
 
 var ErrNoAnswer = errors.New("room transport: query handler returned no answer")
@@ -135,7 +137,14 @@ func (p *Peer) SetQueryHandler(handler func(*Query) error) {
 		if !query.answered {
 			return nil, ErrNoAnswer
 		}
-		return tl.Serialize(query.response, true)
+		encoded, err := tl.Serialize(query.response, true)
+		if err != nil {
+			return nil, err
+		}
+		if len(encoded) > MaxAnswerPayloadSize {
+			return nil, fmt.Errorf("room transport: answer exceeds %d bytes", MaxAnswerObjectSize)
+		}
+		return encoded, nil
 	})
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	_ "modernc.org/sqlite"
 
@@ -33,6 +34,8 @@ type clientQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
+const clientSchemaVersion = 1
+
 func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
@@ -49,7 +52,53 @@ func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 			return nil, err
 		}
 	}
-	if _, err := db.ExecContext(ctx, `
+	if err := migrateClientStore(ctx, db); err != nil {
+		db.Close()
+		return nil, err
+	}
+	var integrity string
+	if err := db.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&integrity); err != nil || integrity != "ok" {
+		db.Close()
+		if err != nil {
+			return nil, fmt.Errorf("client store quick check: %w", err)
+		}
+		return nil, fmt.Errorf("client store quick check: %s", integrity)
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &clientStore{db: db}, nil
+}
+
+func migrateClientStore(ctx context.Context, db *sql.DB) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	version := 0
+	var metadataTableExists int
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(
+SELECT 1 FROM sqlite_master WHERE type='table' AND name='client_meta')`).Scan(&metadataTableExists); err != nil {
+		return fmt.Errorf("client store migration: %w", err)
+	}
+	if metadataTableExists != 0 {
+		var rawVersion string
+		err := tx.QueryRowContext(ctx, "SELECT value FROM client_meta WHERE key='schema_version'").Scan(&rawVersion)
+		if err == nil {
+			version, err = strconv.Atoi(rawVersion)
+			if err != nil || version < 1 {
+				return fmt.Errorf("client store: invalid schema version %q", rawVersion)
+			}
+			if version > clientSchemaVersion {
+				return fmt.Errorf("client store schema %d is newer than supported version %d", version, clientSchemaVersion)
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("client store migration: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS client_meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -73,16 +122,16 @@ CREATE TABLE IF NOT EXISTS room_events (
     UNIQUE(room_key, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_client_events_message ON room_events(room_key, message_id);
-INSERT OR IGNORE INTO client_meta(key,value) VALUES ('schema_version','1');
 `); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("client store migration: %w", err)
+		return fmt.Errorf("client store migration: %w", err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
-		db.Close()
-		return nil, err
+	if version < clientSchemaVersion {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO client_meta(key,value) VALUES ('schema_version',?)
+ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.Itoa(clientSchemaVersion)); err != nil {
+			return fmt.Errorf("client store migration: %w", err)
+		}
 	}
-	return &clientStore{db: db}, nil
+	return tx.Commit()
 }
 
 func (s *clientStore) Close() error { return s.db.Close() }
@@ -102,6 +151,82 @@ func (s *clientStore) profile(ctx context.Context) (string, string, error) {
 		values[key] = value
 	}
 	return values["author_name"], values["author_domain"], rows.Err()
+}
+
+func (s *clientStore) validateOrRepairRooms(ctx context.Context) error {
+	type cachedRoom struct {
+		record               RoomRecord
+		rawGenesis, rawState []byte
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT room_key,reference,bootstrap,raw_genesis,raw_state,head_seqno,head_hash
+FROM joined_rooms ORDER BY reference`)
+	if err != nil {
+		return err
+	}
+	var cached []cachedRoom
+	for rows.Next() {
+		var item cachedRoom
+		if err := rows.Scan(&item.record.RoomKey, &item.record.Reference, &item.record.Bootstrap,
+			&item.rawGenesis, &item.rawState, &item.record.HeadSeqno, &item.record.HeadHash); err != nil {
+			rows.Close()
+			return err
+		}
+		cached = append(cached, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	for _, item := range cached {
+		record := item.record
+		if len(item.rawGenesis) > 0 {
+			record.Genesis, err = community.DecodeGenesis(item.rawGenesis)
+			if err != nil {
+				return fmt.Errorf("client store: invalid pinned genesis for %x: %w", record.RoomKey, err)
+			}
+		}
+		if len(item.rawState) > 0 {
+			record.State, err = community.DecodeRoomState(item.rawState)
+			if err != nil {
+				if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+		if len(record.Genesis.RoomKey) == 0 {
+			if record.HeadSeqno != 0 || len(record.State.RoomID) != 0 || !bytes.Equal(record.HeadHash, community.Zero256()) {
+				if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
+					return err
+				}
+			}
+			continue
+		}
+		if err := record.Genesis.VerifyNow(); err != nil || !bytes.Equal(record.Genesis.RoomKey, record.RoomKey) {
+			if err == nil {
+				err = fmt.Errorf("genesis belongs to another room")
+			}
+			return fmt.Errorf("client store: invalid pinned genesis for %x: %w", record.RoomKey, err)
+		}
+		projection, projectionErr := s.projectRoom(ctx, record.RoomKey, record.Genesis)
+		stateErr := error(nil)
+		if projectionErr == nil {
+			if len(record.State.RoomID) == 0 {
+				stateErr = fmt.Errorf("missing signed room state")
+			} else {
+				stateErr = projection.ValidateState(record.State)
+			}
+		}
+		if projectionErr != nil || stateErr != nil {
+			if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (s *clientStore) setMeta(ctx context.Context, key, value string) error {

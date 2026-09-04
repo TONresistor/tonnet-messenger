@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"net"
 	"path/filepath"
 	"testing"
@@ -172,6 +173,186 @@ func TestTONQUICClientReadsFromVerifiedRelay(t *testing.T) {
 	if sequencerSession, err := replica.DialSequencer(ctx, config); err == nil {
 		sequencerSession.Close()
 		t.Fatal("relay was accepted as authoritative sequencer")
+	}
+}
+
+func TestRelayInstallsStateReceivedFromAnotherVerifiedRelay(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	roomKey, sequencerKey, sourceRelayKey := integrationKey(t), integrationKey(t), integrationKey(t)
+	genesis, err := community.NewGenesis(roomKey, sequencerKey, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "authority.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authorityStore.Close()
+	if err := authorityStore.Initialize(ctx, genesis, roomKey); err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := community.SignProposal(roomKey, genesis.NodeKey, community.EventProposal{
+		RoomID: genesis.RoomKey, Nonce: nonce, Timestamp: time.Now().Unix(),
+		Body: community.EventMetadata{Name: "Updated", Description: "from relay"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := authorityStore.Commit(ctx, proposal, roomKey, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	signedState, err := authorityStore.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sourceStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "source-relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceStore.Close()
+	if err := sourceStore.InitializeReplica(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sourceStore.AppendReplica(ctx, committed.Event); err != nil {
+		t.Fatal(err)
+	}
+	if err := sourceStore.InstallReplicaState(ctx, signedState); err != nil {
+		t.Fatal(err)
+	}
+	listen := integrationAddress(t)
+	sourceRuntime, err := New(Config{
+		Key: sourceRelayKey, Listen: listen, Genesis: &genesis, Store: sourceStore, NodeRole: community.NodeRoleRelay,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sourceRuntime.Close()
+	session, err := replica.DialRoom(ctx, replica.Config{
+		RoomID: genesis.RoomKey, NodeKey: integrationKey(t), DirectAddress: listen,
+		DirectPublic: sourceRelayKey.Public().(ed25519.PublicKey),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	destinationStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "destination-relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destinationStore.Close()
+	if err := destinationStore.InitializeReplica(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	destinationPeers := newPeerTable(DefaultMaxLeaves)
+	sourcePeer := newPeer("source", kindNode, session.Peer, nil)
+	sourcePeer.state = peerHealthy
+	destinationPeers.m[sourcePeer.id] = sourcePeer
+	destination := &Node{store: destinationStore, peers: destinationPeers}
+	if err := destination.persistReplicaEvent(sourcePeer, committed.Event); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.ReplicaReady(ctx); err != nil {
+		t.Fatal(err)
+	}
+	state, err := destinationStore.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.Name != "Updated" || state.Description != "from relay" {
+		t.Fatalf("replicated state = %#v", state)
+	}
+}
+
+func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	roomKey, sequencerKey, relayKey := integrationKey(t), integrationKey(t), integrationKey(t)
+	genesis, err := community.NewGenesis(roomKey, sequencerKey, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorityStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "authority.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authorityStore.Close()
+	if err := authorityStore.Initialize(ctx, genesis, roomKey); err != nil {
+		t.Fatal(err)
+	}
+	initialState, err := authorityStore.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := community.SignProposal(roomKey, genesis.NodeKey, community.EventProposal{
+		RoomID: genesis.RoomKey, Nonce: nonce, Timestamp: time.Now().Unix(),
+		Body: community.EventMessage{Text: "missed tail"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := authorityStore.Commit(ctx, proposal, roomKey, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	listen := integrationAddress(t)
+	sequencerRuntime, err := New(Config{
+		Key: sequencerKey, Listen: listen, Socket: filepath.Join(t.TempDir(), "node.sock"),
+		Genesis: &genesis, Store: authorityStore, RoomKey: roomKey, NodeRole: community.NodeRoleSequencer,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencerRuntime.Close()
+	session, err := replica.DialSequencer(ctx, replica.Config{
+		RoomID: genesis.RoomKey, NodeKey: relayKey, DirectAddress: listen,
+		DirectPublic: sequencerKey.Public().(ed25519.PublicKey),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+
+	relayStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "relay.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayStore.Close()
+	if err := relayStore.InitializeReplica(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	if err := relayStore.InstallReplicaState(ctx, initialState); err != nil {
+		t.Fatal(err)
+	}
+	peers := newPeerTable(DefaultMaxLeaves)
+	sequencerID, err := community.KeyID(genesis.NodeKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerID := hex.EncodeToString(sequencerID)
+	sequencerPeer := newPeer(peerID, kindNode, session.Peer, nil)
+	sequencerPeer.state = peerHealthy
+	peers.m[peerID] = sequencerPeer
+	destination := &Node{store: relayStore, peers: peers, genesis: genesis}
+	if err := destination.reconcileReplicaOnce(); err != nil {
+		t.Fatal(err)
+	}
+	head, err := relayStore.Head(ctx)
+	if err != nil || head.Seqno != 1 {
+		t.Fatalf("relay head = %#v err=%v", head, err)
+	}
+	if destination.stats.replayedItems.Load() != 1 {
+		t.Fatalf("replayed items = %d", destination.stats.replayedItems.Load())
 	}
 }
 
