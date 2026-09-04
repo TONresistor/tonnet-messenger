@@ -194,6 +194,9 @@ Canonical commits form a hash-linked sequence ordered by `seqno`.
 - Recent and before queries return messages in display order.
 - Page size is `1..256`; zero selects the default of 100.
 - A batch contains at most 16 read-only queries and 8064 bytes.
+- The complete boxed batch answer remains subject to the 4 MiB answer-object
+  limit. Items that do not fit return rejection code 9 without invalidating
+  earlier items.
 
 Clients and relays MUST verify genesis, room state, proposal signatures, commit
 signatures, contiguous `seqno` and previous-hash links. Gaps MUST be repaired
@@ -201,6 +204,10 @@ before later events are accepted.
 
 A relay persists and serves only verified canonical data. It MAY serve reads
 while the sequencer is unavailable, but writes remain unavailable.
+
+A relay is `ready` only when its signed room-state revision covers its latest
+state-changing canonical commit. Relays MUST periodically reconcile their tail
+with the authoritative sequencer.
 
 `roomStateResultV2` keeps signed `RoomState` and unsigned `RoomStats` separate
 on the wire. Client APIs MUST NOT merge `online_users`, `node_role` or `ready`
@@ -256,6 +263,10 @@ reimplementing protocol cryptography.
 
 The API covers client information, identity management, room resolution and
 membership, history, messages, moderation and direct messages.
+
+Paginated JSON-RPC results MAY contain fewer items than requested to keep the
+complete response line within 64 KiB. In that case `has_more` MUST be true and
+pagination MUST remain gap-free and duplicate-free.
 
 `room.join` returns separate `state`, `connection`, `presence` and `timeline`
 objects. `room.getState` and `room.state` expose only verified room data.

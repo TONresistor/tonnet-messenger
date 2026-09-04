@@ -74,6 +74,10 @@ tonnet-messenger run --stdio
 {"jsonrpc":"2.0","id":2,"method":"room.join","params":{"reference":"community.ton"}}
 ```
 
+Timeline responses stay within the 64 KiB line contract by returning a shorter
+page with `has_more=true`. `SIGINT`, `SIGTERM`, EOF and broken stdio shut the
+client down cleanly.
+
 User identity domains use `dns_text` category `msg_id` with the canonical
 identity key as their complete value.
 

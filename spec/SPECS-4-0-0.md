@@ -119,6 +119,8 @@ application hello, challenge or binding.
 - Recent and before queries return messages in display order.
 - Page limits are `1..256`; zero selects 100.
 - A batch is read-only, ordered, limited to 16 queries and 8064 bytes.
+- Its complete boxed answer remains limited to 4 MiB; items exceeding the
+  remaining answer budget return rejection code 9.
 
 Clients verify genesis, state, proposal signatures, commit signatures, hash
 links and contiguous `seqno`. Submit responses, broadcasts and gap recovery use
@@ -127,6 +129,10 @@ the same verification and deduplication path.
 A relay persists only verified data. It never possesses `room.key`, allocates a
 `seqno`, changes history, signs room state or self-elects. It may serve verified
 reads while the sequencer is unavailable.
+
+A relay reports `ready=true` only when its signed state covers its latest
+state-changing commit. It periodically reconciles with the authoritative
+sequencer so a missed tail broadcast cannot leave it indefinitely stale.
 
 `roomStateResultV2` keeps signed `RoomState` and unsigned `RoomStats` separate
 on the wire. Client APIs MUST NOT merge `online_users`, `node_role` or `ready`
@@ -197,6 +203,10 @@ Required notifications are `client.ready`, `identity.changed`,
 They contain typed application data, never localized display text.
 
 `client.info` MUST report `room_transport: "ton-quic"`.
+
+Timeline and join responses MAY return fewer events than requested to keep the
+complete JSON-RPC line within 64 KiB. Such responses set `has_more=true` and
+preserve gap-free, duplicate-free pagination.
 
 Each state directory contains one private `identity.key` and a versioned SQLite
 cache. The client reconnects saved rooms, repairs gaps and persists verified
