@@ -80,6 +80,13 @@ event_id  = H(TL(proposal))
 proposals MUST be within 300 seconds of calibrated sequencer time. Historical
 verification does not reapply this time window.
 
+Canonical-write time MUST be obtained over an authenticated QUIC connection
+whose remote public key equals the pinned `genesis.node_key`. Relay time MUST
+NOT set proposal timestamps. Calibration MAY be cached for five minutes and
+MUST be invalidated when the session or identity changes. A relay remains
+usable for reads when the sequencer is unavailable, but writes fail with
+`SEQUENCER_UNAVAILABLE`.
+
 For a direct leaf, `author_key` MUST equal the authenticated TON QUIC peer
 public key. A verified relay MAY forward the unchanged signed proposal.
 
@@ -121,8 +128,10 @@ A relay persists only verified data. It never possesses `room.key`, allocates a
 `seqno`, changes history, signs room state or self-elects. It may serve verified
 reads while the sequencer is unavailable.
 
-`online_users` is unsigned node-local data counting connected leaf identities;
-it is not canonical room state.
+`roomStateResultV2` keeps signed `RoomState` and unsigned `RoomStats` separate
+on the wire. Client APIs MUST NOT merge `online_users`, `node_role` or `ready`
+into verified room state. Exposed `latest_seqno` MUST come from the locally
+verified event chain.
 
 ## 6. TON DNS
 
@@ -178,9 +187,14 @@ never exposed.
 | Moderation | `room.setMetadata`, `room.setWritePolicy`, `room.pin`, `room.unpin`, `room.grantModerator`, `room.revokeModerator` |
 | Direct messages | `dm.send` |
 
+`room.join` returns separate `state`, `connection`, `presence` and `timeline`
+objects. `room.getState` and `room.state` expose only verified room data.
+`connection` contains the authenticated node role. `room.presence` contains
+`room` and unsigned node-local `online_users`.
+
 Required notifications are `client.ready`, `identity.changed`,
-`room.connection`, `room.state`, `room.event` and `dm.message`. They contain
-typed application data, never localized display text.
+`room.connection`, `room.state`, `room.presence`, `room.event` and `dm.message`.
+They contain typed application data, never localized display text.
 
 `client.info` MUST report `room_transport: "ton-quic"`.
 

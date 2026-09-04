@@ -83,6 +83,13 @@ A client joins a room as follows:
 A known node ID MAY be supplied as a diagnostic discovery hint. It is not part
 of room identity and MUST NOT replace verification against `room_key`.
 
+For canonical writes, a client MUST calibrate time only over an authenticated
+QUIC connection whose remote public key equals the pinned `genesis.node_key`.
+A relay clock MUST NOT set proposal timestamps. Calibration MAY be cached for
+at most five minutes and MUST be invalidated when the session or identity
+changes. If the sequencer is unavailable, relay reads remain available but
+writes fail with `SEQUENCER_UNAVAILABLE`.
+
 Classic ADNL MAY be used to access the TON DHT during bootstrap and discovery.
 It MUST NOT carry Messenger room queries, events or direct messages. There is
 no application-level hello, session challenge or device binding.
@@ -153,7 +160,7 @@ key. A verified relay MAY forward the original proposal unchanged.
 The sequencer MUST:
 
 1. validate the proposal, signature and authorization;
-2. reject a timestamp more than 300 seconds from calibrated sequencer time;
+2. reject a timestamp more than 300 seconds from its current time;
 3. reject a nonce already used by that author during the previous 24 hours;
 4. allocate the next `seqno`;
 5. link the previous committed-event hash;
@@ -195,8 +202,10 @@ before later events are accepted.
 A relay persists and serves only verified canonical data. It MAY serve reads
 while the sequencer is unavailable, but writes remain unavailable.
 
-`online_users` is unsigned, node-local presence data. It is not canonical room
-state.
+`roomStateResultV2` keeps signed `RoomState` and unsigned `RoomStats` separate
+on the wire. Client APIs MUST NOT merge `online_users`, `node_role` or `ready`
+into verified room state. Exposed `latest_seqno` MUST come from the client's
+locally verified event chain.
 
 ## 9. TON DNS
 
@@ -246,9 +255,16 @@ reimplementing protocol cryptography.
 - private keys and raw TL, DHT or QUIC operations are never exposed.
 
 The API covers client information, identity management, room resolution and
-membership, history, messages, moderation and direct messages. Required
-notifications are `client.ready`, `identity.changed`, `room.connection`,
-`room.state`, `room.event` and `dm.message`.
+membership, history, messages, moderation and direct messages.
+
+`room.join` returns separate `state`, `connection`, `presence` and `timeline`
+objects. `room.getState` and `room.state` expose only verified room data.
+`connection` contains the authenticated node role. `room.presence` contains
+`room` and unsigned node-local `online_users`; consumers MUST treat it as an
+informational snapshot.
+
+Required notifications are `client.ready`, `identity.changed`,
+`room.connection`, `room.state`, `room.presence`, `room.event` and `dm.message`.
 
 `client.info` MUST report `room_transport: "ton-quic"`.
 
