@@ -27,11 +27,15 @@ import (
 const (
 	defaultConfigURL            = "https://ton-blockchain.github.io/global.config.json"
 	canonicalEventQueueCapacity = 64
+	sequencerClockTTL           = 5 * time.Minute
+	timeQueryTimeout            = 3 * time.Second
 )
 
 var (
-	errRoomSessionChanged = errors.New("room session changed")
-	errCanonicalQueueFull = errors.New("canonical event queue is full")
+	ErrSequencerUnavailable = errors.New("sequencer unavailable")
+	ErrSequencerClockSkew   = errors.New("sequencer clock skew")
+	errRoomSessionChanged   = errors.New("room session changed")
+	errCanonicalQueueFull   = errors.New("canonical event queue is full")
 )
 
 type Config struct {
@@ -51,9 +55,11 @@ type Identity struct {
 }
 
 type JoinResult struct {
-	Room     string         `json:"room"`
-	State    map[string]any `json:"state"`
-	Timeline map[string]any `json:"timeline"`
+	Room       string         `json:"room"`
+	State      map[string]any `json:"state"`
+	Connection map[string]any `json:"connection"`
+	Presence   map[string]any `json:"presence"`
+	Timeline   map[string]any `json:"timeline"`
 }
 
 type Client struct {
@@ -88,17 +94,23 @@ type roomHandle struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 
-	mu           sync.RWMutex
-	connectMu    sync.Mutex
-	historyMu    sync.Mutex
-	session      *replica.Session
-	sessionEpoch uint64
-	state        community.RoomStateResult
-	projection   *community.Projection
-	timeOffset   int64
-	events       chan canonicalEvent
-	workers      sync.WaitGroup
-	ingestDone   bool
+	mu              sync.RWMutex
+	connectMu       sync.Mutex
+	historyMu       sync.Mutex
+	clockMu         sync.Mutex
+	session         *replica.Session
+	sessionEpoch    uint64
+	state           community.RoomStateResult
+	projection      *community.Projection
+	verifiedHead    int64
+	clockSession    *replica.Session
+	clockEpoch      uint64
+	clockRemote     int64
+	clockCalibrated time.Time
+	dialSequencer   func(context.Context, replica.Config) (*replica.Session, error)
+	events          chan canonicalEvent
+	workers         sync.WaitGroup
+	ingestDone      bool
 }
 
 type canonicalEvent struct {
@@ -114,7 +126,6 @@ type roomIdentitySnapshot struct {
 	domain  string
 	session *replica.Session
 	epoch   uint64
-	offset  int64
 }
 
 func Open(ctx context.Context, cfg Config) (*Client, error) {
@@ -376,12 +387,22 @@ func (c *Client) Join(ctx context.Context, reference string, bootstrap []byte) (
 	}
 	handle.mu.RLock()
 	state := handle.state
+	verifiedHead := handle.verifiedHead
+	session := handle.session
 	handle.mu.RUnlock()
+	connection, err := connectionView(session)
+	if err != nil {
+		return JoinResult{}, err
+	}
 	items, hasMore, err := c.Timeline(ctx, roomKey, 0, community.DefaultPageLimit)
 	if err != nil {
 		return JoinResult{}, err
 	}
-	return JoinResult{Room: keyText(roomKey), State: stateView(state), Timeline: map[string]any{"items": items, "has_more": hasMore}}, nil
+	return JoinResult{
+		Room: keyText(roomKey), State: stateView(state.State, verifiedHead),
+		Connection: connection, Presence: presenceView(state),
+		Timeline: map[string]any{"items": items, "has_more": hasMore},
+	}, nil
 }
 
 func (c *Client) Leave(ctx context.Context, reference string) error {
@@ -446,7 +467,7 @@ func (c *Client) RoomState(roomText string) (map[string]any, error) {
 	}
 	handle.mu.RLock()
 	defer handle.mu.RUnlock()
-	return stateView(handle.state), nil
+	return stateView(handle.state.State, handle.verifiedHead), nil
 }
 
 func (c *Client) SendMessage(ctx context.Context, roomText, text string) (map[string]any, error) {
@@ -480,12 +501,12 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 	if len([]byte(text)) > community.MaxDMPlaintextBytes {
 		return nil, fmt.Errorf("direct message exceeds %d bytes", community.MaxDMPlaintextBytes)
 	}
-	session, offset := snapshot.session, snapshot.offset
+	session := snapshot.session
 	box, err := dm.SealForRoom(handle.key, key, ed25519.PublicKey(to), []byte(text))
 	if err != nil {
 		return nil, err
 	}
-	now := time.Now().Unix() + offset
+	now := time.Now().Unix()
 	direct, err := community.SignDirectMessage(key, community.DirectMessage{
 		RoomID: handle.key, ToKey: to, AuthorName: name, Timestamp: now, Ciphertext: box,
 	})
@@ -527,14 +548,18 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 		return nil, err
 	}
 	key, name, domain := snapshot.key, snapshot.name, snapshot.domain
-	session, offset := snapshot.session, snapshot.offset
+	session := snapshot.session
+	timestamp, err := handle.sequencerTimestamp(ctx, snapshot)
+	if err != nil {
+		return nil, err
+	}
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
 	proposal, err := community.SignProposal(key, session.Genesis.NodeKey, community.EventProposal{
 		RoomID: handle.key, AuthorName: name, AuthorDomain: domain, Nonce: nonce,
-		Timestamp: time.Now().Unix() + offset, Body: body,
+		Timestamp: timestamp, Body: body,
 	})
 	if err != nil {
 		return nil, err
@@ -574,8 +599,95 @@ func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot,
 	}
 	return roomIdentitySnapshot{
 		key: append(ed25519.PrivateKey(nil), c.key...), name: c.name, domain: c.domain,
-		session: handle.session, epoch: c.identityEpoch, offset: handle.timeOffset,
+		session: handle.session, epoch: c.identityEpoch,
 	}, nil
+}
+
+func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdentitySnapshot) (int64, error) {
+	r.clockMu.Lock()
+	defer r.clockMu.Unlock()
+
+	now := time.Now()
+	if r.clockSession == snapshot.session && r.clockEpoch == snapshot.epoch && !r.clockCalibrated.IsZero() {
+		age := now.Sub(r.clockCalibrated)
+		if age >= 0 && age <= sequencerClockTTL {
+			return r.clockRemote + int64(age/time.Second), nil
+		}
+	}
+	if !r.isCurrentSession(snapshot.session, snapshot.epoch) {
+		return 0, errRoomSessionChanged
+	}
+
+	authority := snapshot.session
+	if !bytes.Equal(authority.Peer.GetPubKey(), authority.Genesis.NodeKey) {
+		sequencerID, err := community.KeyID(snapshot.session.Genesis.NodeKey)
+		if err != nil {
+			return 0, err
+		}
+		dial := r.dialSequencer
+		if dial == nil {
+			dial = replica.DialSequencer
+		}
+		authority, err = dial(ctx, replica.Config{
+			ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: snapshot.key, BootstrapADNL: sequencerID,
+		})
+		if err != nil {
+			if ctx.Err() != nil {
+				return 0, ctx.Err()
+			}
+			return 0, fmt.Errorf("%w: %v", ErrSequencerUnavailable, err)
+		}
+		defer authority.Close()
+		expectedGenesis, err := snapshot.session.Genesis.Hash()
+		if err != nil {
+			return 0, err
+		}
+		actualGenesis, err := authority.Genesis.Hash()
+		if err != nil {
+			return 0, err
+		}
+		if !bytes.Equal(expectedGenesis, actualGenesis) ||
+			!bytes.Equal(authority.Peer.GetPubKey(), snapshot.session.Genesis.NodeKey) {
+			return 0, fmt.Errorf("%w: conflicting sequencer genesis", ErrSequencerUnavailable)
+		}
+	}
+
+	started := time.Now()
+	var remoteTime broadcast.Time
+	queryCtx, cancel := context.WithTimeout(ctx, timeQueryTimeout)
+	err := authority.Peer.Query(queryCtx, broadcast.GetTime{}, &remoteTime)
+	cancel()
+	if err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		return 0, fmt.Errorf("%w: time query failed: %v", ErrSequencerUnavailable, err)
+	}
+	midpoint := started.Add(time.Since(started) / 2)
+	offset := int64(remoteTime.Now) - midpoint.Unix()
+	maxSkew := int64(community.MutationClockSkew / time.Second)
+	if offset < -maxSkew || offset > maxSkew {
+		return 0, ErrSequencerClockSkew
+	}
+	if !r.isCurrentSession(snapshot.session, snapshot.epoch) {
+		return 0, errRoomSessionChanged
+	}
+	r.clockSession = snapshot.session
+	r.clockEpoch = snapshot.epoch
+	r.clockRemote = int64(remoteTime.Now)
+	r.clockCalibrated = midpoint
+	return r.clockRemote + int64(time.Since(midpoint)/time.Second), nil
+}
+
+func (r *roomHandle) invalidateSequencerClock(session *replica.Session) {
+	r.clockMu.Lock()
+	if session == nil || r.clockSession == session {
+		r.clockSession = nil
+		r.clockEpoch = 0
+		r.clockRemote = 0
+		r.clockCalibrated = time.Time{}
+	}
+	r.clockMu.Unlock()
 }
 
 type RejectedError struct {
@@ -698,22 +810,8 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	started := time.Now()
-	var remoteTime broadcast.Time
-	queryCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	err = session.Peer.Query(queryCtx, broadcast.GetTime{}, &remoteTime)
-	cancel()
-	if err != nil {
-		session.Close()
-		return err
-	}
-	offset := int64(remoteTime.Now) - started.Add(time.Since(started)/2).Unix()
-	if offset < -300 || offset > 300 {
-		session.Close()
-		return fmt.Errorf("sequencer clock skew")
-	}
 	r.historyMu.Lock()
-	if err := r.installSession(session, identity, identityEpoch, offset); err != nil {
+	if err := r.installSession(session, identity, identityEpoch); err != nil {
 		r.historyMu.Unlock()
 		session.Close()
 		return err
@@ -737,8 +835,21 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		return errRoomSessionChanged
 	}
 	state := r.state
+	verifiedHead := r.verifiedHead
 	r.mu.RUnlock()
-	if err := r.notifyLiveSession(ctx, session, identityEpoch, "room.connection", map[string]any{"room": keyText(r.key), "status": "connected", "state": stateView(state)}); err != nil {
+	connection, err := connectionView(session)
+	if err != nil {
+		detached := r.detachSessionIf(session)
+		r.historyMu.Unlock()
+		if detached != nil {
+			detached.Close()
+		}
+		return err
+	}
+	if err := r.notifyLiveSession(ctx, session, identityEpoch, "room.connection", map[string]any{
+		"room": keyText(r.key), "status": "connected",
+		"state": stateView(state.State, verifiedHead), "connection": connection, "presence": presenceView(state),
+	}); err != nil {
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
 		if detached != nil {
@@ -750,7 +861,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	return nil
 }
 
-func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64, offset int64) error {
+func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64) error {
 	r.client.mu.RLock()
 	defer r.client.mu.RUnlock()
 	if r.client.closed || r.client.identityEpoch != epoch ||
@@ -761,7 +872,6 @@ func (r *roomHandle) installSession(session *replica.Session, identity ed25519.P
 	defer r.mu.Unlock()
 	r.session = session
 	r.sessionEpoch = epoch
-	r.timeOffset = offset
 	return nil
 }
 
@@ -843,12 +953,13 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if !r.isCurrentSession(session, epoch) {
 		return errRoomSessionChanged
 	}
-	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
+	if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return fmt.Errorf("invalid room state")
 	}
 	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, projection, state.State); err != nil {
 		return err
 	}
+	verifiedHead, _ := projection.Head()
 	r.mu.Lock()
 	if r.session != session {
 		r.mu.Unlock()
@@ -856,8 +967,12 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	}
 	r.state = state
 	r.projection = projection
+	r.verifiedHead = verifiedHead
 	r.mu.Unlock()
-	return r.client.notify(ctx, "room.state", stateView(state))
+	if err := r.notifyForSession(ctx, session, epoch, "room.state", stateView(state.State, verifiedHead)); err != nil {
+		return err
+	}
+	return r.notifyForSession(ctx, session, epoch, "room.presence", presenceView(state))
 }
 
 func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, serialized tl.Serializable) {
@@ -1051,7 +1166,10 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	if err := projection.Commit(transition); err != nil {
 		return true, err
 	}
+	r.mu.Lock()
 	r.projection = projection
+	r.verifiedHead = event.Seqno
+	r.mu.Unlock()
 	var state *community.RoomStateResult
 	if stateChanging(event.Proposal.Body) {
 		refreshed, err := r.refreshStateLocked(ctx, session, epoch)
@@ -1067,7 +1185,10 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 		return true, err
 	}
 	if state != nil {
-		if err := r.client.notify(ctx, "room.state", stateView(*state)); err != nil {
+		if err := r.notifyForSession(ctx, session, epoch, "room.state", stateView(state.State, event.Seqno)); err != nil {
+			return true, err
+		}
+		if err := r.notifyForSession(ctx, session, epoch, "room.presence", presenceView(*state)); err != nil {
 			return true, err
 		}
 	}
@@ -1092,7 +1213,7 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 	if err != nil {
 		return community.RoomStateResult{}, err
 	}
-	if state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
+	if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
 		return community.RoomStateResult{}, fmt.Errorf("invalid room state")
 	}
 	projection := r.projection
@@ -1135,6 +1256,7 @@ func (r *roomHandle) detachSessionIf(expected *replica.Session) *replica.Session
 	r.session = nil
 	r.sessionEpoch = 0
 	r.mu.Unlock()
+	r.invalidateSequencerClock(session)
 	return session
 }
 
@@ -1251,33 +1373,43 @@ func ParseKeyText(value string) ([]byte, error) {
 	return community.ParseRoomKeyText(strings.TrimSpace(value))
 }
 
-func stateView(result community.RoomStateResult) map[string]any {
-	admins := make([]string, len(result.State.Admins))
-	for i, key := range result.State.Admins {
+func stateView(state community.RoomState, latestSeqno int64) map[string]any {
+	admins := make([]string, len(state.Admins))
+	for i, key := range state.Admins {
 		admins[i] = keyText(key)
 	}
-	moderators := make([]string, len(result.State.Moderators))
-	for i, key := range result.State.Moderators {
+	moderators := make([]string, len(state.Moderators))
+	for i, key := range state.Moderators {
 		moderators[i] = keyText(key)
 	}
-	pins := make([]string, len(result.State.PinnedMessages))
-	for i, id := range result.State.PinnedMessages {
+	pins := make([]string, len(state.PinnedMessages))
+	for i, id := range state.PinnedMessages {
 		pins[i] = fmt.Sprintf("%d", id)
 	}
 	policy := "admins"
-	if result.State.WritePolicy.AnyoneCanWrite {
+	if state.WritePolicy.AnyoneCanWrite {
 		policy = "everyone"
 	}
+	return map[string]any{
+		"room": keyText(state.RoomID), "name": state.Name, "description": state.Description,
+		"write_policy": policy, "admins": admins, "moderators": moderators, "pinned_messages": pins,
+		"revision_seqno": fmt.Sprintf("%d", state.RevisionSeqno), "latest_seqno": fmt.Sprintf("%d", latestSeqno),
+	}
+}
+
+func connectionView(session *replica.Session) (map[string]any, error) {
+	if session == nil || session.Peer == nil || len(session.Peer.GetPubKey()) != ed25519.PublicKeySize {
+		return nil, errRoomSessionChanged
+	}
 	role := "relay"
-	if result.Stats.NodeRole == community.NodeRoleSequencer {
+	if bytes.Equal(session.Peer.GetPubKey(), session.Genesis.NodeKey) {
 		role = "sequencer"
 	}
-	return map[string]any{
-		"room": keyText(result.State.RoomID), "name": result.State.Name, "description": result.State.Description,
-		"write_policy": policy, "admins": admins, "moderators": moderators, "pinned_messages": pins,
-		"revision_seqno": fmt.Sprintf("%d", result.State.RevisionSeqno), "latest_seqno": fmt.Sprintf("%d", result.Stats.ReplicaSeqno),
-		"online_users": result.Stats.OnlineUsers, "node_role": role, "ready": result.Stats.Ready,
-	}
+	return map[string]any{"node_role": role}, nil
+}
+
+func presenceView(result community.RoomStateResult) map[string]any {
+	return map[string]any{"room": keyText(result.State.RoomID), "online_users": result.Stats.OnlineUsers}
 }
 
 func eventView(event community.CommittedEvent) (map[string]any, error) {

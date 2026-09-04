@@ -379,6 +379,10 @@ func classify(err error) *rpcError {
 		default:
 			code = "ROOM_REJECTED"
 		}
+	} else if errors.Is(err, client.ErrSequencerUnavailable) {
+		code, numeric = "SEQUENCER_UNAVAILABLE", -32030
+	} else if errors.Is(err, client.ErrSequencerClockSkew) {
+		code, numeric = "CLOCK_SKEW", -32031
 	} else if errors.Is(err, context.DeadlineExceeded) {
 		code, numeric, message = "TIMEOUT", -32001, "operation timed out"
 	} else {

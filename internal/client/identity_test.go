@@ -155,16 +155,16 @@ func TestSessionInstallRejectsStaleIdentityEpoch(t *testing.T) {
 	handle := &roomHandle{client: client}
 	session := &replica.Session{}
 
-	if err := handle.installSession(session, stale, 1, 0); err != errRoomSessionChanged {
+	if err := handle.installSession(session, stale, 1); err != errRoomSessionChanged {
 		t.Fatalf("stale install error = %v", err)
 	}
 	if handle.session != nil {
 		t.Fatal("stale identity session was installed")
 	}
-	if err := handle.installSession(session, current, 2, 7); err != nil {
+	if err := handle.installSession(session, current, 2); err != nil {
 		t.Fatal(err)
 	}
-	if !handle.isCurrentSession(session, 2) || handle.timeOffset != 7 {
+	if !handle.isCurrentSession(session, 2) {
 		t.Fatal("current identity session was not installed")
 	}
 }

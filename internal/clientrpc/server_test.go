@@ -49,3 +49,20 @@ func TestStdioIdentityAPI(t *testing.T) {
 		t.Fatalf("identity = %#v", identity)
 	}
 }
+
+func TestClassifyAuthoritativeClockErrors(t *testing.T) {
+	tests := []struct {
+		err     error
+		code    string
+		numeric int
+	}{
+		{client.ErrSequencerUnavailable, "SEQUENCER_UNAVAILABLE", -32030},
+		{client.ErrSequencerClockSkew, "CLOCK_SKEW", -32031},
+	}
+	for _, test := range tests {
+		got := classify(test.err)
+		if got.Code != test.numeric || got.Data["code"] != test.code {
+			t.Fatalf("classify(%v) = %#v", test.err, got)
+		}
+	}
+}
