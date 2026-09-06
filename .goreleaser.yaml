@@ -45,6 +45,7 @@ archives:
     name_template: "tonnet-messenger_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
+      - PROTOCOL.md
       - LICENSE*
   - id: server
     builds: [server]
@@ -52,6 +53,7 @@ archives:
     name_template: "tonnet-messenger-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
+      - PROTOCOL.md
       - LICENSE*
 
 checksum:

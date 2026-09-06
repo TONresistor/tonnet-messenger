@@ -1,6 +1,8 @@
 # built binary
-/tonnet
-/cmd/tonnet/tonnet
+/tonnet-messenger
+/tonnet-messenger.exe
+/tonnet-messenger-server
+/tonnet-messenger-server.exe
 
 # goreleaser output
 /dist/
@@ -9,7 +11,6 @@
 # losing it changes the ADNL id and breaks any .ton pointer)
 *.bin
 *.key
-node-key.bin
 
 # local scratch
 *.log

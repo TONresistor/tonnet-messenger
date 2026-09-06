@@ -1,122 +1,79 @@
-# tonnet-messenger
+# Tonnet Messenger
 
-[![ci](https://github.com/TONresistor/tonnet-messenger/actions/workflows/ci.yml/badge.svg)](https://github.com/TONresistor/tonnet-messenger/actions/workflows/ci.yml)
+[![The Open Network](https://img.shields.io/badge/The_Open_Network-0098EA?logo=ton&logoColor=white)](https://ton.org)
 
-Persistent public rooms and an independent client over TON QUIC, DHT and
-overlays.
+Persistent public rooms and encrypted direct messages over TON QUIC.
 
-Protocol 0.4 provides two binaries:
+| Binary                    | Use                                                        |
+| ------------------------- | ---------------------------------------------------------- |
+| `tonnet-messenger`        | Interactive terminal client, CLI commands and JSON-RPC API |
+| `tonnet-messenger-server` | Authoritative room sequencer or verified relay             |
 
-- `tonnet-messenger-server`: authoritative room sequencer or verified relay;
-- `tonnet-messenger`: standalone leaf client with a JSON-RPC stdio interface.
-
-The normative protocol and client contract are defined in
-[spec/SPECS-4-0-0.md](spec/SPECS-4-0-0.md).
+Protocol and API: [PROTOCOL.md](PROTOCOL.md).
 
 ## Build
 
-```bash
-go build ./cmd/tonnet-messenger
-go build ./cmd/tonnet-messenger-server
+Requires **Go 1.26.7 or newer**. From the repository root:
+
+```sh
+go build -o tonnet-messenger ./cmd/tonnet-messenger
+go build -o tonnet-messenger-server ./cmd/tonnet-messenger-server
+```
+
+## Client
+
+Open the interactive client:
+
+```sh
+./tonnet-messenger
+```
+
+Join rooms, send messages and manage your identity from the menu.
+To link a `.ton` domain, scan the QR code and approve the transaction in the wallet that owns it.
+
+Public history is saved locally. Direct messages require both users online and are kept only for the current session.
+The client stores its data in `~/.tonnet-messenger/client`.
+
+You can also use commands directly:
+
+```sh
+./tonnet-messenger identity set-name "Alice"
+./tonnet-messenger room join community.ton
+./tonnet-messenger room send community.ton "Hello"
+./tonnet-messenger room history community.ton
+./tonnet-messenger dm send community.ton RECIPIENT_KEY "Hi"
+```
+
+Applications can connect to the client through JSON-RPC:
+
+```sh
+./tonnet-messenger run --stdio
 ```
 
 ## Server
 
-```bash
-tonnet-messenger-server room create \
-  --state /var/lib/tonnet-messenger \
-  --name "My community"
+Create a room, then start its server. The state directory must not already exist when creating the room.
 
-tonnet-messenger-server serve \
-  --state /var/lib/tonnet-messenger \
-  --advertise PUBLIC_IP:17400
+```sh
+./tonnet-messenger-server room create --state ./room --name "My community"
+./tonnet-messenger-server serve --state ./room --advertise PUBLIC_IP:17400
 ```
 
-Room creation is an operator action and is never available to clients.
-The advertised UDP port carries mandatory TON QUIC room traffic and must be
-publicly reachable. The node publishes it as `adnl.address.quic` through DHT.
-Sequencers, relays and clients must be upgraded together; legacy ADNL room
-endpoints are not compatible.
+Replace `PUBLIC_IP` with the server's public IP and open UDP port 17400.
 
-```bash
-tonnet-messenger-server room admin grant \
-  --state /var/lib/tonnet-messenger \
-  IDENTITY_KEY
+To link a `.ton` domain to the room:
 
-tonnet-messenger-server room write-policy set \
-  --state /var/lib/tonnet-messenger \
-  admins
+```sh
+./tonnet-messenger-server room link-domain community.ton --state ./room
 ```
 
-TON DNS room aliases use `dns_text` category `msg_room` with the canonical room
-key as their complete value.
+A relay serves a verified copy of an existing room's history. To run one on another host:
 
-## Client
-
-The client owns one Ed25519 identity and joins rooms through mutually
-authenticated TON QUIC. Classic ADNL is used only for DHT discovery. The client
-does not create rooms, sequence events or publish room-node records.
-
-Run the client without a command in a terminal to open the interactive menu:
-
-```bash
-tonnet-messenger
+```sh
+./tonnet-messenger-server relay --state ./relay --room ROOM_KEY --advertise PUBLIC_IP:17400
 ```
 
-The menu provides **My rooms**, **Join a room**, **Direct messages** and
-**My identity**. Use arrow keys and Enter to select, Escape to go back, and
-Ctrl+C to quit. Rooms keep receiving messages while you browse other screens.
-The identity screen shows your public key, lets you change your name, and
-prepares/verifies a domain link without submitting a DNS transaction.
-Linking a domain displays a QR code for the prepared wallet transaction. Scan it
-with the wallet owning the domain, approve it there, then select **Verify DNS
-record**. Both the QR and the transaction link are always included. Use
-PgUp/PgDown to scroll when the content extends beyond the screen.
-
-In a conversation, Enter sends the current draft; pasting never sends it.
-PgUp/PgDown scroll the displayed history. For public rooms, Ctrl+O loads an
-older page, Ctrl+N returns to a newer page, Ctrl+L returns to the latest messages,
-Ctrl+D opens room details, and Ctrl+R retries a connection. Reading an older
-page keeps it in place while new events arrive. Leaving a room requires an
-explicit confirmation in its details screen and removes that room's local cache.
-
-Drafts and direct conversations survive menu navigation during the session.
-DM conversations are scoped to a room and recipient, retain the latest 500
-messages in memory, and are not archived to disk. Both recipients must be
-online. A successful send is not a read receipt; failed sends are never retried
-automatically.
-
-The default client profile is `~/.tonnet-messenger/client`; use `--state PATH`
-for another profile and `--config URL` for another TON configuration. A profile
-can only be opened by one process at a time. The menu does not import the
-Browser profile. `NO_COLOR` disables colors. Without a terminal, invoking the
-client without a command prints help and does not open a profile.
-
-Explicit commands remain available for scripts and print JSON results:
-
-```bash
-tonnet-messenger identity show
-tonnet-messenger room join community.ton
-tonnet-messenger room send community.ton "hello"
-```
-
-Any interface can embed the client through newline-delimited JSON-RPC 2.0:
-
-```bash
-tonnet-messenger run --stdio
-```
-
-```json
-{"jsonrpc":"2.0","id":1,"method":"identity.get","params":{}}
-{"jsonrpc":"2.0","id":2,"method":"room.join","params":{"reference":"community.ton"}}
-```
-
-Timeline responses stay within the 64 KiB line contract by returning a shorter
-page with `has_more=true`. `SIGINT`, `SIGTERM`, EOF and broken stdio shut the
-client down cleanly.
-
-User identity domains use `dns_text` category `msg_id` with the canonical
-identity key as their complete value.
+Use `--help` on any command for its options.
 
 ## License
 
