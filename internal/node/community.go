@@ -154,7 +154,7 @@ func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community
 	err := sequencer.conn.Query(ctx, request, &response)
 	cancel()
 	if err != nil {
-		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectSequencerUnavailable, Message: "sequencer unavailable"})
+		return err
 	}
 	var committed *community.CommittedEvent
 	switch value := response.(type) {
@@ -179,7 +179,7 @@ func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community
 		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectInvalidCanonicalState, Message: "sequencer returned another proposal"})
 	}
 	if err := n.persistReplicaEvent(sequencer, *committed); err != nil {
-		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectInvalidCanonicalState, Message: "replica could not verify commit"})
+		return err
 	}
 	return n.answer(leaf, query, response)
 }
@@ -320,11 +320,35 @@ func (n *Node) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, err
 }
 
 func (n *Node) commitProposal(ctx context.Context, proposal community.EventProposal, now time.Time) (store.CommitResult, error) {
+	eventID, err := proposal.ID()
+	if err != nil {
+		return store.CommitResult{}, &store.Rejection{Code: community.RejectMalformedRequest, Message: "malformed proposal", Err: err}
+	}
+	lookup := func() (store.CommitResult, bool, error) {
+		event, found, err := n.store.FindCommitted(ctx, eventID)
+		return store.CommitResult{Event: event, Duplicate: found}, found, err
+	}
+	if result, found, err := lookup(); err != nil || found {
+		return result, err
+	}
+	if !bytes.Equal(proposal.RoomID, n.genesis.RoomKey) {
+		return store.CommitResult{}, &store.Rejection{Code: community.RejectWrongRoom, Message: "wrong room"}
+	}
+	if err := proposal.Verify(n.genesis.NodeKey, now); err != nil {
+		code := community.RejectInvalidSignature
+		if errors.Is(err, community.ErrTimestamp) {
+			code = community.RejectTimestamp
+		}
+		return store.CommitResult{}, &store.Rejection{Code: code, Message: "proposal verification failed", Err: err}
+	}
 	if proposal.AuthorDomain != "" {
 		resolveCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 		err := n.verifyIdentityDomain(resolveCtx, proposal.AuthorDomain, proposal.AuthorKey, now)
 		cancel()
 		if err != nil {
+			if result, found, lookupErr := lookup(); lookupErr != nil || found {
+				return result, lookupErr
+			}
 			return store.CommitResult{}, &store.Rejection{
 				Code: community.RejectInvalidIdentityDomain, Message: "invalid identity domain", Err: err,
 			}
@@ -435,7 +459,7 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 		return
 	}
 	wrapper, ok := broadcast.AsBroadcast(data)
-	if !ok || wrapper.Flags != 0 || !broadcast.Fresh(wrapper.Date, now) {
+	if !ok {
 		n.stats.invalidDrops.Add(1)
 		return
 	}
@@ -444,9 +468,11 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 		n.stats.invalidDrops.Add(1)
 		return
 	}
-	if err := wrapper.Verify(); err != nil {
+	if err := wrapper.VerifyLive(now); err != nil {
 		n.stats.invalidDrops.Add(1)
-		n.penalties.punish(p.id, now)
+		if errors.Is(err, broadcast.ErrBadSignature) {
+			n.penalties.punish(p.id, now)
+		}
 		return
 	}
 	id, err := wrapper.ID()
@@ -487,12 +513,6 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 			n.enqueue(target, wrapper)
 		}
 		return
-	}
-	if _, ok := wrapper.Certificate.(tonoverlay.CertificateEmpty); !ok {
-		if _, ok := wrapper.Certificate.(*tonoverlay.CertificateEmpty); !ok {
-			n.stats.invalidDrops.Add(1)
-			return
-		}
 	}
 	direct, err := community.DecodeDirectMessage(wrapper.Data)
 	if err != nil || !bytes.Equal(source, direct.FromKey) || direct.Verify(n.genesis.RoomKey, now) != nil {

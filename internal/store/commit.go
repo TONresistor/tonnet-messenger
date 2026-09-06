@@ -11,6 +11,19 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
+func (s *Store) FindCommitted(ctx context.Context, eventID []byte) (community.CommittedEvent, bool, error) {
+	var raw []byte
+	err := s.db.QueryRowContext(ctx, "SELECT raw_commit FROM events WHERE event_id=?", eventID).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return community.CommittedEvent{}, false, nil
+	}
+	if err != nil {
+		return community.CommittedEvent{}, false, err
+	}
+	event, err := community.DecodeCommittedEvent(raw)
+	return event, err == nil, err
+}
+
 func (s *Store) Commit(ctx context.Context, proposal community.EventProposal, roomPrivate ed25519.PrivateKey, now time.Time) (CommitResult, error) {
 	rawProposal, err := community.Encode(proposal)
 	if err != nil {

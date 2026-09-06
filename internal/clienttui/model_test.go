@@ -16,11 +16,87 @@ var testRoom = strings.Repeat("Q", 43)
 var testPeer = strings.Repeat("B", 43)
 
 type fakeBackend struct {
+	pendingOperation             *client.PendingOperation
 	events                       chan client.Notification
 	sentRoom, sentPeer, sentText string
 	leaveRoom                    string
 	sendErr                      error
 	joinErr                      error
+}
+
+func (backend *fakeBackend) GetPending(context.Context, string) (*client.PendingOperation, error) {
+	return backend.pendingOperation, nil
+}
+
+func TestPendingMenuPreservesDraftAndRequiresConfirmation(t *testing.T) {
+	model, backend := fixture(t)
+	backend.pendingOperation = &client.PendingOperation{Room: testRoom, EventID: testPeer, Status: "uncertain", Event: map[string]any{"kind": "message", "text": "original"}}
+	model.move(roomScreen)
+	model.input.SetValue("new draft")
+	model.move(detailsScreen)
+	model.cursor = 1
+	execute(t, model, model.selectAction())
+	if model.screen != pendingScreen || !strings.Contains(model.View().Content, "original") {
+		t.Fatal("pending operation not shown")
+	}
+	model.cursor = 2
+	model.selectAction()
+	if model.screen != discardPendingScreen || model.cursor != 0 || backend.pendingOperation == nil {
+		t.Fatal("discard was not confirmed separately")
+	}
+	model.selectAction()
+	if backend.pendingOperation == nil {
+		t.Fatal("cancel discarded operation")
+	}
+	model.cursor = 1
+	execute(t, model, model.selectAction())
+	if model.screen != roomScreen || model.input.Value() != "new draft" {
+		t.Fatal("retry overwrote a newer draft")
+	}
+	backend.pendingOperation = &client.PendingOperation{Room: testRoom, EventID: testPeer}
+	model.rooms[testRoom].Pending = backend.pendingOperation
+	model.move(discardPendingScreen)
+	model.cursor = 1
+	execute(t, model, model.selectAction())
+	if backend.pendingOperation != nil || !strings.Contains(model.notice, "may still be committed") {
+		t.Fatal("explicit discard did not explain uncertain outcome")
+	}
+}
+
+func TestPendingRestoredWithoutResending(t *testing.T) {
+	model, backend := fixture(t)
+	model.operation = 5
+	model.result(resultMsg{ID: 5, Kind: "join", Value: Joined{Room: testRoom, State: State{Room: testRoom, Name: "Room", WritePolicy: "everyone"}, Pending: &client.PendingOperation{Room: testRoom, EventID: testPeer, Status: "committed"}}})
+	if backend.sentRoom != "" || model.rooms[testRoom].Pending == nil || !strings.Contains(model.notice, "needs review") {
+		t.Fatal("restored pending operation not retained for explicit review")
+	}
+}
+
+func TestPendingRetryKeepsSuccessWhenEscapeIsPressed(t *testing.T) {
+	model, backend := fixture(t)
+	backend.pendingOperation = &client.PendingOperation{Room: testRoom, EventID: testPeer, Status: "uncertain"}
+	model.rooms[testRoom].Pending = backend.pendingOperation
+	model.drafts[testRoom] = "original"
+	model.move(pendingScreen)
+	model.cursor = 1
+	retry := model.selectAction()
+	response := retry()
+	model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	model.Update(response)
+	if model.drafts[testRoom] != "" || model.input.Value() != "" || model.rooms[testRoom].Pending != nil {
+		t.Fatal("Escape lost the successful retry and retained the original draft")
+	}
+}
+func (backend *fakeBackend) RetryPending(_ context.Context, room, identifier string) (map[string]any, error) {
+	if backend.sendErr != nil {
+		return nil, backend.sendErr
+	}
+	backend.pendingOperation = nil
+	return map[string]any{"room": room, "event_id": identifier, "seqno": "1", "kind": "message", "text": "original"}, nil
+}
+func (backend *fakeBackend) DiscardPending(context.Context, string, string) error {
+	backend.pendingOperation = nil
+	return nil
 }
 
 func (backend *fakeBackend) Start() error { return nil }

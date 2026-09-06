@@ -51,6 +51,7 @@ type Config struct {
 	Store           *store.Store
 	RoomKey         ed25519.PrivateKey
 	NodeRole        int32
+	LocalOnly       bool
 	ResolveIdentity IdentityResolver
 }
 
@@ -368,7 +369,7 @@ func (n *Node) Status() control.Status {
 }
 
 func (n *Node) Run(ctx context.Context) error {
-	if n.cfg.Advertise == "" {
+	if !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
 	if n.nodeRole == community.NodeRoleSequencer {
@@ -395,6 +396,17 @@ func (n *Node) Run(ctx context.Context) error {
 				log.Printf("control socket: %v", err)
 			}
 		}()
+	}
+	if n.cfg.LocalOnly {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-n.quicErr:
+			if err == nil {
+				return errors.New("TON QUIC server stopped")
+			}
+			return fmt.Errorf("TON QUIC server: %w", err)
+		}
 	}
 
 	pub, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, n.overlayKey(), n.cfg.OverlayID)

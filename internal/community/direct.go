@@ -4,10 +4,21 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"time"
+	"unicode/utf8"
 )
 
 var ErrRecipient = errors.New("community: invalid direct-message recipient")
+
+const MaxDMCiphertextBytes = MaxDMPlaintextBytes + 12 + 16
+
+func ValidateDMPlaintext(text string) error {
+	if !utf8.ValidString(text) || len(text) > MaxDMPlaintextBytes {
+		return fmt.Errorf("community: direct message must be valid UTF-8 and at most %d bytes", MaxDMPlaintextBytes)
+	}
+	return nil
+}
 
 func (m DirectMessage) toSign() DirectMessageToSign {
 	return DirectMessageToSign{
@@ -64,7 +75,7 @@ func (m DirectMessage) validateFields() error {
 	if bytes.Equal(m.ToKey, Zero256()) || bytes.Equal(m.FromKey, m.ToKey) {
 		return ErrRecipient
 	}
-	if !validUTF8Limit(m.AuthorName, MaxNickBytes) || len(m.Ciphertext) < 28 || len(m.Ciphertext) > MaxMessageBytes {
+	if !validUTF8Limit(m.AuthorName, MaxNickBytes) || len(m.Ciphertext) < 28 || len(m.Ciphertext) > MaxDMCiphertextBytes {
 		return ErrInvalidBody
 	}
 	return nil

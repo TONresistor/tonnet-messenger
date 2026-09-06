@@ -16,13 +16,16 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/clientrpc"
 	"github.com/TONresistor/tonnet-messenger/internal/clienttui"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
 var Version = "dev"
 
 type options struct {
-	stateDir  string
-	configURL string
+	stateDir      string
+	configURL     string
+	directAddress string
+	directKey     string
 }
 
 func Execute() {
@@ -54,6 +57,8 @@ func newRoot() *cobra.Command {
 	}
 	root.PersistentFlags().StringVar(&opts.stateDir, "state", "", "client state directory")
 	root.PersistentFlags().StringVar(&opts.configURL, "config", "https://ton-blockchain.github.io/global.config.json", "TON global config URL")
+	root.PersistentFlags().StringVar(&opts.directAddress, "direct", "", "direct TON QUIC address for local testing")
+	root.PersistentFlags().StringVar(&opts.directKey, "direct-key", "", "direct node Ed25519 public key")
 	root.AddCommand(newRun(opts), newIdentity(opts), newRoom(opts), newDM(opts), &cobra.Command{
 		Use: "version", Args: cobra.NoArgs, Run: func(*cobra.Command, []string) { fmt.Println(Version) },
 	})
@@ -62,7 +67,23 @@ func newRoot() *cobra.Command {
 
 func open(cmd *cobra.Command, opts *options) (*client.Client, context.Context, context.CancelFunc, error) {
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-	c, err := client.Open(ctx, client.Config{StateDir: opts.stateDir, ConfigURL: opts.configURL})
+	var directPublic []byte
+	if opts.directAddress != "" || opts.directKey != "" {
+		if opts.directAddress == "" || opts.directKey == "" {
+			stop()
+			return nil, nil, nil, fmt.Errorf("--direct and --direct-key must be provided together")
+		}
+		var err error
+		directPublic, err = community.ParseRoomKeyText(opts.directKey)
+		if err != nil {
+			stop()
+			return nil, nil, nil, fmt.Errorf("invalid --direct-key: %w", err)
+		}
+	}
+	c, err := client.Open(ctx, client.Config{
+		StateDir: opts.stateDir, ConfigURL: opts.configURL,
+		DirectAddress: opts.directAddress, DirectPublic: directPublic,
+	})
 	if err != nil {
 		stop()
 		return nil, nil, nil, err
@@ -147,6 +168,7 @@ func newIdentity(opts *options) *cobra.Command {
 
 func newRoom(opts *options) *cobra.Command {
 	parent := &cobra.Command{Use: "room", Short: "Join and use rooms"}
+	parent.AddCommand(newPendingCommands(opts)...)
 	parent.AddCommand(
 		&cobra.Command{Use: "list", Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, _ []string) error {
 			return withClient(cmd, opts, func(c *client.Client) error {

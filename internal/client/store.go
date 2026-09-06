@@ -34,7 +34,7 @@ type clientQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-const clientSchemaVersion = 1
+const clientSchemaVersion = 2
 
 func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -122,6 +122,13 @@ CREATE TABLE IF NOT EXISTS room_events (
     UNIQUE(room_key, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_client_events_message ON room_events(room_key, message_id);
+CREATE TABLE IF NOT EXISTS pending_operations (
+    room_key BLOB PRIMARY KEY REFERENCES joined_rooms(room_key),
+    event_id BLOB NOT NULL CHECK(length(event_id)=32),
+    genesis_hash BLOB NOT NULL CHECK(length(genesis_hash)=32),
+    raw_proposal BLOB NOT NULL,
+    raw_commit BLOB
+);
 `); err != nil {
 		return fmt.Errorf("client store migration: %w", err)
 	}
@@ -482,7 +489,10 @@ func (s *clientStore) appendEvent(ctx context.Context, roomKey []byte, event com
 		if !bytes.Equal(existingRaw, raw) {
 			return false, fmt.Errorf("client store: conflicting event at seqno %d", event.Seqno)
 		}
-		return false, nil
+		if _, err := tx.ExecContext(ctx, "UPDATE pending_operations SET raw_commit=? WHERE room_key=? AND event_id=?", raw, roomKey, id); err != nil {
+			return false, err
+		}
+		return false, tx.Commit()
 	}
 	if event.Seqno != head+1 || !bytes.Equal(event.PreviousHash, headHash) {
 		return false, fmt.Errorf("client store: non-contiguous event %d after %d", event.Seqno, head)
@@ -491,6 +501,9 @@ func (s *clientStore) appendEvent(ctx context.Context, roomKey []byte, event com
 		return false, err
 	}
 	if _, err := tx.ExecContext(ctx, "UPDATE joined_rooms SET head_seqno=?,head_hash=? WHERE room_key=?", event.Seqno, hash, roomKey); err != nil {
+		return false, err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE pending_operations SET raw_commit=? WHERE room_key=? AND event_id=?", raw, roomKey, id); err != nil {
 		return false, err
 	}
 	if err := tx.Commit(); err != nil {

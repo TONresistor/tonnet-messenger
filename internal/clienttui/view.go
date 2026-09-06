@@ -68,7 +68,12 @@ func (model *Model) choices() []choice {
 		}
 		return append(choices, choice{"Back", "back"})
 	case detailsScreen:
-		return []choice{{"Back to conversation", "back"}, {"Leave room", "leave"}}
+		return []choice{{"Back to conversation", "back"}, {"Pending operation", "pending"}, {"Leave room", "leave"}}
+	case pendingScreen:
+		if model.ensureRoom(model.room).Pending == nil {
+			return []choice{{"Back to conversation", "back"}}
+		}
+		return []choice{{"Back to conversation", "back"}, {"Retry exact operation", "retry"}, {"Discard tracking", "discard"}}
 	case directsScreen:
 		choices := []choice{{"New conversation", "new"}}
 		keys := make([]string, 0, len(model.directs))
@@ -93,7 +98,7 @@ func (model *Model) choices() []choice {
 		return append(choices, choice{"Back", "back"})
 	case domainRecordScreen:
 		return []choice{{"Verify DNS record", "verify"}, {"Back", "back"}}
-	case leaveScreen, clearDomainScreen:
+	case leaveScreen, clearDomainScreen, discardPendingScreen:
 		return []choice{{"Cancel", "cancel"}, {"Confirm", "yes"}}
 	}
 	return nil
@@ -228,6 +233,18 @@ func (model *Model) View() tea.View {
 		}
 	case identityScreen:
 		parts = append(parts, "My identity", "Name: "+line(model.identity.Name), "Key: "+line(model.identity.Key), "Domain: "+line(model.identity.Domain))
+	case pendingScreen:
+		pending := model.ensureRoom(model.room).Pending
+		if pending == nil {
+			parts = append(parts, "No pending operation.")
+		} else {
+			parts = append(parts, "Pending operation · "+line(pending.Status), "Event: "+short(pending.EventID), "Retry reuses the exact signed proposal.")
+			if text, ok := pending.Event["text"].(string); ok {
+				parts = append(parts, line(text))
+			}
+		}
+	case discardPendingScreen:
+		parts = append(parts, "Discard tracking?", "This does not cancel a possible commit. Sending again may duplicate it.")
 	case domainRecordScreen:
 		parts = append(parts, model.viewport.View())
 		foot = "PgUp/PgDown Scroll · Enter Select · Esc Back"

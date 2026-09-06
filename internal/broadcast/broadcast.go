@@ -53,9 +53,12 @@ func init() {
 }
 
 var (
-	ErrBadSource    = errors.New("broadcast: source is not a 32-byte ed25519 key")
-	ErrBadFlags     = errors.New("broadcast: unknown flags")
-	ErrBadSignature = errors.New("broadcast: signature does not verify")
+	ErrBadSource      = errors.New("broadcast: source is not a 32-byte ed25519 key")
+	ErrBadFlags       = errors.New("broadcast: unknown flags")
+	ErrBadSignature   = errors.New("broadcast: signature does not verify")
+	ErrBadCertificate = errors.New("broadcast: certificate must be empty")
+	ErrTooLarge       = errors.New("broadcast: boxed wrapper exceeds 4096 bytes")
+	ErrStale          = errors.New("broadcast: timestamp outside live window")
 )
 
 func KeyID(pub ed25519.PublicKey) ([]byte, error) {
@@ -109,7 +112,7 @@ func (b Broadcast) SourceKey() (ed25519.PublicKey, error) {
 		}
 		return v.Key, nil
 	case *keys.PublicKeyED25519:
-		if len(v.Key) != ed25519.PublicKeySize {
+		if v == nil || len(v.Key) != ed25519.PublicKeySize {
 			return nil, ErrBadSource
 		}
 		return v.Key, nil
@@ -148,6 +151,35 @@ func (b Broadcast) Verify() error {
 		return ErrBadSignature
 	}
 	return nil
+}
+
+func (b Broadcast) VerifyLive(now time.Time) error {
+	switch certificate := b.Certificate.(type) {
+	case tonoverlay.CertificateEmpty:
+	case *tonoverlay.CertificateEmpty:
+		if certificate == nil {
+			return ErrBadCertificate
+		}
+	default:
+		return ErrBadCertificate
+	}
+	if len(b.Data) > MaxSize {
+		return ErrTooLarge
+	}
+	if _, err := b.SourceKey(); err != nil {
+		return err
+	}
+	encoded, err := tl.Serialize(b, true)
+	if err != nil {
+		return err
+	}
+	if len(encoded) > MaxSize {
+		return ErrTooLarge
+	}
+	if !Fresh(b.Date, now) {
+		return ErrStale
+	}
+	return b.Verify()
 }
 
 func Fresh(date int32, now time.Time) bool {

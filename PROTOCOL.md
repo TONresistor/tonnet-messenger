@@ -11,8 +11,6 @@ For installation and commands, see [README.md](README.md).
 [DNS](#5-ton-dns) · [DMs](#6-direct-messages) ·
 [Client API](#7-client-api) · [Limits](#8-limits-and-errors) · [TL schema](#9-tl-schema)
 
-**MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT** and **MAY** follow RFC 2119 and RFC 8174.
-
 ## 1. Scope and roles
 
 Version 0.4 provides persistent public rooms, verified history, moderation,
@@ -35,6 +33,13 @@ identity or an identity-backup protocol.
 Legacy volatile rooms, name-derived overlays, V1 community objects, wallet
 attribution, device binding and session challenges are not accepted.
 There is no automatic migration from legacy rooms.
+
+Messages are off-chain; TON provides discovery and DNS names, not message
+consensus. Verification proves the signatures and consistency of the observed
+chain. It does not prove global freshness, prevent censorship or stop a
+sequencer from signing different branches for different clients. A self-signed
+relay announcement authenticates its node key, not its honesty or approval by
+the room owner. Public overlays provide no Sybil-resistance guarantee.
 
 Incompatible changes to serialization, signatures, identifiers, authorization
 or event semantics require a new protocol version. Changing the required room
@@ -70,6 +75,12 @@ Genesis fixes the room key, sequencer key, creation time, initial metadata,
 write policy and initial admins. It is signed by the room key. Clients MUST pin
 genesis and reject a conflicting genesis for the same room.
 
+`genesis_hash = H(TL(roomGenesisV2))` and
+`commit_hash = H(TL(committedEventV2))`, including their signatures.
+Creation and commit times must be positive Unix seconds. A genesis more than
+300 seconds in the future is rejected; historical proposal timestamps are not
+compared with the current clock.
+
 Resetting a user identity creates a new principal: roles do not transfer and
 the domain association is cleared. The reference client preserves the local
 display name and public-room cache, then reconnects using the new key.
@@ -88,6 +99,15 @@ A known node ADNL ID may be used as a discovery hint. It MUST NOT replace
 verification against the room key. Ephemeral ADNL keys may be used for DHT
 access; classic ADNL MUST NOT carry Messenger room traffic.
 
+Nodes publish `overlay.nodes` under
+`dht.key{id=overlay_id, name="nodes", idx=0}`, with `pub.overlay{name=room_key}`
+and `dht.updateRule.overlayNodes`. Each `overlay.node` binds the node public key,
+overlay ID and Unix-second version; its signature covers boxed
+`overlay.node.toSign{id=keyid(node_public_key), overlay=overlay_id, version}`.
+Verify these signatures and overlay IDs before resolving node addresses through
+the signed ADNL `address` record. The reference implementation accepts node
+versions at most ten minutes old or sixty seconds in the future.
+
 ### Connection profile
 
 | Property | Required value |
@@ -96,6 +116,14 @@ access; classic ADNL MUST NOT carry Messenger room traffic.
 | Authentication | TLS 1.3 raw public keys (RFC 7250), mutual Ed25519 |
 | Framing | Native TON `quic.query`, `quic.answer`, `quic.message` |
 | Endpoint identity | Hash of the peer public key equals the expected ADNL ID |
+
+TON SNI is `<first 32 hex characters>.<last 32 hex characters>.adnl`, using
+the expected node ADNL ID. Each stream carries one boxed request; a query's
+boxed answer uses the same stream. FIN terminates the object. A message has
+no application response. There is no additional length prefix, query ID or
+`overlay.query`/`overlay.message` envelope around the Messenger payload.
+The endpoint serves one room, so read queries have no room selector. A generic
+TON node does not implement the application-specific `tonnet.*` objects.
 
 This is TON QUIC, not HTTP/3. There is no application-level hello or device
 binding. Clients MUST reject wrong-key endpoints and MUST NOT downgrade to
@@ -124,6 +152,10 @@ NOT set proposal timestamps. Calibration may be cached for five minutes and
 MUST be invalidated on session or identity changes. If the sequencer cannot be
 reached, reads may remain available but writes fail with `SEQUENCER_UNAVAILABLE`.
 
+Calibration fails with `CLOCK_SKEW` if sequencer time differs from the local
+clock by more than 300 seconds. Broadcast freshness and DM timestamps use the
+receiver's local clock, not this proposal-time calibration.
+
 ## 4. Canonical history
 
 ### Proposal and commit
@@ -143,7 +175,9 @@ author_signature = Ed25519(identity_private_key, proposal_digest)
 For a direct leaf, the author key MUST equal the authenticated peer key.
 A verified relay may forward the original signed proposal.
 
-The sequencer MUST, in order:
+First, the sequencer MUST return the existing commit for an exact proposal
+already in durable history. Current timestamp, DNS and permission checks do
+not apply to this duplicate. For a new proposal, the sequencer MUST, in order:
 
 1. Verify the room, signature, timestamp, domain claim and authorization.
 2. Reject a reused author nonce within the retention window.
@@ -153,6 +187,11 @@ The sequencer MUST, in order:
 
 Repeating the exact proposal MUST return the existing commit without consuming
 another sequence number. Live timestamp checks MUST NOT be reapplied to history.
+
+Clients and forwarding relays MUST compare the returned commit's proposal ID
+with the submitted proposal ID before treating either `submitAcceptedV2` or
+`submitDuplicateV2` as success. A valid commit for another proposal is a protocol
+error, not a successful submission.
 
 Genesis, room state and commits are signed with `room_key` over
 `H(TL(the corresponding .toSign object))`. Commits bind the proposal hash;
@@ -174,6 +213,14 @@ The holder of `room_key` is the non-delegated owner.
 Roles target identity public keys. Admins, moderators and pins MUST be unique
 and canonically sorted in signed state.
 
+Keys are sorted lexicographically by their raw bytes; pins are sorted
+numerically. Initial admins follow the same key ordering. The owner cannot
+receive or lose a delegated role. Granting an existing role, revoking an absent
+role or pinning an already-pinned message is rejected. Admin and moderator are
+independent roles: an identity may hold both. Pins reference existing messages;
+unpinning requires the message to be pinned. Room names are nonempty and contain
+no control characters; descriptions cannot contain NUL. All text is valid UTF-8.
+
 ### Verification and replication
 
 Clients and relays MUST verify genesis, proposal and commit signatures,
@@ -191,6 +238,8 @@ and verification rules.
 
 Limits are defined once in [§8](#8-limits-and-errors). A batch item exceeding the
 remaining answer budget receives code 9 without invalidating earlier items.
+All subsequent batch items also receive code 9. Successful items use code 0
+and contain the boxed read result; failed items contain no result data.
 
 Relays MUST persist only verified canonical data and periodically reconcile
 with the sequencer. `ready=true` requires their signed state to cover the
@@ -212,6 +261,13 @@ Aliases use standard `dns_text#1eda` records:
 
 Values have no prefix or wrapper. DNS is an alias, never the canonical identity.
 
+This refers to the text value, not its on-chain encoding: the record remains
+`dns_text#1eda` followed by TL-B `Text` (chunk count and length-prefixed chunks),
+not a snake string. Local inputs are trimmed and lowercased. Accepted names end
+in `.ton`, have nonempty labels containing only `a-z`, `0-9` and `-`, and have
+no leading or trailing hyphen in a label. Signed claims must already use this
+normalized form.
+
 When a proposal includes `author_domain`, it MUST be lowercase and the
 sequencer MUST resolve `msg_id` to exactly `author_key` before committing.
 Positive results may be cached for five minutes. Invalid or unavailable claims
@@ -220,6 +276,15 @@ are rejected; later DNS changes do not rewrite history or transfer roles.
 Domain-link helpers prepare a transaction to the domain NFT contract.
 Only its owner's wallet authorizes that transaction. The client confirms the
 association by resolving the published record, not by trusting a QR scan.
+
+**Resolver trust:** the reference client and server use the configured TON
+liteservers. The SDK's default proof policy checks account-state proofs but
+does not anchor the complete masterchain proof chain, and the DNS getter result
+is computed remotely rather than verified by local TVM execution. A resolved
+alias therefore depends on these liteservers and the selected configuration.
+Messenger signatures authenticate the resulting key, not the user's intended
+name independently of that resolver. Historical domain claims attest what the
+sequencer accepted then; they are not fresh proofs of domain ownership.
 
 ## 6. Direct messages
 
@@ -234,6 +299,11 @@ aad    = room_id || from_key || to_key
 box    = nonce(12) || AES-256-GCM(key, plaintext, aad) || tag(16)
 ```
 
+Here the GCM term denotes ciphertext without the separately shown tag.
+The nonce is cryptographically random. Plaintext is valid UTF-8, at most 1400
+bytes; the complete box is 28–1428 bytes. Validate plaintext before encryption
+and after decryption. `dm_id = H(TL(directMessageV2))`, including its signature.
+
 Ed25519 identities use the TON Ed25519-to-X25519 mapping. The sender signs
 `H(TL(directMessageV2.toSign{room_id, from_key, to_key, author_name,
 timestamp, ciphertext}))`. The outer broadcast source and signature MUST match
@@ -246,7 +316,9 @@ provided.
 ## 7. Client API
 
 The standalone client owns keys, networking, discovery, verification and cache.
-Applications MUST use that boundary instead of reimplementing cryptography.
+Applications integrating the reference client should use that boundary rather
+than duplicate its cryptography. Independent wire-protocol implementations are
+allowed; this API describes the reference engine, not a mandatory Go dependency.
 The terminal UI and command-line interface use the same client engine.
 
 ### JSON-RPC transport
@@ -281,6 +353,9 @@ Optional parameters are marked `?`; no-argument methods accept an empty object.
 | `room.join` | `reference, bootstrap?` | `room, state, connection, presence, timeline` |
 | `room.leave` | `reference` | `left` |
 | `room.getState` | `room` | Verified state |
+| `room.getPending` | `room` | `pending` (operation or `null`) |
+| `room.retryPending` | `room, event_id` | Original committed event |
+| `room.discardPending` | `room, event_id` | `discarded` |
 | `room.getTimeline` | `room, before_seqno?, limit?` | `items, has_more` |
 | `room.sendMessage` | `room, text` | Committed event |
 | `room.setMetadata` | `room, name, description` | Committed event |
@@ -297,6 +372,31 @@ operator-only and are not part of the client API.
 `client.info` reports `protocol: "0.4.0"`, `transport: "stdio-jsonrpc"`
 and `room_transport: "ton-quic"`.
 
+### Shared JSON objects
+
+All fields below are required unless marked `?`. Numbers in sequence/ID fields
+remain decimal strings; timestamps are Unix-second numbers.
+
+| Object | Fields |
+| --- | --- |
+| Identity | `key, name, domain?` |
+| State | `room, name, description, write_policy, admins[], moderators[], pinned_messages[], revision_seqno, latest_seqno` |
+| Connection | `node_role` (`sequencer` or `relay`, derived from the authenticated key) |
+| Presence | `room, online_users` |
+| Timeline | `items[]` (events), `has_more` |
+| Room list entry | `room, reference, name, connected` |
+| Event | `room, event_id, seqno, message_id, committed_at, actor, kind`, plus the fields below |
+| DM | `room, id, peer_key, text, timestamp, direction, author_name, domain?` |
+| Pending operation | `room, event_id, status` (`uncertain` or `committed`), `timestamp, event` (proposal preview, not a committed event) |
+
+Event `actor` contains `key, name, domain` (empty when absent). Message events
+add `text`; pin/unpin add `target_message_id`; metadata adds `name, description`;
+write-policy adds `write_policy`; role events add `subject_key`. Role kinds are
+`admin-grant`, `admin-revoke`, `moderator-grant`, `moderator-revoke`.
+Pending previews contain `actor, kind` and the corresponding event fields, but
+no sequence numbers, commit time, room or event ID (the latter two are on the
+pending object). They do not prove that a message was committed.
+
 ### Notifications and state
 
 | Notification | Data |
@@ -312,11 +412,44 @@ and `room_transport: "ton-quic"`.
 `direction` is `sent` or `received`. JSON `connection.node_role` is
 `sequencer` or `relay`; the TL role values are 1 and 2 respectively.
 
+DM `sent` means submitted to the connected node, not delivered to the recipient.
+An outgoing DM's optional domain is the recipient alias used for resolution.
+An incoming DM's optional domain is learned from historical public messages,
+not freshly resolved or contained in the signed DM.
+
 Each state directory contains one private `identity.key` and a versioned
 SQLite cache. Running sessions reconnect saved rooms and persist verified
 events before notifying consumers. Consumers MUST keep reading notifications
 while operations are in progress. `room.leave` removes membership and its
 cached history; navigating an application's screens need not leave a room.
+
+### Pending operations
+
+The client durably journals each canonical proposal before transmission, with
+its identity and pinned genesis. There is at most one unacknowledged operation
+per room; DMs are not journaled. The journal is not an offline sending queue.
+
+A timeout, broken connection or untrustworthy reply leaves the result unknown.
+Relayed rejections are not signed by the sequencer. A rejection can be treated
+as definitive only on the first attempt directly against the authenticated
+sequencer, excluding ambiguous persistence, availability and canonical-state
+errors. Once an attempt is uncertain, a later rejection does not prove the
+absence of an earlier commit. Unknown rejection codes are protocol errors.
+
+Retries use the exact original proposal, nonce, timestamp and signature.
+Submitting the same event body while it is pending retries that proposal;
+another body is blocked. Reconnection only reconciles verified history and
+never retransmits automatically. A verified matching commit atomically records
+a `committed` receipt in the journal, retained until the caller retrieves the
+successful result or explicitly discards tracking.
+
+`retryPending` requires a connected room and the current pending event ID.
+An expired timestamp is never refreshed: the sequencer may still return the
+durable duplicate, otherwise the operation remains uncertain. `discardPending`
+requires the matching ID and does not cancel any possible commit. Room leave
+and identity reset require resolving or explicitly discarding pending tracking
+first. Successful calls acknowledge the journal; this is not an exactly-once
+delivery guarantee for consumers that lose a successful JSON-RPC response.
 
 Timeline pages are in ascending display order. To load older events, pass the
 first item's `seqno` as `before_seqno`. Join/timeline responses may return
@@ -327,6 +460,16 @@ JSON-RPC errors use `error.code`, `error.message` and symbolic
 `error.data.code`. Wire rejection codes below are a separate namespace.
 Clients MUST distinguish a confirmed rejection from an uncertain send outcome;
 a timeout is not proof that nothing was committed.
+
+Operation errors include `data.room`, `data.event_id` and `data.outcome`
+(`unknown`, or `committed` when a confirmed receipt blocks a new operation):
+`SEND_UNCERTAIN` (-32032), `PENDING_OPERATION`
+(-32033) and `PROTOCOL_ERROR` (-32034). A protocol error without an associated
+submission has no operation metadata. Other symbolic errors include
+`INVALID_ARGUMENT`, `NOT_CONNECTED`, `ROOM_UNAVAILABLE`, `TIMEOUT`,
+`SEQUENCER_UNAVAILABLE`, `CLOCK_SKEW`, `PERMISSION_DENIED`,
+`INVALID_IDENTITY_DOMAIN`, `UNKNOWN_MESSAGE`, `ROLE_CONFLICT`, `LIMIT_EXCEEDED`
+and `ROOM_REJECTED`; unclassified local failures use `OPERATION_FAILED`.
 
 ## 8. Limits and errors
 
@@ -343,7 +486,7 @@ a timeout is not proof that nothing was committed.
 | QUIC answer object, including framing | 4 MiB |
 | Incoming QUIC streams per peer | 4 |
 | JSON-RPC line, including newline | 64 KiB |
-| Broadcast wrapper data / freshness | 4096 bytes / ±60 seconds |
+| Complete boxed broadcast wrapper / freshness | 4096 bytes / ±60 seconds |
 | Live proposal and DM timestamp skew | ±300 seconds |
 | Author nonce retention | 24 hours |
 

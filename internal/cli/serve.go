@@ -21,6 +21,7 @@ import (
 func newServeCmd() *cobra.Command {
 	var stateDir, listen, advertise, cfgURL string
 	var maxLeaves int
+	var localOnly bool
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the authoritative sequencer for one persistent room",
@@ -31,15 +32,19 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 			defer authority.Store.Close()
-			advertised, advertiseErr := resolveAdvertise(cmd.Context(), advertise, listen)
-			if advertiseErr != nil {
-				return fmt.Errorf("TON QUIC advertise address: %w", advertiseErr)
+			advertised := ""
+			if !localOnly {
+				var advertiseErr error
+				advertised, advertiseErr = resolveAdvertise(cmd.Context(), advertise, listen)
+				if advertiseErr != nil {
+					return fmt.Errorf("TON QUIC advertise address: %w", advertiseErr)
+				}
 			}
 			runtime, err := node.New(node.Config{
 				Key: authority.NodePrivate, Listen: listen, Advertise: advertised,
 				ConfigURL: cfgURL, Socket: authority.Paths.Socket, MaxLeaves: maxLeaves,
 				Genesis: &authority.Genesis, Store: authority.Store,
-				RoomKey: authority.RoomPrivate, NodeRole: community.NodeRoleSequencer,
+				RoomKey: authority.RoomPrivate, NodeRole: community.NodeRoleSequencer, LocalOnly: localOnly,
 			})
 			if err != nil {
 				return err
@@ -60,6 +65,7 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&advertise, "advertise", "", "public TON QUIC ip:port to publish (default: autodetect)")
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
 	cmd.Flags().IntVar(&maxLeaves, "max-leaves", node.DefaultMaxLeaves, "maximum connected member leaves (1..2048)")
+	cmd.Flags().BoolVar(&localOnly, "local", false, "run without DHT publication for direct local testing")
 	_ = cmd.MarkFlagRequired("state")
 	return cmd
 }

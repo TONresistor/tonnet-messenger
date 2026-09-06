@@ -71,10 +71,11 @@ type Connection struct {
 }
 
 type Joined struct {
-	Room       string   `json:"room"`
-	State      State    `json:"state"`
-	Presence   Presence `json:"presence"`
-	Timeline   Page     `json:"timeline"`
+	Pending    *client.PendingOperation `json:"-"`
+	Room       string                   `json:"room"`
+	State      State                    `json:"state"`
+	Presence   Presence                 `json:"presence"`
+	Timeline   Page                     `json:"timeline"`
 	Connection struct {
 		Role string `json:"node_role"`
 	} `json:"connection"`
@@ -89,6 +90,9 @@ type Backend interface {
 	Leave(context.Context, string) error
 	Timeline(context.Context, string, int64) (Page, error)
 	Send(context.Context, string, string) (Event, error)
+	GetPending(context.Context, string) (*client.PendingOperation, error)
+	RetryPending(context.Context, string, string) (map[string]any, error)
+	DiscardPending(context.Context, string, string) error
 	SendDirect(context.Context, string, string, string) (Direct, error)
 	SetName(context.Context, string) (client.Identity, error)
 	PrepareDomainLink(context.Context, string) (tondns.PreparedLink, error)
@@ -124,7 +128,12 @@ func (backend clientBackend) Join(ctx context.Context, reference string) (Joined
 	if err != nil {
 		return Joined{}, err
 	}
-	return decode[Joined](value)
+	joined, err := decode[Joined](value)
+	if err != nil {
+		return Joined{}, err
+	}
+	joined.Pending, err = backend.GetPending(ctx, joined.Room)
+	return joined, err
 }
 
 func (backend clientBackend) Timeline(ctx context.Context, room string, before int64) (Page, error) {

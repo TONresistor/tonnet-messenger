@@ -352,6 +352,33 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return fail(err)
 		}
 		return value, nil
+	case "room.getPending", "room.retryPending", "room.discardPending":
+		var parameters struct {
+			Room    string `json:"room"`
+			EventID string `json:"event_id"`
+		}
+		if failure := params(&parameters); failure != nil {
+			return nil, failure
+		}
+		switch method {
+		case "room.getPending":
+			pending, err := s.Client.GetPending(ctx, parameters.Room)
+			if err != nil {
+				return fail(err)
+			}
+			return map[string]any{"pending": pending}, nil
+		case "room.retryPending":
+			value, err := s.Client.RetryPending(ctx, parameters.Room, parameters.EventID)
+			if err != nil {
+				return fail(err)
+			}
+			return value, nil
+		default:
+			if err := s.Client.DiscardPending(ctx, parameters.Room, parameters.EventID); err != nil {
+				return fail(err)
+			}
+			return map[string]any{"discarded": true}, nil
+		}
 	case "room.getTimeline":
 		var p struct {
 			Room   string `json:"room"`
@@ -483,11 +510,31 @@ func (s *Server) write(output io.Writer, value any) error {
 }
 
 func classify(err error) *rpcError {
+	var operation *client.OperationError
+	if errors.As(err, &operation) {
+		outcome := operation.Outcome
+		if outcome == "" {
+			outcome = "unknown"
+		}
+		numeric := -32032
+		if operation.Code == "PENDING_OPERATION" {
+			numeric = -32033
+		}
+		if operation.Code == "PROTOCOL_ERROR" {
+			numeric = -32034
+		}
+		return &rpcError{Code: numeric, Message: operation.Error(), Data: map[string]any{
+			"code": operation.Code, "room": operation.Room, "event_id": operation.EventID, "outcome": outcome,
+		}}
+	}
 	code := "OPERATION_FAILED"
 	numeric := -32000
 	message := err.Error()
 	var rejected *client.RejectedError
 	if errors.As(err, &rejected) {
+		if rejected.Code < community.RejectMalformedRequest || rejected.Code > community.RejectInvalidIdentityDomain {
+			return &rpcError{Code: -32034, Message: message, Data: map[string]any{"code": "PROTOCOL_ERROR"}}
+		}
 		numeric = -32010 - int(rejected.Code)
 		switch rejected.Code {
 		case community.RejectPermissionDenied:

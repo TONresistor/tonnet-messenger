@@ -140,6 +140,76 @@ func TestClientStoreRejectsFutureSchemaVersion(t *testing.T) {
 	}
 }
 
+func TestOpenValidatesDirectEndpointPair(t *testing.T) {
+	_, publicKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, config := range []Config{
+		{StateDir: t.TempDir(), DirectAddress: "127.0.0.1:17400"},
+		{StateDir: t.TempDir(), DirectPublic: publicKey},
+		{StateDir: t.TempDir(), DirectAddress: "missing-port", DirectPublic: publicKey},
+		{StateDir: t.TempDir(), DirectAddress: "127.0.0.1:17400", DirectPublic: []byte("short")},
+	} {
+		if instance, err := Open(context.Background(), config); err == nil {
+			instance.Close()
+			t.Fatalf("invalid direct config accepted: %#v", config)
+		}
+	}
+}
+
+func TestClientStoreMigratesPendingJournalWithoutLosingHistory(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "client.db")
+	database, err := openClientStore(ctx, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	roomKey, nodeKey := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	genesis, err := community.NewGenesis(roomKey, nodeKey, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := community.SignProposal(roomKey, genesis.NodeKey, community.EventProposal{RoomID: genesis.RoomKey, Nonce: make([]byte, 32), Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: "preserved"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := community.SignCommit(roomKey, proposal, 1, community.Zero256(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.appendEvent(ctx, genesis.RoomKey, event); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, "DROP TABLE pending_operations; UPDATE client_meta SET value='1' WHERE key='schema_version'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := openClientStore(ctx, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	if found, err := restored.hasEvent(ctx, genesis.RoomKey, event); err != nil || !found {
+		t.Fatalf("history lost during migration: %v", err)
+	}
+	var version string
+	if err := restored.db.QueryRowContext(ctx, "SELECT value FROM client_meta WHERE key='schema_version'").Scan(&version); err != nil || version != "2" {
+		t.Fatalf("version=%s err=%v", version, err)
+	}
+	if _, err := restored.savePending(ctx, genesis, proposal); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestClientOpenRepairsDerivedCacheButPinsGenesis(t *testing.T) {
 	ctx := context.Background()
 	stateDir := t.TempDir()

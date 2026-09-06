@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,8 +40,10 @@ var (
 )
 
 type Config struct {
-	StateDir  string
-	ConfigURL string
+	StateDir      string
+	ConfigURL     string
+	DirectAddress string
+	DirectPublic  []byte
 }
 
 type Notification struct {
@@ -63,14 +66,16 @@ type JoinResult struct {
 }
 
 type Client struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stateDir  string
-	configURL string
-	keyPath   string
-	key       ed25519.PrivateKey
-	store     *clientStore
-	lock      *stateLock
+	ctx           context.Context
+	cancel        context.CancelFunc
+	stateDir      string
+	configURL     string
+	directAddress string
+	directPublic  ed25519.PublicKey
+	keyPath       string
+	key           ed25519.PrivateKey
+	store         *clientStore
+	lock          *stateLock
 
 	mu            sync.RWMutex
 	rooms         map[string]*roomHandle
@@ -81,6 +86,7 @@ type Client struct {
 	closed        bool
 	identityEpoch uint64
 	identityOps   sync.Mutex
+	submissionMu  sync.RWMutex
 	notifyMu      sync.Mutex
 	notifyWG      sync.WaitGroup
 	notifyClosed  bool
@@ -98,6 +104,7 @@ type roomHandle struct {
 	connectMu       sync.Mutex
 	historyMu       sync.Mutex
 	clockMu         sync.Mutex
+	submitMu        sync.Mutex
 	session         *replica.Session
 	sessionEpoch    uint64
 	state           community.RoomStateResult
@@ -129,6 +136,17 @@ type roomIdentitySnapshot struct {
 }
 
 func Open(ctx context.Context, cfg Config) (*Client, error) {
+	if (cfg.DirectAddress == "") != (len(cfg.DirectPublic) == 0) {
+		return nil, fmt.Errorf("direct address and direct public key must be provided together")
+	}
+	if cfg.DirectAddress != "" {
+		if _, _, err := net.SplitHostPort(cfg.DirectAddress); err != nil {
+			return nil, fmt.Errorf("invalid direct address: %w", err)
+		}
+		if len(cfg.DirectPublic) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("direct public key must be 32 bytes")
+		}
+	}
 	if cfg.StateDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -174,6 +192,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	clientCtx, cancel := context.WithCancel(ctx)
 	c := &Client{
 		ctx: clientCtx, cancel: cancel, stateDir: cfg.StateDir, configURL: cfg.ConfigURL,
+		directAddress: cfg.DirectAddress, directPublic: append(ed25519.PublicKey(nil), cfg.DirectPublic...),
 		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 	}
@@ -223,6 +242,8 @@ func (c *Client) Close() error {
 	}
 	c.notifyWG.Wait()
 	close(c.events)
+	c.submissionMu.Lock()
+	defer c.submissionMu.Unlock()
 	err := c.store.Close()
 	releaseStateLock(c.lock)
 	return err
@@ -323,6 +344,11 @@ func (c *Client) ClearDomain(ctx context.Context) (Identity, error) {
 }
 
 func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, error) {
+	c.submissionMu.Lock()
+	defer c.submissionMu.Unlock()
+	if err := c.store.requireNoPending(ctx, nil); err != nil {
+		return Identity{}, err
+	}
 	c.identityOps.Lock()
 	defer c.identityOps.Unlock()
 	c.mu.Lock()
@@ -411,8 +437,13 @@ func (c *Client) Join(ctx context.Context, reference string, bootstrap []byte) (
 }
 
 func (c *Client) Leave(ctx context.Context, reference string) error {
+	c.submissionMu.Lock()
+	defer c.submissionMu.Unlock()
 	roomKey, err := c.resolveRoom(ctx, reference)
 	if err != nil {
+		return err
+	}
+	if err := c.store.requireNoPending(ctx, roomKey); err != nil {
 		return err
 	}
 	key := keyText(roomKey)
@@ -503,8 +534,8 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 	if bytes.Equal(from, to) {
 		return nil, fmt.Errorf("cannot send a direct message to this identity")
 	}
-	if len([]byte(text)) > community.MaxDMPlaintextBytes {
-		return nil, fmt.Errorf("direct message exceeds %d bytes", community.MaxDMPlaintextBytes)
+	if err := community.ValidateDMPlaintext(text); err != nil {
+		return nil, err
 	}
 	session := snapshot.session
 	box, err := dm.SealForRoom(handle.key, key, ed25519.PublicKey(to), []byte(text))
@@ -544,13 +575,35 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 }
 
 func (c *Client) submit(ctx context.Context, roomText string, body any) (map[string]any, error) {
+	c.submissionMu.RLock()
+	defer c.submissionMu.RUnlock()
 	handle, err := c.connectedRoom(roomText)
 	if err != nil {
 		return nil, err
 	}
+	handle.submitMu.Lock()
+	defer handle.submitMu.Unlock()
 	snapshot, err := c.snapshotRoomIdentity(handle)
 	if err != nil {
 		return nil, err
+	}
+	pending, err := c.store.pendingOperation(ctx, handle.key)
+	if err != nil {
+		return nil, err
+	}
+	if pending != nil {
+		wanted, err := community.HashBoxed(body)
+		if err != nil {
+			return nil, err
+		}
+		existing, err := community.HashBoxed(pending.Proposal.Body)
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(wanted, existing) {
+			return c.sendPending(ctx, handle, snapshot, pending, false)
+		}
+		return nil, &OperationError{Code: "PENDING_OPERATION", Room: roomText, EventID: keyText(pending.ID), Outcome: pending.outcome(), Cause: errors.New("resolve the previous operation before sending another")}
 	}
 	key, name, domain := snapshot.key, snapshot.name, snapshot.domain
 	session := snapshot.session
@@ -569,29 +622,11 @@ func (c *Client) submit(ctx context.Context, roomText string, body any) (map[str
 	if err != nil {
 		return nil, err
 	}
-	var response any
-	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = session.Peer.Query(queryCtx, community.SubmitEvent{Proposal: proposal}, &response)
-	cancel()
+	pending, err = c.store.savePending(ctx, session.Genesis, proposal)
 	if err != nil {
 		return nil, err
 	}
-	var event community.CommittedEvent
-	switch value := response.(type) {
-	case community.SubmitAccepted:
-		event = value.Event
-	case community.SubmitDuplicate:
-		event = value.Event
-	case community.SubmitRejected:
-		return nil, &RejectedError{Code: value.Code, Message: value.Message}
-	default:
-		return nil, fmt.Errorf("unexpected submit response %T", response)
-	}
-	if err := handle.ingestCanonical(ctx, session, snapshot.epoch, event); err != nil {
-		handle.closeSessionIf(session)
-		return nil, err
-	}
-	return eventView(event)
+	return c.sendPending(ctx, handle, snapshot, pending, true)
 }
 
 func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot, error) {
@@ -811,6 +846,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	r.client.mu.RUnlock()
 	session, err := replica.DialRoom(ctx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
+		DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
 	})
 	if err != nil {
 		return err
@@ -985,7 +1021,7 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, 
 		return
 	}
 	wrapper, ok := broadcast.AsBroadcast(serialized)
-	if !ok || wrapper.Flags != 0 || wrapper.Verify() != nil || !broadcast.Fresh(wrapper.Date, time.Now()) {
+	if !ok || wrapper.VerifyLive(time.Now()) != nil {
 		return
 	}
 	source, err := wrapper.SourceKey()
@@ -1013,6 +1049,9 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, 
 	}
 	plain, err := dm.OpenForRoom(r.key, identity, ed25519.PublicKey(direct.FromKey), direct.Ciphertext)
 	if err != nil {
+		return
+	}
+	if community.ValidateDMPlaintext(string(plain)) != nil {
 		return
 	}
 	if !r.isCurrentSession(session, epoch) {

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/client"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
 func TestStdioIdentityAPI(t *testing.T) {
@@ -162,5 +163,42 @@ func TestClassifyAuthoritativeClockErrors(t *testing.T) {
 		if got.Code != test.numeric || got.Data["code"] != test.code {
 			t.Fatalf("classify(%v) = %#v", test.err, got)
 		}
+	}
+}
+
+func TestClassifyUncertainOperations(t *testing.T) {
+	for _, code := range []string{"SEND_UNCERTAIN", "PENDING_OPERATION", "PROTOCOL_ERROR"} {
+		failure := &client.OperationError{Code: code, Room: "room", EventID: "event", Cause: &client.RejectedError{Code: community.RejectSequencerUnavailable, Message: "unavailable"}}
+		classified := classify(failure)
+		if classified.Data["code"] != code || classified.Data["event_id"] != "event" || classified.Data["room"] != "room" || classified.Data["outcome"] != "unknown" {
+			t.Fatalf("operation metadata lost: %#v", classified)
+		}
+	}
+	confirmed := classify(&client.OperationError{Code: "PENDING_OPERATION", Room: "room", EventID: "event", Outcome: "committed", Cause: errors.New("retrieve the confirmed result first")})
+	if confirmed.Data["outcome"] != "committed" {
+		t.Fatal("confirmed receipt presented as unknown")
+	}
+	if classified := classify(&client.RejectedError{Code: 99, Message: "future code"}); classified.Data["code"] != "PROTOCOL_ERROR" {
+		t.Fatalf("unknown code = %#v", classified)
+	}
+}
+
+func TestPendingMethodsPreserveExistingRPC(t *testing.T) {
+	instance, err := client.Open(context.Background(), client.Config{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	server := &Server{Client: instance}
+	parameters := json.RawMessage(`{"room":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","event_id":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`)
+	value, failure := server.dispatch(context.Background(), "room.getPending", parameters)
+	if failure != nil || value.(map[string]any)["pending"].(*client.PendingOperation) != nil {
+		t.Fatalf("pending = %#v %#v", value, failure)
+	}
+	if _, failure := server.dispatch(context.Background(), "room.discardPending", parameters); failure != nil {
+		t.Fatal(failure)
+	}
+	if _, failure := server.dispatch(context.Background(), "room.retryPending", parameters); failure == nil {
+		t.Fatal("retry without connected room accepted")
 	}
 }

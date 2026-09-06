@@ -2,6 +2,7 @@ package clienttui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -33,10 +34,13 @@ const (
 	domainRecordScreen
 	leaveScreen
 	clearDomainScreen
+	pendingScreen
+	discardPendingScreen
 )
 
 type roomView struct {
 	Room
+	Pending  *client.PendingOperation
 	State    State
 	Presence *Presence
 	Role     string
@@ -234,7 +238,7 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, tea.Quit
 		}
 		if key == "esc" {
-			if model.busy && (model.screen == leaveScreen || model.screen == clearDomainScreen) {
+			if model.busy && (model.screen == leaveScreen || model.screen == clearDomainScreen || model.screen == discardPendingScreen || model.screen == pendingScreen) {
 				return model, nil
 			}
 			return model, model.back()
@@ -287,8 +291,10 @@ func (model *Model) back() tea.Cmd {
 	switch model.screen {
 	case roomScreen:
 		return model.move(roomsScreen)
-	case detailsScreen, leaveScreen:
+	case detailsScreen, leaveScreen, pendingScreen:
 		return model.move(roomScreen)
+	case discardPendingScreen:
+		return model.move(pendingScreen)
 	case directScreen, directRoomScreen:
 		return model.move(directsScreen)
 	case recipientScreen:
@@ -340,10 +346,39 @@ func (model *Model) selectAction() tea.Cmd {
 		model.rooms[choice].Unread = 0
 		return tea.Batch(focus, model.loadPage(0), model.join(choice))
 	case detailsScreen:
+		if choice == "pending" {
+			room := model.room
+			return model.command("pending", func(ctx context.Context) (any, error) { return model.backend.GetPending(ctx, room) })
+		}
 		if choice == "leave" {
 			return model.move(leaveScreen)
 		}
 		return model.move(roomScreen)
+	case pendingScreen:
+		pending := model.ensureRoom(model.room).Pending
+		if choice == "discard" && pending != nil {
+			return model.move(discardPendingScreen)
+		}
+		if choice == "retry" && pending != nil {
+			room, identifier := model.room, pending.EventID
+			return model.command("retry-pending", func(ctx context.Context) (any, error) {
+				value, err := model.backend.RetryPending(ctx, room, identifier)
+				if err != nil {
+					return nil, err
+				}
+				return decode[Event](value)
+			})
+		}
+		return model.move(roomScreen)
+	case discardPendingScreen:
+		pending := model.ensureRoom(model.room).Pending
+		if choice != "yes" || pending == nil {
+			return model.move(pendingScreen)
+		}
+		room, identifier := model.room, pending.EventID
+		return model.command("discard-pending", func(ctx context.Context) (any, error) {
+			return room, model.backend.DiscardPending(ctx, room, identifier)
+		})
 	case leaveScreen:
 		if choice != "yes" {
 			return model.move(roomScreen)
@@ -556,11 +591,33 @@ func (model *Model) result(result resultMsg) tea.Cmd {
 		room := model.ensureRoom(joined.Room)
 		room.Name, room.State, room.Presence, room.Role = joined.State.Name, joined.State, &joined.Presence, joined.Connection.Role
 		room.Connected, room.Status, room.Reference = true, "connected", model.retryReference
+		room.Pending = joined.Pending
 		focus := model.move(roomScreen)
 		model.room = joined.Room
 		model.input.SetValue(model.drafts[model.room])
 		model.before, model.newer, model.unseen = 0, nil, 0
+		if room.Pending != nil {
+			model.notice = "A previous operation needs review in Details → Pending operation."
+		}
 		return tea.Batch(focus, model.loadPage(0))
+	case "pending":
+		model.ensureRoom(model.room).Pending = result.Value.(*client.PendingOperation)
+		return model.move(pendingScreen)
+	case "retry-pending":
+		event := result.Value.(Event)
+		model.ensureRoom(event.Room).Pending = nil
+		if strings.TrimSpace(model.drafts[event.Room]) == event.Text {
+			delete(model.drafts, event.Room)
+		}
+		focus := model.move(roomScreen)
+		model.input.SetValue(model.drafts[model.room])
+		model.notice = "Operation confirmed."
+		return tea.Batch(focus, model.loadPage(0))
+	case "discard-pending":
+		model.ensureRoom(result.Value.(string)).Pending = nil
+		command := model.move(roomScreen)
+		model.notice = "Tracking discarded. The original operation may still be committed."
+		return command
 	case "leave":
 		delete(model.rooms, result.Value.(string))
 		return model.move(roomsScreen)
@@ -597,12 +654,28 @@ func (model *Model) sent(result resultMsg) tea.Cmd {
 	delete(model.pending, key)
 	current := (model.screen == roomScreen || model.screen == directScreen) && model.draftKey() == key
 	if result.Err != nil {
+		var operation *client.OperationError
+		if result.Peer == "" && errors.As(result.Err, &operation) {
+			message := "Result unknown. Use Details → Pending operation to retry or review."
+			if operation.Outcome == "committed" {
+				message = "Previous operation confirmed. Review it in Details → Pending operation."
+			}
+			if current {
+				model.err = message
+			} else {
+				model.notice = model.roomLabel(result.Room) + ": " + message
+			}
+			return nil
+		}
 		if current {
 			model.err = "Send failed; delivery may be uncertain. " + result.Err.Error()
 		} else {
 			model.notice = "A background send failed. Its draft is retained."
 		}
 		return nil
+	}
+	if result.Peer == "" {
+		model.ensureRoom(result.Room).Pending = nil
 	}
 	if strings.TrimSpace(model.drafts[key]) == result.Text {
 		delete(model.drafts, key)

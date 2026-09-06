@@ -128,3 +128,46 @@ func TestFreshWindow(t *testing.T) {
 		t.Fatal("newer than the window must be rejected")
 	}
 }
+
+func TestVerifyLiveEnforcesProfile(t *testing.T) {
+	now := time.Now().Truncate(time.Second)
+	privateKey := testKey(t)
+	valid, err := Sign(privateKey, nil, []byte("valid"), now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := valid.VerifyLive(now); err != nil {
+		t.Fatal(err)
+	}
+	invalidCertificate := valid
+	invalidCertificate.Certificate = tonoverlay.Certificate{IssuedBy: valid.Src, Signature: make([]byte, 64)}
+	if invalidCertificate.VerifyLive(now) != ErrBadCertificate {
+		t.Fatal("certificate accepted")
+	}
+	if valid.VerifyLive(now.Add(61*time.Second)) != ErrStale {
+		t.Fatal("stale broadcast accepted")
+	}
+	oversized, err := Sign(privateKey, nil, make([]byte, MaxSize), now.Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oversized.VerifyLive(now) != ErrTooLarge {
+		t.Fatal("size applies to boxed wrapper, not only data")
+	}
+	for length := MaxSize; length > 0; length-- {
+		candidate, err := Sign(privateKey, nil, make([]byte, length), now.Unix())
+		if err != nil {
+			t.Fatal(err)
+		}
+		encoded, err := tl.Serialize(candidate, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) == MaxSize {
+			if err := candidate.VerifyLive(now); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
+}

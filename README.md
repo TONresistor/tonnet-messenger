@@ -34,6 +34,9 @@ To link a `.ton` domain, scan the QR code and approve the transaction in the wal
 Public history is saved locally. Direct messages require both users online and are kept only for the current session.
 The client stores its data in `~/.tonnet-messenger/client`.
 
+If an operation's result is unknown, review it in **Room details → Pending operation**.
+Retry reuses the original proposal. Discarding its tracking does not cancel a possible commit.
+
 You can also use commands directly:
 
 ```sh
@@ -41,6 +44,8 @@ You can also use commands directly:
 ./tonnet-messenger room join community.ton
 ./tonnet-messenger room send community.ton "Hello"
 ./tonnet-messenger room history community.ton
+./tonnet-messenger room pending community.ton
+./tonnet-messenger room retry community.ton EVENT_ID
 ./tonnet-messenger dm send community.ton RECIPIENT_KEY "Hi"
 ```
 
@@ -49,6 +54,10 @@ Applications can connect to the client through JSON-RPC:
 ```sh
 ./tonnet-messenger run --stdio
 ```
+
+For an isolated local test, start the server with `--local` and connect the
+client with `--direct IP:PORT --direct-key NODE_PUBLIC_KEY`. The room's JSON
+output includes `node_key`.
 
 ## Server
 
