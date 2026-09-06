@@ -440,23 +440,31 @@ func ValidateAuthorProfile(name, domain string) error {
 	if domain == "" {
 		return nil
 	}
-	if !validUTF8Limit(domain, MaxDomainBytes) || domain != strings.ToLower(domain) || !strings.HasSuffix(domain, ".ton") {
+	if !IsDomainName(domain) {
 		return fmt.Errorf("community: invalid author domain")
 	}
+	return nil
+}
+
+func IsDomainName(domain string) bool {
+	telegram := strings.HasSuffix(domain, ".t.me")
+	if !validUTF8Limit(domain, MaxDomainBytes) || domain != strings.ToLower(domain) || (!strings.HasSuffix(domain, ".ton") && !telegram) {
+		return false
+	}
 	if strings.Contains(domain, "..") || strings.HasPrefix(domain, ".") {
-		return fmt.Errorf("community: invalid author domain")
+		return false
 	}
 	for _, label := range strings.Split(domain, ".") {
 		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
-			return fmt.Errorf("community: invalid author domain")
+			return false
 		}
-		for _, r := range label {
-			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
-				return fmt.Errorf("community: invalid author domain")
+		for _, character := range label {
+			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' && !(telegram && character == '_') {
+				return false
 			}
 		}
 	}
-	return nil
+	return true
 }
 
 func ValidateMetadata(name, description string) error {

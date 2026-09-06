@@ -40,10 +40,16 @@ func TestIdentityAndRoomKeyText(t *testing.T) {
 }
 
 func TestV2ProposalCommitAndProfileBinding(t *testing.T) {
+	for _, domain := range []string{"alice.ton", "alice.t.me", "team_member.t.me"} {
+		t.Run(domain, func(t *testing.T) { testProposalProfileBinding(t, domain) })
+	}
+}
+
+func testProposalProfileBinding(t *testing.T, domain string) {
 	now := time.Unix(1_800_000_000, 0)
 	room, node, author := testPrivate(t), testPrivate(t), testPrivate(t)
 	proposal, err := SignProposal(author, node.Public().(ed25519.PublicKey), EventProposal{
-		RoomID: room.Public().(ed25519.PublicKey), AuthorName: "alice", AuthorDomain: "alice.ton",
+		RoomID: room.Public().(ed25519.PublicKey), AuthorName: "alice", AuthorDomain: domain,
 		Nonce: testNonce(t), Timestamp: now.Unix(), Body: EventMessage{Text: "hello"},
 	})
 	if err != nil {

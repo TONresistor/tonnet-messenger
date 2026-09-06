@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mdp/qrterminal/v3"
 )
@@ -42,7 +43,7 @@ func (model *Model) roomLabel(room string) string {
 		if view.Name != "" {
 			return line(view.Name)
 		}
-		if strings.HasSuffix(view.Reference, ".ton") {
+		if community.IsDomainName(strings.ToLower(strings.TrimSpace(view.Reference))) {
 			return line(view.Reference)
 		}
 	}
@@ -202,13 +203,13 @@ func (model *Model) View() tea.View {
 	foot := "↑↓ Navigate · Enter Select · Esc Back · Ctrl+C Quit"
 	switch model.screen {
 	case joinScreen:
-		parts = append(parts, "Join a room", "Room key or .ton alias:")
+		parts = append(parts, "Join a room", "Room key or .ton / .t.me alias:")
 	case recipientScreen:
-		parts = append(parts, "New direct message · "+model.roomLabel(model.room), "Recipient key or .ton domain:")
+		parts = append(parts, "New direct message · "+model.roomLabel(model.room), "Recipient key or .ton / .t.me domain:")
 	case nameScreen:
 		parts = append(parts, "Change name", "Name:")
 	case domainScreen:
-		parts = append(parts, "Link identity domain", "Domain (.ton):")
+		parts = append(parts, "Link identity domain", "Domain (.ton / .t.me):")
 	case roomScreen, directScreen:
 		title := model.roomLabel(model.room)
 		if model.screen == directScreen {

@@ -29,7 +29,7 @@ Open the interactive client:
 ```
 
 Join rooms, send messages and manage your identity from the menu.
-To link a `.ton` domain, scan the QR code and approve the transaction in the wallet that owns it.
+To link a `.ton` or `.t.me` domain, scan the QR code and approve the transaction in the wallet that owns it.
 
 Public history is saved locally. Direct messages require both users online and are kept only for the current session.
 The client stores its data in `~/.tonnet-messenger/client`.
@@ -70,7 +70,7 @@ Create a room, then start its server. The state directory must not already exist
 
 Replace `PUBLIC_IP` with the server's public IP and open UDP port 17400.
 
-To link a `.ton` domain to the room:
+To link a `.ton` or `.t.me` domain to the room:
 
 ```sh
 ./tonnet-messenger-server room link-domain community.ton --state ./room

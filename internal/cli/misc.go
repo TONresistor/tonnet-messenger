@@ -19,7 +19,7 @@ func newIDCmd() *cobra.Command {
 	var keyPath string
 	cmd := &cobra.Command{
 		Use:   "id",
-		Short: "Print this node's ADNL id (point a .ton record at it)",
+		Short: "Print this node's ADNL id (point a .ton or .t.me record at it)",
 		RunE: func(_ *cobra.Command, _ []string) error {
 			key, err := keys.Load(keyPath)
 			if err != nil {

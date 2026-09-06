@@ -40,6 +40,12 @@ func TestParseTONQUICAdvertiseAddress(t *testing.T) {
 }
 
 func TestLocalSubmissionVerifiesIdentityDomain(t *testing.T) {
+	for _, domain := range []string{"alice.ton", "team_member.t.me"} {
+		t.Run(domain, func(t *testing.T) { testLocalSubmissionIdentityDomain(t, domain) })
+	}
+}
+
+func testLocalSubmissionIdentityDomain(t *testing.T, domain string) {
 	ctx := context.Background()
 	roomKey, nodeKey, authorKey := integrationKey(t), integrationKey(t), integrationKey(t)
 	genesis, err := community.NewGenesis(roomKey, nodeKey, time.Now(), "Room", "", true, nil)
@@ -68,7 +74,7 @@ func TestLocalSubmissionVerifiesIdentityDomain(t *testing.T) {
 			t.Fatal(err)
 		}
 		value, err := community.SignProposal(authorKey, genesis.NodeKey, community.EventProposal{
-			RoomID: genesis.RoomKey, AuthorDomain: "alice.ton", Nonce: nonce,
+			RoomID: genesis.RoomKey, AuthorDomain: domain, Nonce: nonce,
 			Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: text},
 		})
 		if err != nil {

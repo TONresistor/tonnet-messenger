@@ -565,7 +565,7 @@ func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (
 	}
 	id, _ := community.HashBoxed(direct)
 	view := map[string]any{"room": keyText(handle.key), "id": keyText(id), "peer_key": keyText(to), "text": text, "timestamp": now, "direction": "sent", "author_name": name}
-	if strings.HasSuffix(strings.ToLower(strings.TrimSpace(recipient)), ".ton") {
+	if community.IsDomainName(strings.ToLower(strings.TrimSpace(recipient))) {
 		view["domain"] = strings.ToLower(strings.TrimSpace(recipient))
 	}
 	if err := c.notify(c.ctx, "dm.message", view); err != nil {
@@ -1341,7 +1341,7 @@ func (r *roomHandle) notifyLiveSession(ctx context.Context, session *replica.Ses
 
 func (c *Client) resolveRoom(ctx context.Context, reference string) ([]byte, error) {
 	value := strings.ToLower(strings.TrimSpace(reference))
-	if strings.HasSuffix(value, ".ton") {
+	if community.IsDomainName(value) {
 		return tondns.ResolveRoom(ctx, c.configURL, value)
 	}
 	return community.ParseRoomKeyText(strings.TrimSpace(reference))
@@ -1357,7 +1357,7 @@ func (c *Client) ResolveRoom(ctx context.Context, reference string) (string, err
 
 func (c *Client) resolveIdentity(ctx context.Context, reference string) ([]byte, error) {
 	value := strings.ToLower(strings.TrimSpace(reference))
-	if strings.HasSuffix(value, ".ton") {
+	if community.IsDomainName(value) {
 		return tondns.ResolveIdentity(ctx, c.configURL, value)
 	}
 	return community.ParseRoomKeyText(strings.TrimSpace(reference))

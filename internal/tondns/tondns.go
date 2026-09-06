@@ -94,21 +94,8 @@ func PrepareIdentityLink(ctx context.Context, configURL, domainValue string, ide
 
 func NormalizeDomain(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
-	if len(value) < 5 || len(value) > 126 || !strings.HasSuffix(value, ".ton") {
-		return "", fmt.Errorf("TON DNS: domain must be a .ton name")
-	}
-	if strings.Contains(value, "..") || strings.HasPrefix(value, ".") {
-		return "", fmt.Errorf("TON DNS: malformed domain")
-	}
-	for _, label := range strings.Split(value, ".") {
-		if label == "" || strings.HasPrefix(label, "-") || strings.HasSuffix(label, "-") {
-			return "", fmt.Errorf("TON DNS: malformed domain label")
-		}
-		for _, character := range label {
-			if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '-' {
-				return "", fmt.Errorf("TON DNS: unsupported domain character")
-			}
-		}
+	if !community.IsDomainName(value) {
+		return "", fmt.Errorf("TON DNS: expected a valid .ton or .t.me name")
 	}
 	return value, nil
 }

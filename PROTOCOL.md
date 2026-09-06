@@ -264,9 +264,15 @@ Values have no prefix or wrapper. DNS is an alias, never the canonical identity.
 This refers to the text value, not its on-chain encoding: the record remains
 `dns_text#1eda` followed by TL-B `Text` (chunk count and length-prefixed chunks),
 not a snake string. Local inputs are trimmed and lowercased. Accepted names end
-in `.ton`, have nonempty labels containing only `a-z`, `0-9` and `-`, and have
-no leading or trailing hyphen in a label. Signed claims must already use this
-normalized form.
+in `.ton` or `.t.me`, have nonempty labels containing only `a-z`, `0-9` and `-`,
+and have no leading or trailing hyphen in a label. `.t.me` labels also accept
+`_`. Signed claims must already use this normalized form. Both namespaces use
+the configured TON DNS root and standard resolver delegation.
+`.t.me` aliases refer to on-chain collectible usernames with DNS records, not
+arbitrary Telegram accounts.
+
+Clients, sequencers and replicas must support `.t.me` claims before using them
+in a room; the original v0.4.0 implementation only accepts `.ton` claims.
 
 When a proposal includes `author_domain`, it MUST be lowercase and the
 sequencer MUST resolve `msg_id` to exactly `author_key` before committing.
@@ -364,7 +370,7 @@ Optional parameters are marked `?`; no-argument methods accept an empty object.
 | `room.grantModerator` / `room.revokeModerator` | `room, identity_key` | Committed event |
 | `dm.send` | `room, recipient, text` | Direct message |
 
-`reference` accepts a canonical room key or a `.ton` alias; `room` is the
+`reference` accepts a canonical room key or a `.ton` / `.t.me` alias; `room` is the
 canonical key. `recipient` accepts an identity key or alias. `bootstrap` is an
 optional node ADNL ID, not a replacement for the room key. Admin grants remain
 operator-only and are not part of the client API.

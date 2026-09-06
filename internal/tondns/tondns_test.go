@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"strings"
 	"testing"
 )
 
@@ -40,11 +41,13 @@ func TestDeepLinkUsesCanonicalUnpaddedBOC(t *testing.T) {
 }
 
 func TestNormalizeDomain(t *testing.T) {
-	got, err := NormalizeDomain(" Example.TON ")
-	if err != nil || got != "example.ton" {
-		t.Fatalf("normalized domain = %q err=%v", got, err)
+	for _, input := range []string{" Example.TON ", " Alice.T.ME ", "team_member.t.me", "chat.alice.t.me", "chat.example.ton"} {
+		got, err := NormalizeDomain(input)
+		if err != nil || got != strings.ToLower(strings.TrimSpace(input)) {
+			t.Fatalf("normalized domain = %q err=%v", got, err)
+		}
 	}
-	for _, invalid := range []string{"example.com", "https://example.ton", "bad..ton"} {
+	for _, invalid := range []string{"", "example.com", "https://example.ton", "bad..ton", "t.me", ".t.me", "alice.t.me.evil", "https://t.me/alice", "@alice", "-alice.t.me", "alice-.t.me", "alice..t.me", "team_member.ton", strings.Repeat("a", 122) + ".t.me"} {
 		if _, err := NormalizeDomain(invalid); err == nil {
 			t.Fatalf("accepted invalid domain %q", invalid)
 		}
