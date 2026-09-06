@@ -1,7 +1,7 @@
 # Tonnet Messenger Protocol
 
 **Version:** 0.4.0
-**Status:** Draft
+**Status:** Stable
 
 This is the single specification for the room protocol and standalone client API.
 For installation and commands, see [README.md](README.md).

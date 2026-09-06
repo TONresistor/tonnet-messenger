@@ -18,9 +18,13 @@ builds:
     goos:
       - linux
       - darwin
+      - windows
     goarch:
       - amd64
       - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
   - id: server
     main: ./cmd/tonnet-messenger-server
     binary: tonnet-messenger-server
@@ -40,15 +44,18 @@ builds:
 
 archives:
   - id: client
-    builds: [client]
+    ids: [client]
     formats: [tar.gz]
+    format_overrides:
+      - goos: windows
+        formats: [zip]
     name_template: "tonnet-messenger_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
       - README.md
       - PROTOCOL.md
       - LICENSE*
   - id: server
-    builds: [server]
+    ids: [server]
     formats: [tar.gz]
     name_template: "tonnet-messenger-server_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
     files:
