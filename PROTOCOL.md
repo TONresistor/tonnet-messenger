@@ -282,6 +282,9 @@ are rejected; later DNS changes do not rewrite history or transfer roles.
 Domain-link helpers prepare a transaction to the domain NFT contract.
 Only its owner's wallet authorizes that transaction. The client confirms the
 association by resolving the published record, not by trusting a QR scan.
+For collectible `.t.me` usernames, helpers check `get_telemint_auction_config`
+and refuse to prepare a transaction while a sale or auction remains unsettled.
+This check is a snapshot; listing state can change before wallet approval.
 
 **Resolver trust:** the reference client and server use the configured TON
 liteservers. The SDK's default proof policy checks account-state proofs but

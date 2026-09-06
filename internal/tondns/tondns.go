@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/mdp/qrterminal/v3"
+	"github.com/xssnick/tonutils-go/address"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
@@ -81,6 +82,9 @@ func PrepareIdentityLink(ctx context.Context, configURL, domainValue string, ide
 	if nftData.OwnerAddress == nil || nftData.OwnerAddress.IsAddrNone() {
 		return PreparedLink{}, fmt.Errorf("TON DNS: domain has no current owner")
 	}
+	if err := ensureDomainEditable(ctx, api, domain, domainInfo.GetNFTAddress()); err != nil {
+		return PreparedLink{}, err
+	}
 	record, err := TextRecord(identityKey)
 	if err != nil {
 		return PreparedLink{}, err
@@ -98,6 +102,37 @@ func NormalizeDomain(value string) (string, error) {
 		return "", fmt.Errorf("TON DNS: expected a valid .ton or .t.me name")
 	}
 	return value, nil
+}
+
+func ensureDomainEditable(ctx context.Context, api ton.APIClientWrapped, domain string, nftAddress *address.Address) error {
+	if !strings.HasSuffix(domain, ".t.me") || strings.Count(domain, ".") != 2 {
+		return nil
+	}
+	block, err := api.CurrentMasterchainInfo(ctx)
+	if err != nil {
+		return fmt.Errorf("TON DNS: unable to check domain sale status: %w", err)
+	}
+	result, err := api.RunGetMethod(ctx, block, nftAddress, "get_telemint_auction_config")
+	if err != nil {
+		return fmt.Errorf("TON DNS: unable to check domain sale status: %w", err)
+	}
+	if result == nil {
+		return fmt.Errorf("TON DNS: invalid domain sale status")
+	}
+	empty, err := result.IsNil(0)
+	if err != nil {
+		return fmt.Errorf("TON DNS: invalid domain sale status: %w", err)
+	}
+	if !empty {
+		return fmt.Errorf("TON DNS: this domain is listed for sale or auction. Cancel or settle the listing before linking it")
+	}
+	for index := 1; index < 6; index++ {
+		value, err := result.Int(uint(index))
+		if err != nil || value.Sign() != 0 {
+			return fmt.Errorf("TON DNS: invalid domain sale status")
+		}
+	}
+	return nil
 }
 
 func TextRecord(roomID []byte) (*cell.Cell, error) {
@@ -192,6 +227,9 @@ func LinkDomain(ctx context.Context, options LinkOptions) error {
 	}
 	if nftData.OwnerAddress == nil || nftData.OwnerAddress.IsAddrNone() {
 		return fmt.Errorf("TON DNS: domain has no current owner")
+	}
+	if err := ensureDomainEditable(ctx, api, domain, domainInfo.GetNFTAddress()); err != nil {
+		return err
 	}
 	record, err := TextRecord(options.RoomID)
 	if err != nil {
