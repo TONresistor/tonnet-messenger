@@ -11,9 +11,11 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 
 	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/clientrpc"
+	"github.com/TONresistor/tonnet-messenger/internal/clienttui"
 )
 
 var Version = "dev"
@@ -35,6 +37,20 @@ func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use: "tonnet-messenger", Short: "Independent Tonnet Messenger client",
 		SilenceUsage: true, SilenceErrors: true,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			input, inputOK := cmd.InOrStdin().(*os.File)
+			output, outputOK := cmd.OutOrStdout().(*os.File)
+			if !inputOK || !outputOK || !term.IsTerminal(int(input.Fd())) || !term.IsTerminal(int(output.Fd())) {
+				return cmd.Help()
+			}
+			instance, ctx, stop, err := open(cmd, opts)
+			if err != nil {
+				return err
+			}
+			defer stop()
+			return clienttui.Run(ctx, instance, input, output)
+		},
 	}
 	root.PersistentFlags().StringVar(&opts.stateDir, "state", "", "client state directory")
 	root.PersistentFlags().StringVar(&opts.configURL, "config", "https://ton-blockchain.github.io/global.config.json", "TON global config URL")
@@ -215,7 +231,16 @@ func withClient(cmd *cobra.Command, opts *options, operation func(*client.Client
 		return err
 	}
 	defer stop()
-	defer c.Close()
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		for range c.Notifications() {
+		}
+	}()
+	defer func() {
+		_ = c.Close()
+		<-drained
+	}()
 	return operation(c)
 }
 
