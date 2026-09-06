@@ -1,12 +1,11 @@
 name: release
 
-# Tag a release:  git tag v0.1.0 && git push origin v0.1.0
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -21,19 +20,19 @@ jobs:
         run: |
           test -z "$(gofmt -l .)"
           go mod verify
-          go mod tidy
-          git diff --exit-code -- go.mod go.sum
-      - name: vet, race tests, build, and vulnerability scan
+          go mod tidy -diff
+      - name: vet, race tests, and vulnerability scan
         run: |
           go vet ./...
           go test -race ./...
-          go build ./...
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
           govulncheck ./...
 
   goreleaser:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
