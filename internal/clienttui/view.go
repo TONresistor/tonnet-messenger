@@ -2,7 +2,6 @@ package clienttui
 
 import (
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -10,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/mdp/qrterminal/v3"
@@ -38,6 +38,28 @@ func short(value string) string {
 	return value
 }
 
+func (model *Model) compactChrome() bool { return model.width < 50 || model.height < 16 }
+
+func (model *Model) contentWidth() int { return max(10, model.width-4) }
+
+func (model *Model) headerHeight() int {
+	if model.compactChrome() {
+		return 2
+	}
+	return 4
+}
+
+func (model *Model) bodyHeight(extra int) int {
+	chrome := 2 + model.headerHeight() + 1
+	if model.statusLine() != "" {
+		chrome++
+	}
+	if model.isInput() {
+		chrome += 3
+	}
+	return max(1, model.height-chrome-extra)
+}
+
 func (model *Model) roomLabel(room string) string {
 	if view := model.rooms[room]; view != nil {
 		if view.Name != "" {
@@ -48,6 +70,87 @@ func (model *Model) roomLabel(room string) string {
 		}
 	}
 	return short(room)
+}
+
+func (model *Model) identityLabel() string {
+	if model.identity.Domain != "" {
+		return line(model.identity.Domain)
+	}
+	if model.identity.Name != "" {
+		return line(model.identity.Name)
+	}
+	return short(model.identity.Key)
+}
+
+func (model *Model) connectedRooms() int {
+	connected := 0
+	for _, room := range model.rooms {
+		if room.Connected {
+			connected++
+		}
+	}
+	return connected
+}
+
+func (model *Model) headerCopy() (title, subtitle string) {
+	title, subtitle = "Tonnet Messenger", fmt.Sprintf("%s · %d rooms connected", model.identityLabel(), model.connectedRooms())
+	switch model.screen {
+	case roomScreen:
+		title = model.roomLabel(model.room)
+		subtitle = "0 connected"
+		if room := model.rooms[model.room]; room != nil {
+			if room.Presence != nil {
+				subtitle = fmt.Sprintf("%d connected", room.Presence.Online)
+			} else {
+				subtitle = room.Status
+			}
+			if model.unseen > 0 {
+				subtitle += fmt.Sprintf(" · %d new", model.unseen)
+			}
+		}
+	case directScreen:
+		title = short(model.peer)
+		if conversation := model.directs[directKey(model.room, model.peer)]; conversation != nil && conversation.Name != "" {
+			title = line(conversation.Name)
+		}
+		subtitle = model.roomLabel(model.room) + " · this session"
+	case joinScreen:
+		title, subtitle = "Join a room", "Room key or .ton / .t.me alias"
+	case roomsScreen:
+		title, subtitle = "My rooms", fmt.Sprintf("%d connected", model.connectedRooms())
+	case detailsScreen:
+		title, subtitle = "Room details", model.roomLabel(model.room)
+	case pendingScreen, discardPendingScreen:
+		title, subtitle = "Pending operation", model.roomLabel(model.room)
+	case directsScreen:
+		title, subtitle = "Direct messages", "Online recipients only"
+	case directRoomScreen:
+		title, subtitle = "Direct messages", "Choose a connected room"
+	case recipientScreen:
+		title, subtitle = "New direct message", model.roomLabel(model.room)
+	case identityScreen, nameScreen, domainScreen, domainRecordScreen, clearDomainScreen:
+		title, subtitle = "My identity", model.identityLabel()
+	case leaveScreen:
+		title, subtitle = "Leave room", model.roomLabel(model.room)
+	}
+	return title, subtitle
+}
+
+func (model *Model) renderHeader() string {
+	width := model.contentWidth()
+	title, subtitle := model.headerCopy()
+	title, subtitle = bold(truncate(title, width-2)), fg(truncate(subtitle, width-2), "244")
+	text := title + "\n" + subtitle
+	if model.compactChrome() {
+		return lipgloss.NewStyle().Width(width).Render(text)
+	}
+	return borderColor().Width(width).Padding(0, 1).Render(text)
+}
+
+func (model *Model) renderInputBar() string {
+	width := model.contentWidth()
+	field := lipgloss.NewStyle().Width(max(8, width-2)).Render(model.input.View())
+	return borderColor().Width(width).MaxWidth(width).Render(field)
 }
 
 func (model *Model) choices() []choice {
@@ -105,55 +208,114 @@ func (model *Model) choices() []choice {
 	return nil
 }
 
+func (model *Model) actorLabel(actor client.Identity) string {
+	if actor.Domain != "" {
+		return line(actor.Domain)
+	}
+	if actor.Name != "" {
+		return line(actor.Name)
+	}
+	if actor.Key != "" {
+		characters := []rune(actor.Key)
+		if len(characters) > 4 {
+			return "anon " + string(characters[:4])
+		}
+		return "anon"
+	}
+	return "anon"
+}
+
+func (model *Model) selfLabel() string {
+	if model.identity.Domain != "" {
+		return line(model.identity.Domain)
+	}
+	if model.identity.Name != "" {
+		return line(model.identity.Name)
+	}
+	return "You"
+}
+
+func clock(timestamp int64) string {
+	if timestamp <= 0 {
+		return ""
+	}
+	return time.Unix(timestamp, 0).Local().Format("15:04")
+}
+
+func (model *Model) conversationContent() string {
+	width := max(10, model.viewport.Width())
+	var rows []string
+	if model.screen == directScreen {
+		conversation := model.directs[directKey(model.room, model.peer)]
+		if conversation == nil || len(conversation.Messages) == 0 {
+			return systemRow("No messages yet", width)
+		}
+		for _, message := range conversation.Messages {
+			if message.Direction == "sent" {
+				rows = append(rows, outgoingRow(model.selfLabel(), clock(message.Timestamp), message.Text, width))
+				continue
+			}
+			author := conversation.Name
+			if message.Author != "" {
+				author = message.Author
+			}
+			if message.Domain != "" {
+				author = message.Domain
+			}
+			rows = append(rows, incomingRow(line(author), clock(message.Timestamp), message.Text, width))
+		}
+		return strings.Join(rows, "\n")
+	}
+	if len(model.page.Items) == 0 {
+		return systemRow("No messages yet", width)
+	}
+	for _, event := range model.page.Items {
+		if event.Kind != "message" {
+			rows = append(rows, systemRow(model.systemText(event), width))
+			continue
+		}
+		if event.Actor.Key != "" && event.Actor.Key == model.identity.Key {
+			rows = append(rows, outgoingRow(model.selfLabel(), clock(event.Timestamp), event.Text, width))
+			continue
+		}
+		rows = append(rows, incomingRow(model.actorLabel(event.Actor), clock(event.Timestamp), event.Text, width))
+	}
+	return strings.Join(rows, "\n")
+}
+
+func (model *Model) systemText(event Event) string {
+	text := "[" + event.Kind + "]"
+	if event.Target != "" {
+		text += " message #" + event.Target
+	}
+	if event.Subject != "" {
+		text += " " + short(event.Subject)
+	}
+	if event.Kind == "metadata" {
+		text += " " + event.Name
+	}
+	if event.Kind == "write-policy" {
+		text += " " + event.WritePolicy
+	}
+	author := model.actorLabel(event.Actor)
+	if author != "" && author != "?" {
+		return author + " " + text
+	}
+	return text
+}
+
 func (model *Model) refreshViewport(bottom bool) {
+	model.layout()
+	width := model.contentWidth()
 	if model.screen == domainRecordScreen {
-		model.viewport.SetHeight(max(1, model.height-12))
 		model.viewport.SetContent(model.domainLinkContent())
 		model.viewport.GotoTop()
 		return
 	}
-	model.viewport.SetHeight(max(1, model.height-10))
-	var lines []string
-	if model.screen == directScreen {
-		if conversation := model.directs[directKey(model.room, model.peer)]; conversation != nil {
-			for _, message := range conversation.Messages {
-				author := conversation.Name
-				if message.Direction == "sent" {
-					author = "You"
-				}
-				lines = append(lines, fmt.Sprintf("%s %s: %s", time.Unix(message.Timestamp, 0).Local().Format("15:04"), line(author), clean(message.Text)))
-			}
-		}
-	} else {
-		for _, event := range model.page.Items {
-			author := event.Actor.Name
-			if author == "" {
-				author = short(event.Actor.Key)
-			}
-			if event.Actor.Domain != "" {
-				author = event.Actor.Domain
-			}
-			text := event.Text
-			if event.Kind != "message" {
-				text = "[" + event.Kind + "]"
-				if event.Target != "" {
-					text += " message #" + event.Target
-				}
-				if event.Subject != "" {
-					text += " " + short(event.Subject)
-				}
-				if event.Kind == "metadata" {
-					text += " " + event.Name
-				}
-				if event.Kind == "write-policy" {
-					text += " " + event.WritePolicy
-				}
-			}
-			lines = append(lines, fmt.Sprintf("%s %s: %s", time.Unix(event.Timestamp, 0).Local().Format("15:04"), line(author), clean(text)))
-		}
+	if model.screen != roomScreen && model.screen != directScreen {
+		return
 	}
-	content := strings.Join(lines, "\n")
-	model.viewport.SetContent(lipgloss.NewStyle().Width(max(10, model.width-4)).Render(content))
+	model.viewport.SetContent(lipgloss.NewStyle().Width(width).Render(model.conversationContent()))
 	if bottom {
 		model.viewport.GotoBottom()
 	}
@@ -169,7 +331,7 @@ func walletQR(transactionURL string) string {
 }
 
 func (model *Model) domainLinkContent() string {
-	width := model.viewport.Width()
+	width := max(10, model.viewport.Width())
 	recordText := strings.Join([]string{
 		"Domain: " + line(model.link.Domain),
 		"Category: " + line(model.link.Category),
@@ -184,99 +346,80 @@ func (model *Model) domainLinkContent() string {
 	return record + "\n" + lipgloss.NewStyle().Width(width).Render(instructions) + "\n" + model.linkQR + "\n" + transactionLink
 }
 
-func (model *Model) View() tea.View {
-	name := line(model.identity.Name)
-	if name == "" {
-		name = short(model.identity.Key)
-	}
-	connected := 0
-	for _, room := range model.rooms {
-		if room.Connected {
-			connected++
-		}
-	}
-	heading := "Tonnet Messenger"
-	if _, disabled := os.LookupEnv("NO_COLOR"); !disabled && os.Getenv("TERM") != "dumb" {
-		heading = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render(heading)
-	}
-	parts := []string{heading, fmt.Sprintf("%s · %d rooms connected", name, connected), ""}
-	foot := "↑↓ Navigate · Enter Select · Esc Back · Ctrl+C Quit"
+func (model *Model) menuBody(height int) string {
+	var parts []string
 	switch model.screen {
-	case joinScreen:
-		parts = append(parts, "Join a room", "Room key or .ton / .t.me alias:")
-	case recipientScreen:
-		parts = append(parts, "New direct message · "+model.roomLabel(model.room), "Recipient key or .ton / .t.me domain:")
-	case nameScreen:
-		parts = append(parts, "Change name", "Name:")
-	case domainScreen:
-		parts = append(parts, "Link identity domain", "Domain (.ton / .t.me):")
-	case roomScreen, directScreen:
-		title := model.roomLabel(model.room)
-		if model.screen == directScreen {
-			title = short(model.peer) + " · " + title
-		}
-		if room := model.rooms[model.room]; room != nil {
-			title += " · " + room.Status
-			if room.Presence != nil {
-				title += fmt.Sprintf(" · %d online", room.Presence.Online)
-			}
-		}
-		parts = append(parts, title, model.viewport.View())
-		if model.screen == roomScreen {
-			parts = append(parts, fmt.Sprintf("%d new · Ctrl+O Older · Ctrl+N Newer · Ctrl+L Latest", model.unseen))
-			foot = "Enter Send · PgUp/PgDown Scroll · Ctrl+D Details · Ctrl+R Retry · Esc Back"
-		} else {
-			foot = "Enter Send · PgUp/PgDown Scroll · Esc Back · DM history lasts this session"
-		}
 	case detailsScreen:
 		if room := model.rooms[model.room]; room != nil {
-			parts = append(parts, "Room details", "Key: "+line(room.ID), "Alias: "+line(room.Reference), "Node: "+line(room.Role), "Writing: "+line(room.State.WritePolicy))
+			parts = append(parts,
+				"Key: "+line(room.ID),
+				"Alias: "+line(room.Reference),
+				"Node: "+line(room.Role),
+				"Writing: "+line(room.State.WritePolicy),
+			)
 		}
 	case identityScreen:
-		parts = append(parts, "My identity", "Name: "+line(model.identity.Name), "Key: "+line(model.identity.Key), "Domain: "+line(model.identity.Domain))
+		parts = append(parts, "Name: "+line(model.identity.Name), "Key: "+line(model.identity.Key), "Domain: "+line(model.identity.Domain))
 	case pendingScreen:
 		pending := model.ensureRoom(model.room).Pending
 		if pending == nil {
 			parts = append(parts, "No pending operation.")
 		} else {
-			parts = append(parts, "Pending operation · "+line(pending.Status), "Event: "+short(pending.EventID), "Retry reuses the exact signed proposal.")
+			parts = append(parts, line(pending.Status), "Event: "+short(pending.EventID), "Retry reuses the exact signed proposal.")
 			if text, ok := pending.Event["text"].(string); ok {
 				parts = append(parts, line(text))
 			}
 		}
 	case discardPendingScreen:
 		parts = append(parts, "Discard tracking?", "This does not cancel a possible commit. Sending again may duplicate it.")
-	case domainRecordScreen:
-		parts = append(parts, model.viewport.View())
-		foot = "PgUp/PgDown Scroll · Enter Select · Esc Back"
 	case leaveScreen:
 		parts = append(parts, "Leave "+model.roomLabel(model.room)+"?", "This removes membership and its local room cache.")
 	case clearDomainScreen:
 		parts = append(parts, "Remove the verified domain from this identity?")
-	case directsScreen:
-		parts = append(parts, "Direct messages · online recipients only")
-	case directRoomScreen:
-		parts = append(parts, "Choose a connected room for this conversation")
-	case roomsScreen:
-		parts = append(parts, "My rooms")
 	}
-	if model.isInput() {
-		parts = append(parts, model.input.View())
-		if model.screen != roomScreen && model.screen != directScreen {
-			foot = "Enter Continue / Retry · Esc Back · Ctrl+C Quit"
+	choices := model.choices()
+	available := min(len(choices), height)
+	var bodyParts []string
+	if len(parts) > 0 {
+		content := lipgloss.NewStyle().Width(model.contentWidth()).Render(strings.Join(parts, "\n"))
+		contentHeight := min(lipgloss.Height(content), max(0, height-available-1))
+		model.viewport.SetWidth(model.contentWidth())
+		model.viewport.SetHeight(contentHeight)
+		model.viewport.SetContent(content)
+		if contentHeight > 0 {
+			bodyParts = append(bodyParts, model.viewport.View(), "")
 		}
-	} else {
-		choices := model.choices()
-		available := max(1, model.height-lipgloss.Height(strings.Join(parts, "\n"))-5)
+	}
+	if len(choices) > 0 {
 		start := max(0, model.cursor-available+1)
 		for index := start; index < min(len(choices), start+available); index++ {
 			prefix := "  "
 			if index == model.cursor {
 				prefix = "› "
 			}
-			parts = append(parts, prefix+line(choices[index].label))
+			bodyParts = append(bodyParts, prefix+truncate(choices[index].label, model.contentWidth()-2))
 		}
 	}
+	body := strings.Join(bodyParts, "\n")
+	return lipgloss.NewStyle().Width(model.contentWidth()).Height(height).Render(body)
+}
+
+func (model *Model) footerHelp() string {
+	switch model.screen {
+	case roomScreen:
+		return "Enter Send · PgUp/PgDown Scroll · Ctrl+D Details · Ctrl+R Retry · Esc Back"
+	case directScreen:
+		return "Enter Send · PgUp/PgDown Scroll · Esc Back · DM history lasts this session"
+	case domainRecordScreen:
+		return "PgUp/PgDown Scroll · Enter Select · Esc Back"
+	case joinScreen, recipientScreen, nameScreen, domainScreen:
+		return "Enter Continue / Retry · Esc Back · Ctrl+C Quit"
+	default:
+		return "↑↓ Navigate · Enter Select · Esc Back · Ctrl+C Quit"
+	}
+}
+
+func (model *Model) statusLine() string {
 	status := model.notice
 	if model.busy || model.pageLoading {
 		status = "Loading…"
@@ -287,13 +430,48 @@ func (model *Model) View() tea.View {
 	if model.err != "" {
 		status = "Error: " + line(model.err)
 	}
-	parts = append(parts, "", line(status), foot)
-	for index, part := range parts {
-		if !strings.Contains(part, "\n") {
-			parts[index] = ansi.Truncate(part, max(10, model.width-2), "…")
-		}
+	return fg(truncate(line(status), model.contentWidth()), "244")
+}
+
+func (model *Model) View() tea.View {
+	model.layout()
+	width := model.contentWidth()
+	header := model.renderHeader()
+	status := model.statusLine()
+	foot := truncate(fg(model.footerHelp(), "240"), width)
+	var bottom []string
+	if model.isInput() {
+		bottom = append(bottom, model.renderInputBar())
 	}
-	view := tea.NewView(strings.Join(parts, "\n"))
+	if status != "" {
+		bottom = append(bottom, status)
+	}
+	bottom = append(bottom, foot)
+	footer := strings.Join(bottom, "\n")
+	bodyHeight := model.bodyHeight(0)
+	var body string
+	switch model.screen {
+	case roomScreen, directScreen:
+		body = model.viewport.View()
+	case domainRecordScreen:
+		choices := model.choices()
+		var choiceLines []string
+		for index, item := range choices {
+			prefix := "  "
+			if index == model.cursor {
+				prefix = "› "
+			}
+			choiceLines = append(choiceLines, prefix+item.label)
+		}
+		body = lipgloss.JoinVertical(lipgloss.Left, model.viewport.View(), strings.Join(choiceLines, "\n"))
+		body = lipgloss.NewStyle().Width(width).Height(bodyHeight).Render(body)
+	default:
+		body = model.menuBody(bodyHeight)
+	}
+	frame := borderColor().Width(model.width).Padding(0, 1).MaxWidth(model.width).MaxHeight(model.height).Render(
+		lipgloss.JoinVertical(lipgloss.Left, header, body, footer),
+	)
+	view := tea.NewView(frame)
 	view.AltScreen = true
 	return view
 }

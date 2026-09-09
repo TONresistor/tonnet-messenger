@@ -24,7 +24,7 @@ func TestDomainLinkDisplaysPreparedTransactionQRAndKeepsVerification(t *testing.
 	qrterminal.GenerateHalfBlock(prepared.TxURL, qrterminal.L, &expected)
 	qr := strings.TrimSuffix(expected.String(), "\n")
 	view := withoutLinePadding(model.View().Content)
-	if !strings.Contains(view, qr) {
+	if !containsBlock(view, qr) {
 		t.Fatal("complete QR for the exact prepared transaction is missing")
 	}
 	if !strings.Contains(view, prepared.TxURL) {
@@ -68,7 +68,7 @@ func TestDomainQRAndLinkRemainPresentRegardlessOfTerminalSize(t *testing.T) {
 	}
 	model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
 	model.Update(tea.WindowSizeMsg{Width: 120, Height: 90})
-	if !strings.Contains(withoutLinePadding(model.View().Content), model.linkQR) {
+	if !containsBlock(withoutLinePadding(model.View().Content), model.linkQR) {
 		t.Fatal("resizing retained a cropped/scrolled QR")
 	}
 	model.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
@@ -83,4 +83,47 @@ func withoutLinePadding(value string) string {
 		lines[index] = strings.TrimRight(lines[index], " ")
 	}
 	return strings.Join(lines, "\n")
+}
+
+func containsBlock(haystack, needle string) bool {
+	if needle == "" {
+		return false
+	}
+	rows := strings.Split(haystack, "\n")
+	block := strings.Split(strings.TrimSuffix(needle, "\n"), "\n")
+	for start := 0; start+len(block) <= len(rows); start++ {
+		column := strings.Index(rows[start], block[0])
+		if column < 0 {
+			continue
+		}
+		matches := true
+		for offset, row := range block {
+			candidate := rows[start+offset]
+			if len(candidate) < column+len(row) || candidate[column:column+len(row)] != row {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			return true
+		}
+	}
+	return false
+}
+
+func TestContainsBlockRequiresContiguousAlignedRows(t *testing.T) {
+	block := "abc\ndef\nghi"
+	if !containsBlock("│ abc │\n│ def │\n│ ghi │", block) {
+		t.Fatal("intact framed block rejected")
+	}
+	for _, content := range []string{
+		"ghi\ndef\nabc",
+		"abc\nextra\ndef\nghi",
+		"abc\n def\nghi",
+		"abc\ndef\ngh",
+	} {
+		if containsBlock(content, block) {
+			t.Fatalf("damaged block accepted: %q", content)
+		}
+	}
 }

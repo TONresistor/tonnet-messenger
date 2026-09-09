@@ -105,6 +105,8 @@ type Model struct {
 
 func newModel(ctx context.Context, backend Backend) *Model {
 	input := textinput.New()
+	input.Prompt = " "
+	input.Placeholder = "Message"
 	input.SetVirtualCursor(true)
 	input.SetStyles(textinput.Styles{})
 	input.CharLimit = 2048
@@ -112,10 +114,47 @@ func newModel(ctx context.Context, backend Backend) *Model {
 	view := viewport.New()
 	view.SetWidth(76)
 	view.SetHeight(12)
-	return &Model{
+	model := &Model{
 		ctx: ctx, backend: backend, width: 80, height: 24, input: input, viewport: view,
 		identity: backend.Identity(), rooms: make(map[string]*roomView), directs: make(map[string]*conversation),
 		drafts: make(map[string]string), pending: make(map[string]bool),
+	}
+	model.layout()
+	return model
+}
+
+func (model *Model) layout() {
+	width := model.contentWidth()
+	model.input.SetWidth(max(1, width-4))
+	if model.screen != roomScreen && model.screen != directScreen && model.screen != domainRecordScreen {
+		return
+	}
+	atBottom := model.viewport.AtBottom()
+	extra := 0
+	if model.screen == domainRecordScreen {
+		extra = len(model.choices())
+	}
+	model.viewport.SetWidth(width)
+	model.viewport.SetHeight(model.bodyHeight(extra))
+	if atBottom {
+		model.viewport.GotoBottom()
+	}
+}
+
+func (model *Model) setPlaceholder() {
+	switch model.screen {
+	case roomScreen, directScreen:
+		model.input.Placeholder = "Message"
+	case joinScreen:
+		model.input.Placeholder = "Room key or .ton / .t.me"
+	case recipientScreen:
+		model.input.Placeholder = "Recipient key or .ton / .t.me"
+	case nameScreen:
+		model.input.Placeholder = "Display name"
+	case domainScreen:
+		model.input.Placeholder = "Domain (.ton / .t.me)"
+	default:
+		model.input.Placeholder = ""
 	}
 }
 
@@ -173,6 +212,8 @@ func (model *Model) move(next screen) tea.Cmd {
 	model.input.SetValue("")
 	model.input.Blur()
 	model.viewport.GotoTop()
+	model.setPlaceholder()
+	model.layout()
 	if model.isInput() {
 		if next == roomScreen || next == directScreen {
 			model.input.SetValue(model.drafts[model.draftKey()])
@@ -220,9 +261,7 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := message.(type) {
 	case tea.WindowSizeMsg:
 		model.width, model.height = max(20, value.Width), max(8, value.Height)
-		model.input.SetWidth(max(8, model.width-6))
-		model.viewport.SetWidth(max(10, model.width-4))
-		model.viewport.SetHeight(max(1, model.height-10))
+		model.layout()
 		model.refreshViewport(false)
 		return model, nil
 	case endedMsg:
