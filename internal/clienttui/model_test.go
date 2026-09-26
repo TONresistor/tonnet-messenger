@@ -22,6 +22,7 @@ type fakeBackend struct {
 	leaveRoom                    string
 	sendErr                      error
 	joinErr                      error
+	latestSeq                    int64
 }
 
 func (backend *fakeBackend) GetPending(context.Context, string) (*client.PendingOperation, error) {
@@ -120,6 +121,9 @@ func (backend *fakeBackend) Leave(_ context.Context, room string) error {
 func (backend *fakeBackend) Timeline(_ context.Context, room string, before int64) (Page, error) {
 	if before == 0 {
 		before = 601
+		if backend.latestSeq > 0 {
+			before = backend.latestSeq + 1
+		}
 	}
 	page := Page{HasMore: before > 101}
 	for sequence := max(int64(1), before-100); sequence < before; sequence++ {
@@ -221,29 +225,32 @@ func TestJoinFailureRetryAndStaleResult(t *testing.T) {
 	}
 }
 
-func TestPagingSurvivesLiveEventsAndObsoleteResults(t *testing.T) {
-	model, _ := fixture(t)
+func TestContinuousHistorySurvivesLiveEventsAndObsoleteResults(t *testing.T) {
+	model, backend := fixture(t)
 	model.move(roomScreen)
 	execute(t, model, model.loadPage(0))
 	for index := 0; index < 5; index++ {
 		execute(t, model, model.older())
 	}
-	if model.page.HasMore || model.page.Items[0].Seqno != 1 {
-		t.Fatal("oldest page not reached")
+	if model.page.HasMore || len(model.page.Items) != 600 || model.page.Items[0].Seqno != 1 || model.page.Items[599].Seqno != 600 {
+		t.Fatal("loaded history is not continuous through the latest message")
 	}
+	model.viewport.GotoTop()
 	first := model.page.Items[0]
+	backend.latestSeq = 601
 	command := model.notification(client.Notification{Method: "room.event", Params: map[string]any{"room": testRoom, "event_id": "new", "seqno": "601", "kind": "message"}})
 	if command != nil || model.page.Items[0] != first || model.unseen != 1 {
 		t.Fatal("live event replaced old history")
 	}
-	execute(t, model, model.newerPage())
-	if model.page.Items[0].Seqno != 101 {
-		t.Fatal("newer page cursor incorrect")
+	_, command = model.Update(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
+	execute(t, model, command)
+	if len(model.page.Items) != 601 || model.page.Items[0].Seqno != 1 || model.page.Items[600].Seqno != 601 || !model.viewport.AtBottom() || model.page.HasMore {
+		t.Fatal("returning live discarded older history, duplicated events or lost the latest message")
 	}
 	command = model.loadPage(0)
 	model.move(homeScreen)
 	execute(t, model, command)
-	if model.page.Items[0].Seqno != 101 {
+	if model.page.Items[0].Seqno != 1 || len(model.page.Items) != 601 {
 		t.Fatal("obsolete page replaced current history")
 	}
 }
@@ -279,11 +286,15 @@ func TestNavigationDoesNotForgetPendingHistoryOrConfirmedLeave(t *testing.T) {
 	model.move(roomScreen)
 	execute(t, model, model.loadPage(0))
 	older := model.older()
+	requestID := model.pageRequest
 	model.Update(tea.KeyPressMsg{Code: 'l', Mod: tea.ModCtrl})
-	if len(model.newer) != 1 {
-		t.Fatal("Latest discarded the pending page cursor")
+	if !model.pageLoading || model.pageRequest != requestID {
+		t.Fatal("Latest discarded the pending history request")
 	}
 	execute(t, model, older)
+	if len(model.page.Items) != 200 || model.page.Items[0].Seqno != 401 || model.page.Items[199].Seqno != 600 {
+		t.Fatal("pending history did not extend the conversation")
+	}
 	model.move(leaveScreen)
 	model.cursor = 1
 	leaving := model.selectAction()

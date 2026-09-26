@@ -266,10 +266,16 @@ func (model *Model) conversationContent() string {
 		}
 		return strings.Join(rows, "\n")
 	}
-	if len(model.page.Items) == 0 {
+	return model.roomContent(model.page.Items)
+}
+
+func (model *Model) roomContent(events []Event) string {
+	width := max(10, model.viewport.Width())
+	if len(events) == 0 {
 		return systemRow("No messages yet", width)
 	}
-	for _, event := range model.page.Items {
+	var rows []string
+	for _, event := range events {
 		if event.Kind != "message" {
 			rows = append(rows, systemRow(model.systemText(event), width))
 			continue
@@ -407,9 +413,9 @@ func (model *Model) menuBody(height int) string {
 func (model *Model) footerHelp() string {
 	switch model.screen {
 	case roomScreen:
-		return "Enter Send · PgUp/PgDown Scroll · Ctrl+D Details · Ctrl+R Retry · Esc Back"
+		return "Enter Send · ↑↓/PgUp/PgDown Scroll · Ctrl+D Details · Ctrl+R Retry · Esc Back"
 	case directScreen:
-		return "Enter Send · PgUp/PgDown Scroll · Esc Back · DM history lasts this session"
+		return "Enter Send · ↑↓/PgUp/PgDown Scroll · Esc Back · DM history lasts this session"
 	case domainRecordScreen:
 		return "PgUp/PgDown Scroll · Enter Select · Esc Back"
 	case joinScreen, recipientScreen, nameScreen, domainScreen:
@@ -473,5 +479,8 @@ func (model *Model) View() tea.View {
 	)
 	view := tea.NewView(frame)
 	view.AltScreen = true
+	if model.screen == roomScreen || model.screen == directScreen {
+		view.MouseMode = tea.MouseModeCellMotion
+	}
 	return view
 }

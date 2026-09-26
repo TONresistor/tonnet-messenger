@@ -87,8 +87,6 @@ type Model struct {
 	room            string
 	peer            string
 	page            Page
-	before          int64
-	newer           []int64
 	unseen          int
 	pageDirty       bool
 	pageLoading     bool
@@ -271,6 +269,11 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return model, tea.Batch(model.waitNotification(), command)
 	case resultMsg:
 		return model, model.result(value)
+	case tea.MouseWheelMsg:
+		if model.screen == roomScreen || model.screen == directScreen {
+			return model, model.scroll(message)
+		}
+		return model, nil
 	case tea.KeyPressMsg:
 		key := value.String()
 		if key == "ctrl+c" {
@@ -289,10 +292,10 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, model.older()
 		}
 		if key == "ctrl+n" && model.screen == roomScreen {
-			return model, model.newerPage()
+			return model, model.scroll(tea.KeyPressMsg{Code: tea.KeyPgDown})
 		}
 		if key == "ctrl+l" && model.screen == roomScreen && !model.pageLoading {
-			model.newer = nil
+			model.viewport.GotoBottom()
 			return model, model.loadPage(0)
 		}
 		if key == "ctrl+d" && model.screen == roomScreen {
@@ -302,9 +305,10 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, model.join(model.room)
 		}
 		if key == "pgup" || key == "pgdown" {
-			var command tea.Cmd
-			model.viewport, command = model.viewport.Update(message)
-			return model, command
+			return model, model.scroll(message)
+		}
+		if (key == "up" || key == "down") && (model.screen == roomScreen || model.screen == directScreen) {
+			return model, model.scroll(message)
 		}
 		if !model.isInput() {
 			length := len(model.choices())
@@ -324,6 +328,27 @@ func (model *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return model, command
 	}
 	return model, nil
+}
+
+func (model *Model) scroll(message tea.Msg) tea.Cmd {
+	var command tea.Cmd
+	model.viewport, command = model.viewport.Update(message)
+	if model.screen == roomScreen {
+		up := false
+		switch value := message.(type) {
+		case tea.KeyPressMsg:
+			up = value.String() == "up" || value.String() == "pgup"
+		case tea.MouseWheelMsg:
+			up = value.Button == tea.MouseWheelUp && !value.Mod.Contains(tea.ModShift)
+		}
+		if up && model.viewport.AtTop() {
+			return tea.Batch(command, model.older())
+		}
+		if model.viewport.AtBottom() && model.unseen > 0 {
+			return tea.Batch(command, model.loadPage(0))
+		}
+	}
+	return command
 }
 
 func (model *Model) back() tea.Cmd {
@@ -380,7 +405,7 @@ func (model *Model) selectAction() tea.Cmd {
 			return model.move(recipientScreen)
 		}
 		focus := model.move(roomScreen)
-		model.before, model.newer, model.unseen = 0, nil, 0
+		model.unseen = 0
 		model.page = Page{}
 		model.rooms[choice].Unread = 0
 		return tea.Batch(focus, model.loadPage(0), model.join(choice))
@@ -549,10 +574,30 @@ func (model *Model) loadPage(before int64) tea.Cmd {
 	model.pageDirty = false
 	model.pageRequest++
 	requestID, room := model.pageRequest, model.room
+	var head int64
+	if len(model.page.Items) > 0 {
+		head = model.page.Items[len(model.page.Items)-1].Seqno
+	}
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(model.ctx, 10*time.Second)
 		defer cancel()
 		page, err := model.backend.Timeline(ctx, room, before)
+		if before == 0 && head > 0 {
+			for err == nil && page.HasMore && len(page.Items) > 0 && page.Items[0].Seqno > head+1 {
+				cursor := page.Items[0].Seqno
+				var older Page
+				older, err = model.backend.Timeline(ctx, room, cursor)
+				if err != nil {
+					break
+				}
+				if len(older.Items) == 0 || older.Items[0].Seqno >= cursor {
+					err = errors.New("history did not advance while loading recent messages")
+					break
+				}
+				page.Items = append(older.Items, page.Items...)
+				page.HasMore = older.HasMore
+			}
+		}
 		return resultMsg{Kind: "page", ID: requestID, Room: room, Before: before, Value: page, Err: err}
 	}
 }
@@ -561,17 +606,53 @@ func (model *Model) older() tea.Cmd {
 	if model.pageLoading || !model.page.HasMore || len(model.page.Items) == 0 {
 		return nil
 	}
-	model.newer = append(model.newer, model.before)
 	return model.loadPage(model.page.Items[0].Seqno)
 }
 
-func (model *Model) newerPage() tea.Cmd {
-	if model.pageLoading || len(model.newer) == 0 {
-		return nil
+func mergeEvents(current, incoming []Event) []Event {
+	merged := make([]Event, 0, len(current)+len(incoming))
+	for len(current) > 0 && len(incoming) > 0 {
+		switch {
+		case current[0].Seqno < incoming[0].Seqno:
+			merged, current = append(merged, current[0]), current[1:]
+		case current[0].Seqno > incoming[0].Seqno:
+			merged, incoming = append(merged, incoming[0]), incoming[1:]
+		default:
+			merged = append(merged, incoming[0])
+			current, incoming = current[1:], incoming[1:]
+		}
 	}
-	before := model.newer[len(model.newer)-1]
-	model.newer = model.newer[:len(model.newer)-1]
-	return model.loadPage(before)
+	merged = append(merged, current...)
+	return append(merged, incoming...)
+}
+
+func (model *Model) mergePage(page Page, older bool) {
+	empty := len(model.page.Items) == 0
+	follow := empty || model.viewport.AtBottom()
+	offset := model.viewport.YOffset()
+	var first, last int64
+	if !empty {
+		first, last = model.page.Items[0].Seqno, model.page.Items[len(model.page.Items)-1].Seqno
+	}
+	if empty || older || (len(page.Items) > 0 && page.Items[0].Seqno < first) {
+		model.page.HasMore = page.HasMore
+	}
+	model.page.Items = mergeEvents(model.page.Items, page.Items)
+	model.refreshViewport(false)
+	if empty || (!older && follow) {
+		model.viewport.GotoBottom()
+		model.unseen = 0
+		return
+	}
+	prepended := sort.Search(len(model.page.Items), func(index int) bool { return model.page.Items[index].Seqno >= first })
+	if prepended > 0 {
+		offset += strings.Count(model.roomContent(model.page.Items[:prepended]), "\n") + 1
+	}
+	model.viewport.SetYOffset(offset)
+	if !older {
+		previousEnd := sort.Search(len(model.page.Items), func(index int) bool { return model.page.Items[index].Seqno > last })
+		model.unseen = max(model.unseen, len(model.page.Items)-previousEnd)
+	}
 }
 
 func (model *Model) result(result resultMsg) tea.Cmd {
@@ -587,12 +668,8 @@ func (model *Model) result(result resultMsg) tea.Cmd {
 			model.err = result.Err.Error()
 			return nil
 		}
-		model.page, model.before = result.Value.(Page), result.Before
-		if model.before == 0 {
-			model.unseen = 0
-		}
-		model.refreshViewport(model.before == 0)
-		if model.pageDirty && model.before == 0 {
+		model.mergePage(result.Value.(Page), result.Before != 0)
+		if model.pageDirty {
 			return model.loadPage(0)
 		}
 		return nil
@@ -634,7 +711,7 @@ func (model *Model) result(result resultMsg) tea.Cmd {
 		focus := model.move(roomScreen)
 		model.room = joined.Room
 		model.input.SetValue(model.drafts[model.room])
-		model.before, model.newer, model.unseen = 0, nil, 0
+		model.page, model.unseen = Page{}, 0
 		if room.Pending != nil {
 			model.notice = "A previous operation needs review in Details → Pending operation."
 		}
@@ -737,7 +814,7 @@ func (model *Model) sent(result resultMsg) tea.Cmd {
 		model.receiveDirect(direct)
 		return nil
 	}
-	if current && model.before == 0 {
+	if current {
 		return model.loadPage(0)
 	}
 	return nil
@@ -802,7 +879,7 @@ func (model *Model) notification(notification client.Notification) tea.Cmd {
 		}
 		room := model.ensureRoom(event.Room)
 		if model.screen == roomScreen && event.Room == model.room {
-			if model.before == 0 {
+			if model.viewport.AtBottom() {
 				return model.loadPage(0)
 			}
 			model.unseen++
@@ -837,7 +914,7 @@ func (model *Model) notification(notification client.Notification) tea.Cmd {
 		}
 		if room.Connected {
 			room.Name, room.State, room.Presence, room.Role = connection.State.Name, connection.State, &connection.Presence, connection.Connection.Role
-			if model.screen == roomScreen && model.room == room.ID && model.before == 0 {
+			if model.screen == roomScreen && model.room == room.ID {
 				return model.loadPage(0)
 			}
 		}

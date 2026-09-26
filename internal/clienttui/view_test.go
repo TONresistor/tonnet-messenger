@@ -196,3 +196,145 @@ func TestOnlyBottomBorderEmbedsTime(t *testing.T) {
 		t.Fatalf("time should sit on the right: %q", bottom)
 	}
 }
+
+func TestChatMouseScrollPreservesDraftAndReadingPosition(t *testing.T) {
+	for _, screen := range []screen{roomScreen, directScreen} {
+		model, _ := fixture(t)
+		model.move(screen)
+		model.input.SetValue("unfinished message")
+		model.viewport.SetContent(strings.Repeat("history line\n", 100))
+		model.viewport.GotoBottom()
+		if model.View().MouseMode != tea.MouseModeCellMotion {
+			t.Fatal("chat does not request mouse events")
+		}
+		bottom := model.viewport.YOffset()
+		model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+		if model.viewport.YOffset() >= bottom {
+			t.Fatal("wheel up did not scroll history")
+		}
+		model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+		if model.viewport.YOffset() != bottom || model.input.Value() != "unfinished message" {
+			t.Fatal("wheel down lost position or changed the draft")
+		}
+	}
+}
+
+func TestChatArrowsScrollWhileEditingDraft(t *testing.T) {
+	for _, target := range []screen{roomScreen, directScreen} {
+		model, _ := fixture(t)
+		model.move(target)
+		model.input.SetValue("unfinished message")
+		model.input.CursorEnd()
+		end := model.input.Position()
+		model.viewport.SetContent(strings.Repeat("history line\n", 100))
+		model.viewport.GotoBottom()
+		bottom := model.viewport.YOffset()
+
+		model.Update(tea.KeyPressMsg{Code: tea.KeyLeft})
+		if model.input.Position() != end-1 || model.viewport.YOffset() != bottom {
+			t.Fatal("left arrow must move only the input cursor")
+		}
+		model.Update(tea.KeyPressMsg{Code: tea.KeyUp})
+		if model.viewport.YOffset() != bottom-1 || model.input.Position() != end-1 {
+			t.Fatal("up arrow must scroll one line without moving the input cursor")
+		}
+		model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+		if model.viewport.YOffset() != bottom || model.input.Position() != end-1 {
+			t.Fatal("down arrow must scroll one line without moving the input cursor")
+		}
+		model.Update(tea.KeyPressMsg{Code: tea.KeyRight})
+		if model.input.Position() != end || model.viewport.YOffset() != bottom || model.input.Value() != "unfinished message" {
+			t.Fatal("arrow navigation changed the draft or lost its cursor position")
+		}
+	}
+}
+
+func TestLiveRefreshDoesNotInterruptScrolledReader(t *testing.T) {
+	model, _ := fixture(t)
+	model.move(roomScreen)
+	for index := 0; index < 30; index++ {
+		model.page.Items = append(model.page.Items, Event{Seqno: int64(index + 1), Kind: "message", Text: fmt.Sprintf("message-%d", index)})
+	}
+	model.refreshViewport(true)
+	model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelUp})
+	offset := model.viewport.YOffset()
+	oldCount := len(model.page.Items)
+	page := Page{Items: append(append([]Event(nil), model.page.Items...), Event{Seqno: 31, Kind: "message", Text: "new message"})}
+	command := model.result(resultMsg{Kind: "page", ID: model.pageRequest, Room: model.room, Value: page})
+	if command != nil || model.viewport.YOffset() != offset || len(model.page.Items) != oldCount+1 || model.unseen == 0 {
+		t.Fatal("live refresh interrupted the reader")
+	}
+	for attempts := 0; attempts < 20 && !model.viewport.AtBottom(); attempts++ {
+		_, command = model.Update(tea.MouseWheelMsg{Button: tea.MouseWheelDown})
+	}
+	if command == nil || !model.viewport.AtBottom() {
+		t.Fatal("returning to bottom did not resume live updates")
+	}
+	model.result(resultMsg{Kind: "page", ID: model.pageRequest, Room: model.room, Value: page})
+	if len(model.page.Items) != oldCount+1 || !model.viewport.AtBottom() || model.unseen != 0 {
+		t.Fatal("live updates did not follow the latest message")
+	}
+}
+
+func TestScrollToTopLoadsOlderHistory(t *testing.T) {
+	for _, message := range []tea.Msg{
+		tea.MouseWheelMsg{Button: tea.MouseWheelUp},
+		tea.KeyPressMsg{Code: tea.KeyUp},
+		tea.KeyPressMsg{Code: tea.KeyPgUp},
+	} {
+		model, _ := fixture(t)
+		model.move(roomScreen)
+		execute(t, model, model.loadPage(0))
+		model.viewport.SetYOffset(1)
+		_, command := model.Update(message)
+		execute(t, model, command)
+		if len(model.page.Items) != 200 || model.page.Items[0].Seqno != 401 || model.viewport.AtTop() {
+			t.Fatal("scrolling to the top did not prepend older history and preserve the visible message")
+		}
+	}
+}
+
+func TestReturningLiveFillsMultiplePagesWithoutDroppingHistory(t *testing.T) {
+	model, backend := fixture(t)
+	model.move(roomScreen)
+	execute(t, model, model.loadPage(0))
+	execute(t, model, model.older())
+	model.viewport.GotoTop()
+	backend.latestSeq = 850
+	model.notification(client.Notification{Method: "room.event", Params: map[string]any{"room": testRoom, "seqno": "850", "kind": "message"}})
+	model.viewport.GotoBottom()
+	_, command := model.Update(tea.KeyPressMsg{Code: tea.KeyDown})
+	execute(t, model, command)
+	if len(model.page.Items) != 450 || !model.viewport.AtBottom() || model.unseen != 0 {
+		t.Fatal("returning live did not retain old history and catch up completely")
+	}
+	for index, event := range model.page.Items {
+		if event.Seqno != int64(401+index) {
+			t.Fatalf("history has a gap or duplicate at index %d: sequence %d", index, event.Seqno)
+		}
+	}
+}
+
+func TestOlderHistoryKeepsRecentMessagesAndReadingPosition(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+	model, _ := fixture(t)
+	model.move(roomScreen)
+	execute(t, model, model.loadPage(0))
+	model.input.SetValue("unfinished message")
+	model.viewport.SetYOffset(5)
+	visible := model.viewport.View()
+	_, command := model.Update(tea.KeyPressMsg{Code: 'o', Mod: tea.ModCtrl})
+	execute(t, model, command)
+	if len(model.page.Items) != 200 || model.page.Items[0].Seqno != 401 || model.page.Items[199].Seqno != 600 {
+		t.Fatal("loading older history replaced the recent messages")
+	}
+	if model.viewport.View() != visible {
+		t.Fatal("prepending history moved the message being read")
+	}
+	for attempts := 0; attempts < 100 && !model.viewport.AtBottom(); attempts++ {
+		model.Update(tea.KeyPressMsg{Code: tea.KeyPgDown})
+	}
+	if !model.viewport.AtBottom() || !strings.Contains(model.viewport.View(), "600") || model.input.Value() != "unfinished message" {
+		t.Fatal("scrolling down did not return to the latest message with the draft intact")
+	}
+}
