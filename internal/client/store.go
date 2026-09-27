@@ -195,20 +195,13 @@ FROM joined_rooms ORDER BY reference`)
 				return fmt.Errorf("client store: invalid pinned genesis for %x: %w", record.RoomKey, err)
 			}
 		}
-		if len(item.rawState) > 0 {
-			record.State, err = community.DecodeRoomState(item.rawState)
-			if err != nil {
-				if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
-					return err
-				}
-				continue
-			}
-		}
 		if len(record.Genesis.RoomKey) == 0 {
-			if record.HeadSeqno != 0 || len(record.State.RoomID) != 0 || !bytes.Equal(record.HeadHash, community.Zero256()) {
-				if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
-					return err
-				}
+			var hasEvents bool
+			if err := s.db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM room_events WHERE room_key=?)", record.RoomKey).Scan(&hasEvents); err != nil {
+				return err
+			}
+			if hasEvents || record.HeadSeqno != 0 || len(item.rawState) != 0 || !bytes.Equal(record.HeadHash, community.Zero256()) {
+				return fmt.Errorf("client store: missing pinned genesis for %x", record.RoomKey)
 			}
 			continue
 		}
@@ -218,17 +211,16 @@ FROM joined_rooms ORDER BY reference`)
 			}
 			return fmt.Errorf("client store: invalid pinned genesis for %x: %w", record.RoomKey, err)
 		}
-		projection, projectionErr := s.projectRoom(ctx, record.RoomKey, record.Genesis)
-		stateErr := error(nil)
-		if projectionErr == nil {
-			if len(record.State.RoomID) == 0 {
-				stateErr = fmt.Errorf("missing signed room state")
-			} else {
-				stateErr = projection.ValidateState(record.State)
-			}
+		projection, err := s.projectRoom(ctx, record.RoomKey, record.Genesis)
+		if err != nil {
+			return fmt.Errorf("client store: invalid history for %x: %w", record.RoomKey, err)
 		}
-		if projectionErr != nil || stateErr != nil {
-			if err := s.resetRoomCache(ctx, record.RoomKey); err != nil {
+		if len(item.rawState) == 0 {
+			continue
+		}
+		state, err := community.DecodeRoomState(item.rawState)
+		if err != nil || projection.ValidateState(state) != nil {
+			if err := s.clearRoomState(ctx, record.RoomKey); err != nil {
 				return err
 			}
 		}
@@ -393,12 +385,13 @@ func (s *clientStore) projectRoom(ctx context.Context, roomKey []byte, genesis c
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	record, err := s.room(ctx, roomKey)
-	if err != nil {
+	var storedHead int64
+	var storedHash []byte
+	if err := s.db.QueryRowContext(ctx, "SELECT head_seqno,head_hash FROM joined_rooms WHERE room_key=?", roomKey).Scan(&storedHead, &storedHash); err != nil {
 		return nil, err
 	}
 	headSeqno, headHash := projection.Head()
-	if headSeqno != record.HeadSeqno || !bytes.Equal(headHash, record.HeadHash) {
+	if headSeqno != storedHead || !bytes.Equal(headHash, storedHash) {
 		return nil, fmt.Errorf("client store: projected event head mismatch")
 	}
 	return projection, nil
@@ -575,19 +568,9 @@ func (s *clientStore) deleteRoom(ctx context.Context, roomKey []byte) error {
 	return err
 }
 
-func (s *clientStore) resetRoomCache(ctx context.Context, roomKey []byte) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, "DELETE FROM room_events WHERE room_key=?", roomKey); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE joined_rooms SET raw_state=NULL,head_seqno=0,head_hash=? WHERE room_key=?`, community.Zero256(), roomKey); err != nil {
-		return err
-	}
-	return tx.Commit()
+func (s *clientStore) clearRoomState(ctx context.Context, roomKey []byte) error {
+	_, err := s.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=NULL WHERE room_key=?", roomKey)
+	return err
 }
 
 func nullableBytes(value []byte) any {

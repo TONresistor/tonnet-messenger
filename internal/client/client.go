@@ -927,19 +927,9 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if err != nil {
 		return err
 	}
-	projection, projectionErr := r.client.store.projectRoom(ctx, r.key, session.Genesis)
-	if projectionErr != nil {
-		if record.HeadSeqno > 0 {
-			if resetErr := r.client.store.resetRoomCache(ctx, r.key); resetErr != nil {
-				return resetErr
-			}
-			record.HeadSeqno = 0
-			record.HeadHash = community.Zero256()
-			projection, projectionErr = community.NewProjection(session.Genesis)
-		}
-		if projectionErr != nil {
-			return projectionErr
-		}
+	projection, err := r.client.store.projectRoom(ctx, r.key, session.Genesis)
+	if err != nil {
+		return err
 	}
 	for {
 		var page community.EventList

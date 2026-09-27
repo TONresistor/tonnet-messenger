@@ -453,7 +453,7 @@ func TestClientStoreRejectsConflictingCommitForSameProposal(t *testing.T) {
 	}
 }
 
-func TestClientStorePinsGenesisAcrossCacheReset(t *testing.T) {
+func TestClientStorePinsGenesisAcrossStateInvalidation(t *testing.T) {
 	ctx := context.Background()
 	store, err := openClientStore(ctx, filepath.Join(t.TempDir(), "client.db"))
 	if err != nil {
@@ -482,7 +482,7 @@ func TestClientStorePinsGenesisAcrossCacheReset(t *testing.T) {
 	if err := store.pinGenesis(ctx, genesis.RoomKey, conflict); err == nil {
 		t.Fatal("conflicting genesis accepted")
 	}
-	if err := store.resetRoomCache(ctx, genesis.RoomKey); err != nil {
+	if err := store.clearRoomState(ctx, genesis.RoomKey); err != nil {
 		t.Fatal(err)
 	}
 	record, err := store.room(ctx, genesis.RoomKey)
@@ -492,7 +492,7 @@ func TestClientStorePinsGenesisAcrossCacheReset(t *testing.T) {
 	want, _ := community.Encode(genesis)
 	got, _ := community.Encode(record.Genesis)
 	if !bytes.Equal(got, want) {
-		t.Fatal("cache reset replaced pinned genesis")
+		t.Fatal("state invalidation replaced pinned genesis")
 	}
 }
 
