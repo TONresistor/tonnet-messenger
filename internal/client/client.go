@@ -86,6 +86,7 @@ type Client struct {
 	closed        bool
 	identityEpoch uint64
 	identityOps   sync.Mutex
+	receivedDMs   directReplayCache
 	submissionMu  sync.RWMutex
 	notifyMu      sync.Mutex
 	notifyWG      sync.WaitGroup
@@ -386,6 +387,7 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	c.key = key
 	c.domain = ""
 	c.identityEpoch++
+	c.receivedDMs = directReplayCache{}
 	identity := Identity{Key: keyText(key.Public().(ed25519.PublicKey)), Name: c.name}
 	c.mu.Unlock()
 	if err := c.notify(c.ctx, "identity.changed", identity); err != nil {
@@ -1047,7 +1049,10 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, 
 	if !r.isCurrentSession(session, epoch) {
 		return
 	}
-	id, _ := community.HashBoxed(direct)
+	id, err := community.HashBoxed(direct)
+	if err != nil {
+		return
+	}
 	view := map[string]any{
 		"room": keyText(r.key), "id": keyText(id), "peer_key": keyText(direct.FromKey),
 		"text": string(plain), "timestamp": direct.Timestamp, "direction": "received", "author_name": direct.AuthorName,
@@ -1058,7 +1063,8 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, 
 	if domain != "" {
 		view["domain"] = domain
 	}
-	_ = r.notifyForSession(r.ctx, session, epoch, "dm.message", view)
+	expires := time.Unix(direct.Timestamp, 0).Add(community.MutationClockSkew)
+	_ = r.notifyDirectForSession(r.ctx, session, epoch, [32]byte(id), expires, view)
 }
 
 func (r *roomHandle) enqueueCanonical(session *replica.Session, epoch uint64, event community.CommittedEvent, result chan error) error {
