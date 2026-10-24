@@ -65,6 +65,13 @@ func (s *Store) Commit(ctx context.Context, proposal community.EventProposal, ro
 		}
 		return CommitResult{}, reject(code, "proposal verification failed", err)
 	}
+	state, err := stateTx(ctx, tx)
+	if err != nil {
+		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot load room state", err)
+	}
+	if err := authorize(ctx, tx, genesis, state, proposal); err != nil {
+		return CommitResult{}, err
+	}
 	if _, err := tx.ExecContext(ctx, "DELETE FROM request_nonces WHERE expires_at<=?", now.Unix()); err != nil {
 		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot expire nonces", err)
 	}
@@ -76,13 +83,6 @@ SELECT 1 FROM request_nonces WHERE author_key=? AND nonce=? AND expires_at>?)`,
 	}
 	if nonceExists != 0 {
 		return CommitResult{}, reject(community.RejectReusedNonce, "nonce already used", nil)
-	}
-	state, err := stateTx(ctx, tx)
-	if err != nil {
-		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot load room state", err)
-	}
-	if err := authorize(ctx, tx, genesis, state, proposal); err != nil {
-		return CommitResult{}, err
 	}
 
 	var headSeqno int64

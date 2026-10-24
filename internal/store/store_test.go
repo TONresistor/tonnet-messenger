@@ -140,6 +140,51 @@ func TestCommitIsDurableOrderedAndIdempotent(t *testing.T) {
 	}
 }
 
+func TestCommitChecksAuthorizationBeforeNonceReuse(t *testing.T) {
+	f := newFixture(t)
+	nonce := randomNonce(t)
+	original := f.proposal(t, f.user, community.EventMessage{Text: "accepted"}, nonce, f.now)
+	first, err := f.store.Commit(f.ctx, original, f.room, f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := f.proposal(t, f.room, community.EventWritePolicy{AnyoneCanWrite: false}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, policy, f.room, f.now); err != nil {
+		t.Fatal(err)
+	}
+	head, err := f.store.Head(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reused := f.proposal(t, f.user, community.EventMessage{Text: "denied"}, nonce, f.now)
+	if _, err := f.store.Commit(f.ctx, reused, f.room, f.now); rejectionCode(err) != community.RejectPermissionDenied {
+		t.Fatalf("unauthorized nonce reuse error = %v", err)
+	}
+	afterRejection, err := f.store.Head(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRejection.Seqno != head.Seqno || !bytes.Equal(afterRejection.Hash, head.Hash) {
+		t.Fatalf("head changed after rejected proposal: before=%+v after=%+v", head, afterRejection)
+	}
+
+	duplicate, err := f.store.Commit(f.ctx, original, f.room, f.now.Add(6*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !duplicate.Duplicate || duplicate.Event.Seqno != first.Event.Seqno || !bytes.Equal(duplicate.Event.Signature, first.Event.Signature) {
+		t.Fatalf("original proposal was not returned unchanged after write restriction and expiry: %+v", duplicate)
+	}
+	afterDuplicate, err := f.store.Head(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDuplicate.Seqno != head.Seqno || !bytes.Equal(afterDuplicate.Hash, head.Hash) {
+		t.Fatalf("head changed after duplicate: before=%+v after=%+v", head, afterDuplicate)
+	}
+}
+
 func TestCommitAcceptsNonceAfterRetentionExpires(t *testing.T) {
 	f := newFixture(t)
 	nonce := randomNonce(t)
