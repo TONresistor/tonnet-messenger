@@ -77,19 +77,20 @@ type Client struct {
 	store         *clientStore
 	lock          *stateLock
 
-	mu            sync.RWMutex
-	rooms         map[string]*roomHandle
-	name          string
-	domain        string
-	profiles      map[string]string
-	events        chan Notification
-	closed        bool
-	identityEpoch uint64
-	identityOps   sync.Mutex
-	submissionMu  sync.RWMutex
-	notifyMu      sync.Mutex
-	notifyWG      sync.WaitGroup
-	notifyClosed  bool
+	mu              sync.RWMutex
+	rooms           map[string]*roomHandle
+	name            string
+	domain          string
+	profiles        map[string]string
+	events          chan Notification
+	closed          bool
+	identityEpoch   uint64
+	identityOps     sync.Mutex
+	submissionMu    sync.RWMutex
+	notifyMu        sync.Mutex
+	notifyWG        sync.WaitGroup
+	notifyClosed    bool
+	freshnessChecks chan struct{}
 }
 
 type roomHandle struct {
@@ -118,6 +119,8 @@ type roomHandle struct {
 	events          chan canonicalEvent
 	workers         sync.WaitGroup
 	ingestDone      bool
+	freshness       relayFreshness
+	excludedRelays  map[string]time.Time
 }
 
 type canonicalEvent struct {
@@ -195,6 +198,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		directAddress: cfg.DirectAddress, directPublic: append(ed25519.PublicKey(nil), cfg.DirectPublic...),
 		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
+		freshnessChecks: make(chan struct{}, 1),
 	}
 	return c, nil
 }
@@ -430,7 +434,7 @@ func (c *Client) Join(ctx context.Context, reference string, bootstrap []byte) (
 		return JoinResult{}, err
 	}
 	return JoinResult{
-		Room: keyText(roomKey), State: stateView(state.State, verifiedHead),
+		Room: keyText(roomKey), State: handle.stateView(state.State, verifiedHead),
 		Connection: connection, Presence: presenceView(state),
 		Timeline: map[string]any{"items": items, "has_more": hasMore},
 	}, nil
@@ -503,7 +507,9 @@ func (c *Client) RoomState(roomText string) (map[string]any, error) {
 	}
 	handle.mu.RLock()
 	defer handle.mu.RUnlock()
-	return stateView(handle.state.State, handle.verifiedHead), nil
+	view := stateView(handle.state.State, handle.verifiedHead)
+	view["freshness"] = handle.freshness.view()
+	return view, nil
 }
 
 func (c *Client) SendMessage(ctx context.Context, roomText, text string) (map[string]any, error) {
@@ -817,17 +823,26 @@ func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 		}
 		r.mu.RLock()
 		session := r.session
+		epoch := r.sessionEpoch
 		r.mu.RUnlock()
 		if session == nil {
 			continue
 		}
-		select {
-		case <-ctx.Done():
-			r.closeSessionIf(session)
-			return
-		case <-session.Done:
-			r.closeSessionIf(session)
+		timer := time.NewTimer(r.nextFreshnessCheck())
+		for r.isCurrentSession(session, epoch) {
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				r.closeSessionIf(session)
+				return
+			case <-session.Done:
+				r.closeSessionIf(session)
+			case <-timer.C:
+				_ = r.checkFreshness(ctx, session, epoch, time.Now())
+				timer.Reset(r.nextFreshnessCheck())
+			}
 		}
+		timer.Stop()
 	}
 }
 
@@ -847,6 +862,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	session, err := replica.DialRoom(ctx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
 		DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
+		ExcludedPublicKeys: r.excludedRelayKeys(time.Now()),
 	})
 	if err != nil {
 		return err
@@ -889,7 +905,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	}
 	if err := r.notifyLiveSession(ctx, session, identityEpoch, "room.connection", map[string]any{
 		"room": keyText(r.key), "status": "connected",
-		"state": stateView(state.State, verifiedHead), "connection": connection, "presence": presenceView(state),
+		"state": r.stateView(state.State, verifiedHead), "connection": connection, "presence": presenceView(state),
 	}); err != nil {
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
@@ -913,6 +929,7 @@ func (r *roomHandle) installSession(session *replica.Session, identity ed25519.P
 	defer r.mu.Unlock()
 	r.session = session
 	r.sessionEpoch = epoch
+	r.freshness.status, r.freshness.reason = "unverified", "not_checked"
 	return nil
 }
 
@@ -1000,7 +1017,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	r.projection = projection
 	r.verifiedHead = verifiedHead
 	r.mu.Unlock()
-	if err := r.notifyForSession(ctx, session, epoch, "room.state", stateView(state.State, verifiedHead)); err != nil {
+	if err := r.notifyForSession(ctx, session, epoch, "room.state", r.stateView(state.State, verifiedHead)); err != nil {
 		return err
 	}
 	return r.notifyForSession(ctx, session, epoch, "room.presence", presenceView(state))
@@ -1223,7 +1240,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 		return true, err
 	}
 	if state != nil {
-		if err := r.notifyForSession(ctx, session, epoch, "room.state", stateView(state.State, event.Seqno)); err != nil {
+		if err := r.notifyForSession(ctx, session, epoch, "room.state", r.stateView(state.State, event.Seqno)); err != nil {
 			return true, err
 		}
 		if err := r.notifyForSession(ctx, session, epoch, "room.presence", presenceView(*state)); err != nil {

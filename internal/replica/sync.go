@@ -14,6 +14,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/address"
 	tondht "github.com/xssnick/tonutils-go/adnl/dht"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
+	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -23,12 +24,13 @@ import (
 )
 
 type Config struct {
-	ConfigURL     string
-	RoomID        []byte
-	NodeKey       ed25519.PrivateKey
-	BootstrapADNL []byte
-	DirectAddress string
-	DirectPublic  ed25519.PublicKey
+	ConfigURL          string
+	RoomID             []byte
+	NodeKey            ed25519.PrivateKey
+	BootstrapADNL      []byte
+	DirectAddress      string
+	DirectPublic       ed25519.PublicKey
+	ExcludedPublicKeys [][]byte
 }
 
 type Result struct {
@@ -171,7 +173,7 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 			discoveryGateway.Close()
 			return nil, nil, err
 		}
-		targets, err = resolveTargets(ctx, dhtClient, cfg.RoomID, cfg.BootstrapADNL)
+		targets, err = resolveTargets(ctx, dhtClient, cfg.RoomID, cfg.BootstrapADNL, cfg.ExcludedPublicKeys)
 		discoveryGateway.Close()
 		if err != nil {
 			return nil, nil, err
@@ -183,6 +185,9 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 	}
 	closeClient := func() { gateway.Close() }
 	for _, candidate := range targets {
+		if excludedPublicKey(candidate.public, cfg.ExcludedPublicKeys) {
+			continue
+		}
 		peer, err := gateway.DialDefault(ctx, candidate.public, candidate.address)
 		if err != nil {
 			continue
@@ -212,7 +217,29 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 	return nil, nil, fmt.Errorf("replica: no live authoritative endpoint")
 }
 
-func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, bootstrapADNL []byte) ([]target, error) {
+func excludedPublicKey(public []byte, excluded [][]byte) bool {
+	for _, key := range excluded {
+		if bytes.Equal(public, key) {
+			return true
+		}
+	}
+	return false
+}
+
+type targetResolver interface {
+	FindAddresses(context.Context, []byte) (*address.List, ed25519.PublicKey, error)
+	FindOverlayNodes(context.Context, []byte, ...*tondht.Continuation) (*tonoverlay.NodesList, *tondht.Continuation, error)
+}
+
+func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, bootstrapADNL []byte, excluded [][]byte) ([]target, error) {
+	for _, public := range excluded {
+		id, err := community.KeyID(public)
+		if err == nil && bytes.Equal(id, bootstrapADNL) {
+			// A stale bootstrap must not prevent trying another room node.
+			bootstrapADNL = nil
+			break
+		}
+	}
 	var ids [][]byte
 	if len(bootstrapADNL) > 0 {
 		ids = append(ids, bootstrapADNL)
@@ -229,6 +256,9 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 			if !ok || len(public.Key) != ed25519.PublicKeySize {
 				continue
 			}
+			if excludedPublicKey(public.Key, excluded) {
+				continue
+			}
 			id, err := tl.Hash(node.ID)
 			if err == nil {
 				ids = append(ids, id)
@@ -243,6 +273,9 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 		}
 		resolvedID, err := community.KeyID(public)
 		if err != nil || !bytes.Equal(resolvedID, id) {
+			continue
+		}
+		if excludedPublicKey(public, excluded) {
 			continue
 		}
 		for _, candidate := range addresses.Addresses {
