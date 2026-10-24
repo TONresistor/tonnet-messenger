@@ -5,7 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"encoding/hex"
+	"fmt"
 	"net"
 	"path/filepath"
 	"testing"
@@ -314,14 +314,6 @@ func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sequencerRuntime.Close()
-	session, err := replica.DialSequencer(ctx, replica.Config{
-		RoomID: genesis.RoomKey, NodeKey: relayKey, DirectAddress: listen,
-		DirectPublic: sequencerKey.Public().(ed25519.PublicKey),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
 
 	relayStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "relay.db"))
 	if err != nil {
@@ -334,16 +326,55 @@ func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
 	if err := relayStore.InstallReplicaState(ctx, initialState); err != nil {
 		t.Fatal(err)
 	}
-	peers := newPeerTable(DefaultMaxLeaves)
-	sequencerID, err := community.KeyID(genesis.NodeKey)
+	destination, err := New(Config{
+		Key: relayKey, Listen: integrationAddress(t), Genesis: &genesis,
+		Store: relayStore, NodeRole: community.NodeRoleRelay,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	peerID := hex.EncodeToString(sequencerID)
-	sequencerPeer := newPeer(peerID, kindNode, session.Peer, nil)
-	sequencerPeer.state = peerHealthy
-	peers.m[peerID] = sequencerPeer
-	destination := &Node{store: relayStore, peers: peers, genesis: genesis}
+	defer destination.Close()
+	for index := 0; index < MaxNodePeers; index++ {
+		id := fmt.Sprintf("fake-%d", index)
+		p := newPeer(id, kindNode, nil, nil)
+		p.state = peerHealthy
+		destination.peers.m[id] = p
+	}
+	// Even saturated gossip dials must leave room for authoritative discovery.
+	for index := 0; index < maxConcurrentDials-1; index++ {
+		if !destination.acquireDial() {
+			t.Fatal("ordinary dial capacity unexpectedly exhausted")
+		}
+		defer destination.releaseDial()
+	}
+	if destination.acquireDial() {
+		destination.releaseDial()
+		t.Fatal("gossip consumed the reserved authority dial")
+	}
+	resolve := func(_ context.Context, id []byte) ([]string, ed25519.PublicKey, error) {
+		expected, _ := community.KeyID(genesis.NodeKey)
+		if !bytes.Equal(id, expected) {
+			t.Fatal("resolved an identity other than the pinned sequencer")
+		}
+		return []string{listen}, ed25519.PublicKey(genesis.NodeKey), nil
+	}
+	if err := destination.ensureSequencerLink(ctx, resolve); err != nil {
+		t.Fatal(err)
+	}
+	if _, connected := destination.sequencerPeer(); !connected {
+		t.Fatal("sequencer was not admitted beyond the 16 ordinary node slots")
+	}
+	if _, nodes := destination.peers.counts(); nodes != MaxNodePeers+1 {
+		t.Fatalf("node count=%d, want %d", nodes, MaxNodePeers+1)
+	}
+	if p, _, _ := destination.peers.addInbound("extra", nil); p == nil {
+		// Unknown peers remain leaves; only the sequencer gets the node exception.
+		t.Fatal("unexpected leaf rejection")
+	}
+	destination.peers.markKnown("extra")
+	if destination.peers.setSigned("extra", nil) {
+		t.Fatal("ordinary peer received the sequencer capacity exception")
+	}
 	if err := destination.reconcileReplicaOnce(); err != nil {
 		t.Fatal(err)
 	}
@@ -353,6 +384,16 @@ func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
 	}
 	if destination.stats.replayedItems.Load() != 1 {
 		t.Fatalf("replayed items = %d", destination.stats.replayedItems.Load())
+	}
+	sequencer, _ := destination.sequencerPeer()
+	for index := 0; index < peerMaxFailures; index++ {
+		destination.peerFailure(sequencer, time.Now(), "test connection failure")
+	}
+	if _, connected := destination.sequencerPeer(); connected {
+		t.Fatal("capacity reservation kept a failed sequencer connection")
+	}
+	if err := destination.ensureSequencerLink(ctx, resolve); err != nil {
+		t.Fatalf("sequencer did not reconnect after failure: %v", err)
 	}
 }
 

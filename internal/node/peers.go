@@ -69,7 +69,8 @@ type peer struct {
 }
 
 type peerTable struct {
-	maxLeaves int
+	maxLeaves   int
+	sequencerID string
 
 	mu    sync.RWMutex
 	m     map[string]*peer
@@ -115,13 +116,13 @@ func (t *peerTable) addInbound(id string, conn *roomnet.Peer) (*peer, bool, *pee
 		return next, true, p
 	}
 	kind := kindLeaf
-	if _, ok := t.known[id]; ok {
+	if _, ok := t.known[id]; ok || id == t.sequencerID {
 		kind = kindNode
 	}
 	if kind == kindLeaf && t.pendingCountLocked() >= MaxPendingPeers {
 		return nil, false, nil
 	}
-	if kind == kindNode && t.nodeCountLocked() >= MaxNodePeers {
+	if kind == kindNode && id != t.sequencerID && t.nodeCountLocked() >= MaxNodePeers {
 		return nil, false, nil
 	}
 	p := newPeer(id, kind, conn, nil)
@@ -244,7 +245,7 @@ func (t *peerTable) setSigned(id string, signed *tonoverlay.Node) bool {
 	if !ok {
 		return false
 	}
-	if p.kind != kindNode && t.nodeCountLocked() >= MaxNodePeers {
+	if p.kind != kindNode && id != t.sequencerID && t.nodeCountLocked() >= MaxNodePeers {
 		return false
 	}
 	if p.kind != kindNode {
@@ -520,7 +521,7 @@ func (t *peerTable) pendingCountLocked() int {
 func (t *peerTable) nodeCountLocked() int {
 	n := 0
 	for _, p := range t.m {
-		if p.kind == kindNode {
+		if p.kind == kindNode && p.id != t.sequencerID {
 			n++
 		}
 	}

@@ -82,6 +82,7 @@ type Node struct {
 	stats           stats
 	pub             atomic.Pointer[dht.Publisher]
 	dialSem         chan struct{}
+	dialMu          sync.Mutex
 	myID            string
 	started         time.Time
 	genesis         community.Genesis
@@ -189,6 +190,10 @@ func New(cfg Config) (*Node, error) {
 		roomKey:     cfg.RoomKey,
 		nodeRole:    cfg.NodeRole,
 	}
+	if cfg.NodeRole == community.NodeRoleRelay {
+		sequencerID, _ := community.KeyID(n.genesis.NodeKey)
+		n.peers.sequencerID = hex.EncodeToString(sequencerID)
+	}
 	if cfg.ResolveIdentity != nil {
 		n.resolveIdentity = cfg.ResolveIdentity
 	} else {
@@ -292,6 +297,16 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 func (n *Node) publisher() *dht.Publisher { return n.pub.Load() }
 
 func (n *Node) acquireDial() bool {
+	n.dialMu.Lock()
+	defer n.dialMu.Unlock()
+	limit := cap(n.dialSem)
+	if n.nodeRole == community.NodeRoleRelay {
+		// Leave one dial available for the pinned authority, even during gossip floods.
+		limit--
+	}
+	if len(n.dialSem) >= limit {
+		return false
+	}
 	select {
 	case n.dialSem <- struct{}{}:
 		return true

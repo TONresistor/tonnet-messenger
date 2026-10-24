@@ -45,19 +45,31 @@ func (n *Node) discoveryLoop(ctx context.Context) {
 }
 
 func (n *Node) discoverOnce(ctx context.Context) {
+	// Slow untrusted neighbours must not postpone the next authority check indefinitely.
+	ctx, cancel := context.WithTimeout(ctx, DiscoverEach)
+	defer cancel()
 	pub := n.publisher()
 	if pub == nil {
 		return
+	}
+	if err := n.ensureSequencerLink(ctx, pub.ResolveAll); err != nil && ctx.Err() == nil {
+		log.Printf("sequencer link: %v", err)
 	}
 	if list, err := pub.FindOverlayNodes(ctx, n.overlayKey()); err != nil {
 		log.Printf("discover: dht find: %v", err)
 	} else if list != nil {
 		for i := range capNodes(list.List) {
+			if ctx.Err() != nil {
+				return
+			}
 			n.considerNode(ctx, &list.List[i])
 		}
 	}
 
 	for _, p := range n.peers.nodePeers() {
+		if ctx.Err() != nil {
+			return
+		}
 		nodes, ok := n.probeNode(ctx, p)
 		if !ok {
 			continue
@@ -67,6 +79,62 @@ func (n *Node) discoverOnce(ctx context.Context) {
 			n.considerNode(ctx, &nodes[i])
 		}
 	}
+}
+
+func (n *Node) ensureSequencerLink(ctx context.Context, resolve func(context.Context, []byte) ([]string, ed25519.PublicKey, error)) error {
+	if n.nodeRole != community.NodeRoleRelay {
+		return nil
+	}
+	if _, ok := n.sequencerPeer(); ok {
+		return nil
+	}
+	// Ordinary discovery leaves this last slot available to the authority.
+	n.dialMu.Lock()
+	select {
+	case n.dialSem <- struct{}{}:
+		n.dialMu.Unlock()
+	default:
+		n.dialMu.Unlock()
+		return fmt.Errorf("sequencer dial already in progress")
+	}
+	defer n.releaseDial()
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	id, err := community.KeyID(n.genesis.NodeKey)
+	if err != nil {
+		return err
+	}
+	idHex := hex.EncodeToString(id)
+	if p, ok := n.peers.get(idHex); ok {
+		if _, healthy := n.probeNode(ctx, p); healthy {
+			return nil
+		}
+		if n.peers.removePeer(idHex, p) {
+			closePeerConnection(p)
+		}
+	}
+	addresses, public, err := resolve(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(public, n.genesis.NodeKey) {
+		return fmt.Errorf("resolved sequencer key does not match genesis")
+	}
+	for _, endpoint := range addresses {
+		if _, err := n.qgw.DialDefault(ctx, public, endpoint); err != nil {
+			continue
+		}
+		p, ok := n.peers.get(idHex)
+		if ok {
+			if _, healthy := n.probeNode(ctx, p); healthy {
+				return nil
+			}
+			if n.peers.removePeer(idHex, p) {
+				closePeerConnection(p)
+			}
+		}
+	}
+	return fmt.Errorf("no live sequencer address")
 }
 
 func capNodes(nodes []tonoverlay.Node) []tonoverlay.Node {
@@ -162,7 +230,9 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 	defer cancel()
 	nodes, err := p.conn.GetRandomPeers(gctx)
 	if err != nil {
-		n.peerFailure(p, time.Now(), "peer probe failed")
+		if ctx.Err() == nil {
+			n.peerFailure(p, time.Now(), "peer probe failed")
+		}
 		return nil, false
 	}
 	n.peers.markNodeGood(p.id, time.Now())
