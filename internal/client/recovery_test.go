@@ -270,8 +270,13 @@ func TestReconnectRecoversStateWithoutRewindingHistory(t *testing.T) {
 	peer := roomnet.Wrap(raw)
 	session := &replica.Session{Genesis: f.genesis, Peer: peer, Done: peer.Done()}
 	f.handle.session = session
+	retryTime := time.Now()
+	f.handle.syncNow = func() time.Time { return retryTime }
 	for attempt := int32(0); attempt < 3; attempt++ {
 		mode.Store(attempt)
+		if attempt > 0 {
+			retryTime = retryTime.Add(relayExclusionTTL + time.Second)
+		}
 		err := f.handle.syncSessionLocked(ctx, session, 0)
 		if (attempt < 2 && err == nil) || (attempt == 2 && err != nil) {
 			t.Fatalf("sync attempt %d: %v", attempt, err)

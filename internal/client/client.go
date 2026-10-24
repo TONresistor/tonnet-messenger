@@ -920,12 +920,11 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	}
 	syncErr := r.syncSessionLocked(ctx, session, identityEpoch)
 	if syncErr != nil {
-		if errors.Is(syncErr, errCatchupRate) {
-			r.mu.Lock()
-			if r.session == session && r.sessionEpoch == identityEpoch {
-				r.markBehindLocked(session, r.syncTime())
-			}
-			r.mu.Unlock()
+		if ctx.Err() == nil && (errors.Is(syncErr, errCatchupRate) || errors.Is(syncErr, errRelaySync)) && r.isCurrentSession(session, identityEpoch) {
+			// A failed last target remains a readable stale fallback while discovery
+			// tries eligible alternatives. It cannot renew its excluded budget.
+			r.historyMu.Unlock()
+			return r.emitConnected(ctx, session, identityEpoch)
 		}
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
@@ -972,9 +971,20 @@ func (r *roomHandle) installSession(session *replica.Session, identity ed25519.P
 	if r.session != expected {
 		return errRoomSessionChanged
 	}
+	if expected != nil {
+		if old := r.freshness.rates[keyText(expected.Peer.GetPubKey())]; old != nil && old.pausedAt.IsZero() {
+			old.pausedAt = r.syncTime()
+		}
+	}
+	if next := r.freshness.rates[keyText(session.Peer.GetPubKey())]; next != nil && next.completed {
+		next.pausedAt = time.Time{}
+	}
 	r.session = session
 	r.sessionEpoch = epoch
 	r.freshness.status, r.freshness.reason = "unverified", "not_checked"
+	if r.freshness.alarmed {
+		r.freshness.status, r.freshness.reason = "stale", "relay_behind"
+	}
 	if time.Now().Before(r.excludedRelays[keyText(session.Peer.GetPubKey())]) {
 		r.freshness.status, r.freshness.reason = "stale", "excluded_fallback"
 	}
@@ -985,12 +995,28 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	return r.syncSessionFromLocked(ctx, session, session, epoch)
 }
 
-func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expected *replica.Session, epoch uint64) error {
+func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expected *replica.Session, epoch uint64) (syncErr error) {
 	if session == nil || !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
+	parentCtx := ctx
 	progress := r.beginRoomSync(session)
 	defer r.endRoomSync(progress)
+	defer func() {
+		if parentCtx.Err() == nil && (errors.Is(syncErr, errCatchupRate) || errors.Is(syncErr, errRelaySync)) && !errors.Is(syncErr, errFreshnessConflict) {
+			r.mu.Lock()
+			budget := progress.budget
+			if budget == nil {
+				target := r.receivedHead
+				if pending := r.freshness.pending; pending != nil {
+					target = pending.seqno
+				}
+				budget = r.ensureCatchupLocked(target, r.receivedHead, r.syncTime(), session)
+			}
+			r.rejectRelayLocked(session, budget, r.syncTime())
+			r.mu.Unlock()
+		}
+	}()
 	if err := r.client.store.pinGenesis(ctx, r.key, session.Genesis); err != nil {
 		return err
 	}
@@ -1006,9 +1032,15 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	r.receivedHead = max(r.receivedHead, record.HeadSeqno) // Existing cache is not new progress.
 	var budget *catchupRate
 	if pending := r.freshness.pending; pending != nil {
-		budget = r.ensureCatchupLocked(pending.seqno, record.HeadSeqno, r.syncTime())
+		budget = r.ensureCatchupLocked(pending.seqno, record.HeadSeqno, r.syncTime(), session)
+	} else if prior := r.freshness.rates[keyText(session.Peer.GetPubKey())]; prior != nil && (!prior.completed || prior.failed) {
+		budget = r.ensureCatchupLocked(prior.target, record.HeadSeqno, r.syncTime(), session)
 	}
+	blocked := budget != nil && budget.failed
 	r.mu.Unlock()
+	if blocked {
+		return errCatchupRate
+	}
 	var finalCtx context.Context
 	var finalCancel context.CancelFunc
 	defer func() {
@@ -1021,10 +1053,11 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 			phaseCtx, phaseCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
 			r.mu.Lock()
 			now := r.syncTime()
-			if progress.finalizingUntil.IsZero() {
-				progress.finalizingUntil = now.Add(freshnessRepairTimeout)
+			if budget.finalizingUntil.IsZero() {
+				budget.finalizingUntil = now.Add(freshnessRepairTimeout)
 			}
-			remaining := max(time.Duration(0), progress.finalizingUntil.Sub(now))
+			progress.finalizingUntil = budget.finalizingUntil
+			remaining := max(time.Duration(0), budget.finalizingUntil.Sub(now))
 			r.mu.Unlock()
 			var boundCancel context.CancelFunc
 			finalCtx, boundCancel = context.WithTimeout(phaseCtx, remaining)
@@ -1033,16 +1066,33 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 		return finalCtx
 	}
 	queryPage := func(queryCtx context.Context, target int64, catchup bool) error {
-		limit := int64(community.MaxPageLimit)
+		if queryCtx.Err() != nil {
+			return fmt.Errorf("%w: %w", errRelaySync, queryCtx.Err())
+		}
+		if err := r.paceRelayQuery(queryCtx, budget); err != nil {
+			return fmt.Errorf("%w: %w", errRelaySync, err)
+		}
+		limit := int64(catchupPageLimit)
+		if catchup {
+			r.mu.RLock()
+			// Never request a page that a minimum-rate sender cannot deliver
+			// before the already-earned allowance, keeping 2s for overhead.
+			spendable := budget.baseDeadline().Sub(r.syncTime())
+			r.mu.RUnlock()
+			if spendable > 2*time.Second {
+				limit = max(int64(1), min(int64(maxCatchupPageLimit), int64(spendable/time.Second)-2))
+			}
+		}
 		if target >= 0 {
 			limit = max(int64(1), min(limit, target-record.HeadSeqno))
 		}
-		pageCtx, cancel := context.WithTimeout(queryCtx, 10*time.Second)
+		pageTimeout := max(10*time.Second, time.Duration(limit)*time.Second+2*time.Second)
+		pageCtx, cancel := r.freshnessContext(queryCtx, pageTimeout)
 		var page community.EventList
 		err := session.Peer.Query(pageCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: int32(limit)}, &page)
 		cancel()
 		if err != nil {
-			return err
+			return fmt.Errorf("%w: %w", errRelaySync, err)
 		}
 		for _, event := range page.Events {
 			if catchup {
@@ -1082,17 +1132,20 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	}
 	queryState := func(queryCtx context.Context) (community.RoomStateResult, error) {
 		var state community.RoomStateResult
+		if err := r.paceRelayQuery(queryCtx, budget); err != nil {
+			return state, fmt.Errorf("%w: %w", errRelaySync, err)
+		}
 		stateCtx, cancel := context.WithTimeout(queryCtx, 10*time.Second)
 		err := session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
 		cancel()
 		if err != nil {
-			return state, err
+			return state, fmt.Errorf("%w: %w", errRelaySync, err)
 		}
 		if !r.isCurrentSession(expected, epoch) {
 			return state, errRoomSessionChanged
 		}
 		if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
-			return state, fmt.Errorf("invalid room state")
+			return state, fmt.Errorf("%w: invalid room state", errRelaySync)
 		}
 		return state, nil
 	}
@@ -1113,7 +1166,7 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 		if pending := r.freshness.pending; pending != nil {
 			target = pending.seqno
 		}
-		budget = r.ensureCatchupLocked(target, record.HeadSeqno, r.syncTime())
+		budget = r.ensureCatchupLocked(target, record.HeadSeqno, r.syncTime(), session)
 		r.mu.Unlock()
 	} else {
 		r.mu.RLock()
@@ -1148,7 +1201,7 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 			return err
 		}
 		if record.HeadSeqno == before {
-			return fmt.Errorf("relay did not advance toward checkpoint")
+			return fmt.Errorf("%w: did not advance toward checkpoint", errRelaySync)
 		}
 		r.mu.Lock()
 		_, err = r.rateDeadlineLocked(budget, session, r.syncTime())
@@ -1159,9 +1212,24 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	}
 	// Freeze ONE current-state response J after H. Fetch through J only, under F;
 	// continuous writes/HasMore cannot extend J or restart the finalization timer.
-	state, err := queryState(finalize())
-	if err != nil {
-		return err
+	phase := finalize()
+	r.mu.RLock()
+	frozen := budget.finalState
+	r.mu.RUnlock()
+	var state community.RoomStateResult
+	if frozen != nil {
+		state = *frozen
+		if err := phase.Err(); err != nil {
+			return fmt.Errorf("%w: %w", errRelaySync, err)
+		}
+	} else {
+		state, err = queryState(phase)
+		if err != nil {
+			return err
+		}
+		r.mu.Lock()
+		budget.finalState = &state
+		r.mu.Unlock()
 	}
 	finalTarget := state.Stats.ReplicaSeqno
 	for record.HeadSeqno < finalTarget {
@@ -1170,13 +1238,16 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 			return err
 		}
 		if record.HeadSeqno == before {
-			return fmt.Errorf("relay did not reach frozen state head")
+			return fmt.Errorf("%w: did not reach frozen state head", errRelaySync)
 		}
 	}
 	if !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
 	ctx = finalCtx
+	if err := projection.ValidateState(state.State); err != nil {
+		return fmt.Errorf("%w: %w", errRelaySync, err)
+	}
 	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, projection, state.State); err != nil {
 		return err
 	}
@@ -1193,6 +1264,7 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	r.state = state
 	r.projection = projection
 	r.verifiedHead = verifiedHead
+	budget.completed = true
 	r.mu.Unlock()
 	if stateChanged {
 		if err := r.notifyForSession(ctx, expected, epoch, "room.state", r.stateView(state.State, verifiedHead)); err != nil {
@@ -1312,7 +1384,7 @@ func (r *roomHandle) ingestLoop(ctx context.Context) {
 			return
 		case item := <-r.events:
 			durable, err := r.processCanonical(ctx, item.session, item.epoch, item.event)
-			if err != nil {
+			if err != nil && !errors.Is(err, errCatchupRate) && !errors.Is(err, errRelaySync) {
 				r.closeSessionIf(item.session)
 			}
 			if durable {
@@ -1362,9 +1434,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 		return false, err
 	}
 	if event.Seqno > record.HeadSeqno+1 {
-		gapCtx, gapCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
-		err := r.syncSessionLocked(gapCtx, session, epoch)
-		gapCancel()
+		err := r.syncSessionLocked(ctx, session, epoch)
 		if err != nil {
 			durable, lookupErr := r.client.store.hasEvent(ctx, r.key, event)
 			if lookupErr != nil {
@@ -1493,6 +1563,11 @@ func (r *roomHandle) detachSessionIf(expected *replica.Session) *replica.Session
 	if expected != nil && session != expected {
 		r.mu.Unlock()
 		return nil
+	}
+	if session != nil {
+		if budget := r.freshness.rates[keyText(session.Peer.GetPubKey())]; budget != nil && budget.pausedAt.IsZero() {
+			budget.pausedAt = r.syncTime()
+		}
 	}
 	r.session = nil
 	r.sessionEpoch = 0

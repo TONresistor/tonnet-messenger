@@ -753,18 +753,8 @@ func TestFreshnessBusyHistoryStillDetectsBehindRelay(t *testing.T) {
 	relay.mu.Lock()
 	relay.eventGate, relay.onEvents = gate, onEvents
 	relay.mu.Unlock()
-	gapCancel := make(chan context.CancelFunc, 1)
-	var repairs atomic.Int32
 	waits := 0
 	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
-		if budget == freshnessRepairTimeout && repairs.Add(1) == 1 {
-			ctx, cancel := context.WithTimeout(ctx, budget)
-			if _, bounded := ctx.Deadline(); !bounded {
-				t.Error("gap sync has no overall deadline")
-			}
-			gapCancel <- cancel
-			return ctx, cancel
-		}
 		if budget == freshnessLockTimeout {
 			waits++
 			if waits == 2 { // First wait is the global slot, second is historyMu.
@@ -777,8 +767,6 @@ func TestFreshnessBusyHistoryStillDetectsBehindRelay(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() { _, err := handle.processCanonical(handle.ctx, handle.session, 1, events[2]); done <- err }()
-	cancel := <-gapCancel
-	defer cancel()
 	select {
 	case <-onEvents:
 	case <-handle.ctx.Done():
@@ -787,7 +775,10 @@ func TestFreshnessBusyHistoryStillDetectsBehindRelay(t *testing.T) {
 	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if handle.freshness.status != "stale" || len(handle.excludedRelays) != 1 || handle.freshness.failures != 0 {
+	handle.mu.RLock()
+	stale := handle.freshness.status == "stale" && len(handle.excludedRelays) == 1 && handle.freshness.failures == 0
+	handle.mu.RUnlock()
+	if !stale {
 		t.Fatal("history lock concealed proven lag or increased authority backoff")
 	}
 	close(gate)
@@ -871,10 +862,12 @@ func TestFreshnessTwentyMinuteBacklogAtMinimumRateIsNotCut(t *testing.T) {
 	defer func() { cancel(); <-done }()
 	relay.setEvents(events...)
 	relay.mu.Lock()
-	relay.pageLimit = 1
 	relay.beforeEvents = func(req community.GetEvents) {
-		clock.Store(now.Add(time.Duration(req.AfterSeqno+1) * time.Second).UnixNano())
-		if req.AfterSeqno > 0 && req.AfterSeqno%60 == 0 {
+		if req.Limit <= catchupPageLimit || req.Limit > maxCatchupPageLimit {
+			t.Errorf("unexpected adaptive page size: %d", req.Limit)
+		}
+		clock.Store(now.Add(time.Duration(req.AfterSeqno+int64(req.Limit)) * time.Second).UnixNano())
+		if req.AfterSeqno > 0 {
 			handle.mu.RLock()
 			session, epoch := handle.session, handle.sessionEpoch
 			handle.mu.RUnlock()
@@ -916,11 +909,11 @@ func TestFreshnessBelowMinimumRateIsCut(t *testing.T) {
 		clock.Store(now.Add(time.Duration(req.AfterSeqno+1) * 10 * time.Second).UnixNano())
 	}
 	relay.mu.Unlock()
-	if err := handle.connect(handle.ctx); !errors.Is(err, errCatchupRate) {
-		t.Fatalf("slow feeder escaped: %v", err)
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
 	}
-	if handle.session != nil || len(handle.excludedRelays) != 1 || handle.freshness.status != "stale" {
-		t.Fatal("below-rate relay was not closed/excluded")
+	if handle.session == nil || len(handle.excludedRelays) != 1 || handle.freshness.status != "stale" || !handle.freshness.rate.failed {
+		t.Fatal("below-rate relay was not excluded with a readable stale fallback")
 	}
 }
 
@@ -981,13 +974,14 @@ func TestFreshnessRecoveryIsSharedAndSuccessorCanRepayDebt(t *testing.T) {
 func TestFreshnessBusyRelayIsLeftAndAnotherRelayConnects(t *testing.T) {
 	_, handle, authority, relay, events := freshnessTestRoom(t)
 	authority.setEvents(events[0])
-	now := time.Now()
-	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
+	now, original := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, original, 1, now); err != nil {
 		t.Fatal(err)
 	}
 	handle.closeSession()
 	gate := make(chan struct{})
-	defer close(gate)
+	var release sync.Once
+	defer release.Do(func() { close(gate) })
 	requested := make(chan struct{}, 1)
 	relay.mu.Lock()
 	relay.eventGate, relay.onEvents = gate, requested
@@ -1006,42 +1000,40 @@ func TestFreshnessBusyRelayIsLeftAndAnotherRelayConnects(t *testing.T) {
 	select {
 	case slow = <-dialed:
 	case <-handle.ctx.Done():
-		t.Fatal("slow relay was not dialed")
+		t.Fatal("initial dial did not start")
 	}
 	select {
 	case <-requested:
 	case <-handle.ctx.Done():
-		t.Fatal("slow relay did not start sync")
+		t.Fatal("sync did not start")
+	}
+	key := clientTestPrivateKey(t)
+	server := &freshnessTestServer{role: community.NodeRoleRelay}
+	server.setEvents(events[0])
+	endpoint := freshnessTestEndpoint(t, key, original.Genesis, handle.state.State, server)
+	handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
+		release.Do(func() { close(gate) })
+		cfg.DirectAddress, cfg.DirectPublic = endpoint, key.Public().(ed25519.PublicKey)
+		return replica.DialRoom(ctx, cfg)
 	}
 	if err := handle.busyFreshness(handle.ctx, slow, 1, "history_busy", now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	select {
-	case <-slow.Done:
-	case <-handle.ctx.Done():
-		t.Fatal("busy stale relay was kept")
-	}
-	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("closed relay sync succeeded")
+		if err != nil {
+			t.Fatal(err)
 		}
 	case <-handle.ctx.Done():
-		t.Fatal("sync held lock after relay close")
-	}
-	key := clientTestPrivateKey(t)
-	server := &freshnessTestServer{role: community.NodeRoleRelay}
-	server.setEvents(events[0])
-	endpoint := freshnessTestEndpoint(t, key, slow.Genesis, handle.state.State, server)
-	handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
-		cfg.DirectAddress, cfg.DirectPublic = endpoint, key.Public().(ed25519.PublicKey)
-		return replica.DialRoom(ctx, cfg)
-	}
-	if err := handle.connect(handle.ctx); err != nil {
-		t.Fatal(err)
+		t.Fatal("initial sync retained history lock")
 	}
 	if handle.session == nil || handle.session == slow || handle.verifiedHead != 1 {
-		t.Fatal("available alternative was not installed")
+		t.Fatal("honest replacement was not installed")
+	}
+	select {
+	case <-slow.Done:
+	case <-handle.ctx.Done():
+		t.Fatal("displaced stale connection leaked")
 	}
 }
 
@@ -1231,10 +1223,8 @@ func TestFreshnessBusyClosureDoesNotWaitForNotifications(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("stale closure waits for notification delivery")
 	}
-	select {
-	case <-session.Done:
-	case <-handle.ctx.Done():
-		t.Fatal("stale connection remains open")
+	if !handle.isCurrentSession(session, 1) {
+		t.Fatal("last readable fallback was dropped")
 	}
 	state, err := instance.RoomState(keyText(handle.key))
 	if err != nil || state["freshness"].(map[string]any)["status"] != "stale" {
@@ -1255,8 +1245,8 @@ func TestFreshnessRetainedDeadlineAppliesWhenSequencerIsUnavailable(t *testing.T
 	if err := handle.checkFreshness(handle.ctx, session, 1, now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if handle.session != nil || handle.freshness.status != "stale" || len(handle.excludedRelays) != 1 {
-		t.Fatal("authority failure erased an expired retained checkpoint")
+	if handle.session != session || handle.freshness.status != "stale" || len(handle.excludedRelays) != 1 {
+		t.Fatal("authority failure erased alarm or lost the readable fallback")
 	}
 }
 
@@ -1373,31 +1363,53 @@ func TestFreshnessReconnectClosesExactSameIdentitySession(t *testing.T) {
 	}
 }
 
-func TestFreshnessExpiredBudgetCannotBuyRepairPerReconnect(t *testing.T) {
-	_, handle, authority, relay, events := freshnessTestRoom(t)
-	authority.setEvents(events...)
-	now := time.Now()
-	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
+func TestFreshnessExpiredBudgetDoesNotBrickRoom(t *testing.T) {
+	instance, handle, authority, relay, events := freshnessTestRoom(t, 5)
+	authority.setEvents(events[:3]...)
+	now, old := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, old, 1, now); err != nil {
 		t.Fatal(err)
 	}
+	handle.mu.Lock()
+	oldBudget := handle.ensureCatchupLocked(3, 0, now, old)
+	handle.mu.Unlock()
 	handle.closeSession()
-	budget := handle.ensureCatchupLocked(3, 0, now)
-	handle.syncNow = func() time.Time { return now.Add(catchupSlack + catchupRecovery + time.Second) }
-	relay.setEvents(events...)
-	var queries atomic.Int32
-	relay.mu.Lock()
-	relay.beforeEvents = func(community.GetEvents) { queries.Add(1) }
-	relay.mu.Unlock()
-	for attempt := 0; attempt < 2; attempt++ {
-		if err := handle.connect(handle.ctx); !errors.Is(err, errCatchupRate) {
-			t.Fatalf("expired reconnect %d: %v", attempt, err)
-		}
-		if handle.freshness.rate != budget || handle.session != nil {
-			t.Fatal("expired budget was replaced or session leaked")
-		}
+	clock := now.Add(3 * time.Minute)
+	handle.syncNow = func() time.Time { return clock }
+	handle.mu.Lock()
+	handle.rejectRelayLocked(old, oldBudget, clock)
+	handle.mu.Unlock()
+	relay.setEvents(events[:3]...)
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
 	}
-	if queries.Load() != 0 || budget.credits != 0 {
-		t.Fatal("expired reconnect granted new I/O or credit")
+	if !handle.freshness.rate.failed || handle.freshness.status != "stale" || handle.session == nil {
+		t.Fatal("excluded reconnect reset its budget or lost fallback")
+	}
+	handle.closeSession()
+	authority.setEvents(events...)
+	key := clientTestPrivateKey(t)
+	honest := &freshnessTestServer{role: community.NodeRoleRelay}
+	honest.setEvents(events...)
+	endpoint := freshnessTestEndpoint(t, key, old.Genesis, handle.state.State, honest)
+	handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
+		cfg.DirectAddress, cfg.DirectPublic = endpoint, key.Public().(ed25519.PublicKey)
+		return replica.DialRoom(ctx, cfg)
+	}
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if handle.verifiedHead != 5 || handle.freshness.rate == oldBudget || handle.freshness.status != "stale" {
+		t.Fatal("old budget condemned a new honest relay or hid alarm")
+	}
+	if _, _, err := instance.Timeline(handle.ctx, handle.key, 0, 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.checkFreshness(handle.ctx, handle.session, 1, clock); err != nil {
+		t.Fatal(err)
+	}
+	if handle.freshness.status != "verified" {
+		t.Fatal("honest relay did not complete validation")
 	}
 }
 
@@ -1429,5 +1441,257 @@ func TestFreshnessHonestFinalizationIsProtectedAfterH(t *testing.T) {
 	}
 	if handle.verifiedHead != 1 || len(handle.excludedRelays) != 0 {
 		t.Fatal("bounded finalization failed to apply")
+	}
+}
+
+func TestFreshnessOfflineTimeDoesNotCondemnNextRelay(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events...)
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	clock := now
+	handle.syncNow = func() time.Time { return clock }
+	progress := handle.beginRoomSync(session)
+	handle.mu.Lock()
+	budget := handle.ensureCatchupLocked(3, 0, now, session)
+	handle.mu.Unlock()
+	handle.endRoomSync(progress)
+	handle.closeSession()
+	clock = now.Add(time.Hour)
+	relay.setEvents(events...)
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if handle.verifiedHead != 3 || budget.failed || len(handle.excludedRelays) != 0 || !budget.started.Equal(clock) {
+		t.Fatal("offline time became a relay deficit")
+	}
+}
+
+func TestFreshnessPageStallExcludesRelayAndHonestAlternativeRecovers(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events...)
+	now, old := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, old, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	handle.closeSession()
+	clock := now
+	handle.syncNow = func() time.Time { return clock }
+	// Inject expiration of the page's deadline, without sleeping ten seconds.
+	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		if budget == 10*time.Second {
+			return context.WithDeadline(ctx, time.Unix(0, 0))
+		}
+		return context.WithTimeout(ctx, budget)
+	}
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
+	}
+	bad := handle.session
+	budget := handle.freshness.rate
+	until := budget.retryAfter
+	if bad == nil || !budget.failed || handle.freshness.status != "stale" {
+		t.Fatal("page stall was not quarantined with readable fallback")
+	}
+	relay.setEvents(events...)
+	clock = clock.Add(time.Second)
+	if err := handle.syncSessionLocked(handle.ctx, bad, 1); !errors.Is(err, errCatchupRate) {
+		t.Fatalf("excluded reconnect resumed: %v", err)
+	}
+	if !budget.retryAfter.Equal(until) || budget.credits != 0 {
+		t.Fatal("excluded peer renewed quarantine or budget")
+	}
+	handle.freshnessBudget = nil
+	key := clientTestPrivateKey(t)
+	server := &freshnessTestServer{role: community.NodeRoleRelay}
+	server.setEvents(events...)
+	endpoint := freshnessTestEndpoint(t, key, bad.Genesis, handle.state.State, server)
+	handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
+		cfg.DirectAddress, cfg.DirectPublic = endpoint, key.Public().(ed25519.PublicKey)
+		return replica.DialRoom(ctx, cfg)
+	}
+	if err := handle.replaceStaleRelay(handle.ctx, bad, 1, clock); err != nil {
+		t.Fatal(err)
+	}
+	if handle.session == bad || handle.verifiedHead != 3 || handle.freshness.status != "verified" {
+		t.Fatal("honest alternative inherited stalling peer's failure")
+	}
+}
+
+func TestFreshnessFinalizationDeadlineAndSnapshotSurviveRetries(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events[0])
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	handle.syncNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	relay.setEvents(events...)
+	var states atomic.Int32
+	attemptCtx, cancelAttempt := context.WithCancel(handle.ctx)
+	relay.mu.Lock()
+	relay.headLimit = 2
+	relay.beforeState = func() { states.Add(1) }
+	relay.beforeEvents = func(req community.GetEvents) {
+		if req.AfterSeqno == 1 {
+			clock.Store(now.Add(5 * time.Second).UnixNano())
+			cancelAttempt()
+		}
+	}
+	relay.mu.Unlock()
+	// A local cancellation is not evidence against the relay, but consumes active finalization time.
+	if err := handle.syncSessionLocked(attemptCtx, session, 1); err == nil {
+		t.Fatal("canceled attempt succeeded")
+	}
+	budget := handle.freshness.rate
+	if budget.failed || budget.finalState == nil || budget.finalState.Stats.ReplicaSeqno != 2 {
+		t.Fatal("frozen state was lost or local cancellation blamed on peer")
+	}
+	firstDeadline := budget.finalizingUntil
+	handle.closeSession()
+	clock.Store(now.Add(100 * time.Second).UnixNano()) // offline gap must not consume the remaining allowance
+	relay.mu.Lock()
+	relay.headLimit = 3
+	relay.beforeEvents = nil
+	relay.mu.Unlock()
+	reconnected, err := replica.DialRoom(handle.ctx, replica.Config{RoomID: handle.key, NodeKey: handle.client.key, DirectAddress: handle.client.directAddress, DirectPublic: handle.client.directPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.installSession(reconnected, handle.client.key, 1, nil); err != nil {
+		reconnected.Close()
+		t.Fatal(err)
+	}
+	if err := handle.syncSessionLocked(handle.ctx, reconnected, 1); err != nil {
+		t.Fatal(err)
+	}
+	if handle.verifiedHead != 2 || states.Load() != 1 || !budget.finalizingUntil.Equal(firstDeadline.Add(95*time.Second)) {
+		t.Fatal("retry moved J or renewed its finalization allowance")
+	}
+}
+
+func TestFreshnessFinalizationStallIsQuarantinedAcrossReconnects(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events[0])
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	relay.setEvents(events...)
+	relay.mu.Lock()
+	relay.headLimit = 3
+	relay.mu.Unlock()
+	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		if budget == freshnessRepairTimeout {
+			return context.WithDeadline(ctx, time.Unix(0, 0))
+		}
+		return context.WithTimeout(ctx, budget)
+	}
+	if err := handle.syncSessionLocked(handle.ctx, session, 1); !errors.Is(err, errRelaySync) {
+		t.Fatalf("finalization failure was not attributed: %v", err)
+	}
+	budget := handle.freshness.rate
+	deadline, excludedUntil := budget.finalizingUntil, budget.retryAfter
+	if !budget.failed || handle.freshness.status != "stale" || handle.verifiedHead != 0 {
+		t.Fatal("finalization failure was not stale/excluded")
+	}
+	if err := handle.syncSessionLocked(handle.ctx, session, 1); !errors.Is(err, errCatchupRate) {
+		t.Fatal("excluded retry regained finalization")
+	}
+	if budget != handle.freshness.rate || !budget.finalizingUntil.Equal(deadline) || !budget.retryAfter.Equal(excludedUntil) {
+		t.Fatal("finalization was reset by reconnect")
+	}
+}
+
+func TestFreshnessNewCheckpointDoesNotClearExistingAlarm(t *testing.T) {
+	_, handle, authority, _, events := freshnessTestRoom(t)
+	now, session := time.Now(), handle.session
+	handle.mu.Lock()
+	handle.rejectRelayLocked(session, handle.freshness.rate, now)
+	handle.mu.Unlock()
+	authority.setEvents(events[0])
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	if !handle.freshness.alarmed || handle.freshness.status != "stale" || handle.freshness.reason != "relay_behind" {
+		t.Fatal("new checkpoint hid a prior relay alarm")
+	}
+}
+
+func TestFreshnessLocalFailuresDoNotExcludeRelay(t *testing.T) {
+	for _, failure := range []string{"cancel", "store", "unavailable_store"} {
+		t.Run(failure, func(t *testing.T) {
+			_, handle, authority, _, events := freshnessTestRoom(t)
+			authority.setEvents(events[0])
+			now, session := time.Now(), handle.session
+			if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+				t.Fatal(err)
+			}
+			ctx := handle.ctx
+			if failure == "unavailable_store" {
+				handle.dialSequencer = func(context.Context, replica.Config) (*replica.Session, error) { return nil, errors.New("unreachable") }
+			}
+			if failure == "cancel" {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			} else {
+				handle.client.store.db.Close()
+			}
+			_ = handle.checkFreshness(ctx, session, 1, now.Add(relayFreshnessGrace))
+			if len(handle.excludedRelays) != 0 || handle.freshness.alarmed || !handle.isCurrentSession(session, 1) {
+				t.Fatal("local failure was attributed to relay")
+			}
+		})
+	}
+}
+
+func TestFreshnessExcludedFallbackSurvivesCanonicalGap(t *testing.T) {
+	_, handle, authority, _, events := freshnessTestRoom(t)
+	authority.setEvents(events...)
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	handle.mu.Lock()
+	budget := handle.ensureCatchupLocked(3, 0, now, session)
+	handle.rejectRelayLocked(session, budget, now)
+	handle.mu.Unlock()
+	handle.events = make(chan canonicalEvent, 1)
+	ctx, cancel := context.WithCancel(handle.ctx)
+	done := make(chan struct{})
+	go func() { defer close(done); handle.ingestLoop(ctx) }()
+	defer func() { cancel(); <-done }()
+	result := make(chan error, 1)
+	handle.events <- canonicalEvent{session: session, epoch: 1, event: events[2], result: result}
+	select {
+	case err := <-result:
+		if !errors.Is(err, errCatchupRate) {
+			t.Fatalf("unexpected result: %v", err)
+		}
+	case <-handle.ctx.Done():
+		t.Fatal("gap result missing")
+	}
+	if !handle.isCurrentSession(session, 1) || handle.freshness.status != "stale" {
+		t.Fatal("gap closed last readable excluded fallback")
+	}
+}
+
+func TestFreshnessQueryPacingMatchesNodeLeafAllowance(t *testing.T) {
+	budget, now := &catchupRate{}, time.Now()
+	for i := 0; i < 8; i++ {
+		if delay := relayQueryDelay(budget, now); delay != 0 {
+			t.Fatalf("initial burst delayed: %v", delay)
+		}
+	}
+	if delay := relayQueryDelay(budget, now); delay != 500*time.Millisecond {
+		t.Fatalf("query refill = %v", delay)
+	}
+	if delay := relayQueryDelay(budget, now.Add(500*time.Millisecond)); delay != 0 {
+		t.Fatalf("refill not admitted: %v", delay)
 	}
 }
