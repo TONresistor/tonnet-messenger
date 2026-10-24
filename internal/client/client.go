@@ -86,7 +86,6 @@ type Client struct {
 	closed        bool
 	identityEpoch uint64
 	identityOps   sync.Mutex
-	receivedDMs   directReplayCache
 	submissionMu  sync.RWMutex
 	notifyMu      sync.Mutex
 	notifyWG      sync.WaitGroup
@@ -387,7 +386,6 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	c.key = key
 	c.domain = ""
 	c.identityEpoch++
-	c.receivedDMs = directReplayCache{}
 	identity := Identity{Key: keyText(key.Public().(ed25519.PublicKey)), Name: c.name}
 	c.mu.Unlock()
 	if err := c.notify(c.ctx, "identity.changed", identity); err != nil {

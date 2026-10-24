@@ -202,7 +202,7 @@ func TestClientStoreMigratesPendingJournalWithoutLosingHistory(t *testing.T) {
 		t.Fatalf("history lost during migration: %v", err)
 	}
 	var version string
-	if err := restored.db.QueryRowContext(ctx, "SELECT value FROM client_meta WHERE key='schema_version'").Scan(&version); err != nil || version != "2" {
+	if err := restored.db.QueryRowContext(ctx, "SELECT value FROM client_meta WHERE key='schema_version'").Scan(&version); err != nil || version != "3" {
 		t.Fatalf("version=%s err=%v", version, err)
 	}
 	if _, err := restored.savePending(ctx, genesis, proposal); err != nil {

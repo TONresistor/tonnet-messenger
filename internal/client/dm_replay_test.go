@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/binary"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -21,7 +22,8 @@ func TestClientDeduplicatesReceivedDMs(t *testing.T) {
 			ctx := context.Background()
 			room, sender, recipient := clientTestPrivateKey(t), clientTestPrivateKey(t), clientTestPrivateKey(t)
 			roomID := room.Public().(ed25519.PublicKey)
-			instance := &Client{ctx: ctx, key: recipient, identityEpoch: 1, events: make(chan Notification, 64)}
+			instance := directTestClient(t)
+			instance.key = recipient
 			session := &replica.Session{}
 			handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
 			create := func() (community.DirectMessage, broadcast.Broadcast) {
@@ -100,93 +102,200 @@ func TestClientDeduplicatesReceivedDMs(t *testing.T) {
 	}
 }
 
-func TestDirectReplayCacheExpiresOnlyAfterAcceptanceWindow(t *testing.T) {
+func directTestClient(t *testing.T) *Client {
+	t.Helper()
+	instance, err := Open(context.Background(), Config{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { instance.Close() })
+	return instance
+}
+
+func directTestBroadcast(t *testing.T, roomID []byte, sender, recipient ed25519.PrivateKey) broadcast.Broadcast {
+	t.Helper()
+	box, err := dm.SealForRoom(roomID, sender, recipient.Public().(ed25519.PublicKey), []byte("hello"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct, err := community.SignDirectMessage(sender, community.DirectMessage{
+		RoomID: roomID, ToKey: recipient.Public().(ed25519.PublicKey), Timestamp: time.Now().Unix(), Ciphertext: box,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := community.Encode(direct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper, err := broadcast.Sign(sender, nil, raw, time.Now().Unix())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return wrapper
+}
+
+func directTestRowCount(t *testing.T, instance *Client) int {
+	t.Helper()
+	var count int
+	if err := instance.store.db.QueryRow("SELECT COUNT(*) FROM received_direct_messages").Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+func TestDirectReplayProtectionHasNoCapacityLimit(t *testing.T) {
+	ctx := context.Background()
+	instance := directTestClient(t)
+	room, sender := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	roomID := room.Public().(ed25519.PublicKey)
+	session := &replica.Session{}
+	handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
 	now := time.Now()
-	var cache directReplayCache
-	id := [32]byte{1}
 	expires := now.Add(community.MutationClockSkew)
-	cache.record(id, expires)
-	futureID := [32]byte{2}
-	cache.record(futureID, now.Add(2*community.MutationClockSkew))
-	for _, when := range []time.Time{now.Add(61 * time.Second), expires} {
-		cache.prune(when)
-		if len(cache.entries) != 2 {
-			t.Fatal("cache forgot a DM that could still be accepted")
+	for i := 0; i < 8193; i++ {
+		var id [32]byte
+		binary.BigEndian.PutUint64(id[:8], uint64(i))
+		inserted, err := instance.store.claimDirectMessage(ctx, instance.key.Public().(ed25519.PublicKey), id, expires, now)
+		if err != nil || !inserted {
+			t.Fatalf("record id %d: inserted=%v err=%v", i, inserted, err)
 		}
 	}
-	cache.prune(expires.Add(time.Nanosecond))
-	if _, exists := cache.entries[id]; exists || len(cache.entries) != 1 {
-		t.Fatal("cache did not expire only the old DM")
+	wrapper := directTestBroadcast(t, roomID, sender, instance.key)
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(instance.events) != 1 {
+		t.Fatalf("new DM produced %d notifications, want 1", len(instance.events))
 	}
-	cache.prune(now.Add(2*community.MutationClockSkew + time.Nanosecond))
-	if len(cache.entries) != 0 || !cache.nextExpiry.IsZero() {
-		t.Fatal("expired IDs remain in the cache")
+	notification := <-instance.events
+	if notification.Method != "dm.message" {
+		t.Fatalf("notification = %#v", notification)
+	}
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(instance.events) != 0 || directTestRowCount(t, instance) != 8194 {
+		t.Fatal("replayed DM was emitted or new DM was not recorded")
+	}
+	if err := handle.notifyDirectForSession(ctx, session, 1, [32]byte{}, expires, "old duplicate"); err != nil || len(instance.events) != 0 {
+		t.Fatalf("live id was evicted: %v", err)
 	}
 }
 
-func TestDirectReplayCacheRejectsOverflowWithoutEvictingLiveIDs(t *testing.T) {
+func TestClientDeduplicatesReceivedDMAfterRestart(t *testing.T) {
 	ctx := context.Background()
-	instance := &Client{ctx: ctx, events: make(chan Notification, 1)}
-	session := &replica.Session{}
-	handle := &roomHandle{client: instance, session: session}
-	expires := time.Now().Add(community.MutationClockSkew)
-	for i := 0; i < maxReceivedDMs; i++ {
-		var id [32]byte
-		binary.BigEndian.PutUint64(id[:8], uint64(i))
-		instance.receivedDMs.record(id, expires)
-	}
-	newID := [32]byte{31: 1}
-	if err := handle.notifyDirectForSession(ctx, session, 0, newID, expires, "new"); !errors.Is(err, errDirectReplayCacheFull) {
-		t.Fatalf("full cache accepted another ID: %v", err)
-	}
-	if err := handle.notifyDirectForSession(ctx, session, 0, [32]byte{}, expires, "duplicate"); err != nil {
+	stateDir := t.TempDir()
+	instance, err := Open(ctx, Config{StateDir: stateDir})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if len(instance.events) != 0 || len(instance.receivedDMs.entries) != maxReceivedDMs {
-		t.Fatal("overflow evicted a live ID or delivered a duplicate")
+	t.Cleanup(func() { instance.Close() })
+	room, sender := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	roomID := room.Public().(ed25519.PublicKey)
+	wrapper := directTestBroadcast(t, roomID, sender, instance.key)
+	session := &replica.Session{}
+	handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(instance.events) != 1 {
+		t.Fatalf("first delivery produced %d notifications", len(instance.events))
 	}
-	instance.receivedDMs.record([32]byte{}, time.Now().Add(-time.Second))
-	if err := handle.notifyDirectForSession(ctx, session, 0, newID, expires, "new"); err != nil {
-		t.Fatalf("expired entry did not free capacity: %v", err)
+	<-instance.events
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
 	}
-	if len(instance.events) != 1 || len(instance.receivedDMs.entries) != maxReceivedDMs {
-		t.Fatal("unexpected delivery or cache size after expiry")
+	reopened, err := Open(ctx, Config{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	session = &replica.Session{}
+	handle = &roomHandle{client: reopened, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(reopened.events) != 0 || directTestRowCount(t, reopened) != 1 {
+		t.Fatal("restart forgot the delivered DM")
+	}
+}
+
+func TestDirectReplayProtectionPrunesExpiredRowsAndScopesRecipients(t *testing.T) {
+	ctx := context.Background()
+	instance := directTestClient(t)
+	recipient := instance.key.Public().(ed25519.PublicKey)
+	other := clientTestPrivateKey(t).Public().(ed25519.PublicKey)
+	now := time.Now()
+	id, liveID := [32]byte{1}, [32]byte{2}
+	for index, expiry := range []time.Time{now.Add(-time.Nanosecond), now} {
+		expiredID := id
+		expiredID[1] = byte(index)
+		inserted, err := instance.store.claimDirectMessage(ctx, recipient, expiredID, expiry, now.Add(-time.Second))
+		if err != nil || !inserted {
+			t.Fatalf("record expiring row: inserted=%v err=%v", inserted, err)
+		}
+	}
+	if inserted, err := instance.store.claimDirectMessage(ctx, recipient, liveID, now.Add(time.Minute), now); err != nil || !inserted {
+		t.Fatalf("record live row: inserted=%v err=%v", inserted, err)
+	}
+	if directTestRowCount(t, instance) != 1 {
+		t.Fatal("expired rows remain or live row was deleted")
+	}
+	if inserted, err := instance.store.claimDirectMessage(ctx, other, liveID, now.Add(time.Minute), now); err != nil || !inserted {
+		t.Fatalf("other recipient incorrectly deduplicated: inserted=%v err=%v", inserted, err)
+	}
+	if inserted, err := instance.store.claimDirectMessage(ctx, recipient, liveID, now.Add(time.Minute), now); err != nil || inserted {
+		t.Fatalf("same recipient not deduplicated: inserted=%v err=%v", inserted, err)
 	}
 }
 
 func TestFailedDirectNotificationRemainsRetryable(t *testing.T) {
 	ctx := context.Background()
-	instance := &Client{ctx: ctx, events: make(chan Notification, 1)}
+	instance := directTestClient(t)
 	session := &replica.Session{}
-	handle := &roomHandle{client: instance, session: session}
+	handle := &roomHandle{client: instance, session: session, sessionEpoch: 1}
 	id := [32]byte{1}
 	expires := time.Now().Add(community.MutationClockSkew)
-	instance.events <- Notification{Method: "occupied"}
 	canceled, cancel := context.WithCancel(ctx)
 	cancel()
-	if err := handle.notifyDirectForSession(canceled, session, 0, id, expires, "hello"); !errors.Is(err, context.Canceled) {
+	if err := handle.notifyDirectForSession(canceled, session, 1, id, expires, "hello"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled notification: %v", err)
 	}
-	if len(instance.receivedDMs.entries) != 0 {
-		t.Fatal("failed notification poisoned the replay cache")
-	}
 	instance.notifyClosed = true
-	if err := handle.notifyDirectForSession(ctx, session, 0, id, expires, "hello"); !errors.Is(err, context.Canceled) || len(instance.receivedDMs.entries) != 0 {
+	if err := handle.notifyDirectForSession(ctx, session, 1, id, expires, "hello"); !errors.Is(err, context.Canceled) || directTestRowCount(t, instance) != 0 {
 		t.Fatalf("notification failure was recorded as a delivery: %v", err)
 	}
 	instance.notifyClosed = false
-	<-instance.events
-	if err := handle.notifyDirectForSession(ctx, session, 0, id, expires, "hello"); err != nil {
+	// Cancellation during notification must not cancel the subsequent DELETE.
+	instance.events = make(chan Notification)
+	deadline, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	if err := handle.notifyDirectForSession(deadline, session, 1, id, expires, "hello"); !errors.Is(err, context.DeadlineExceeded) || directTestRowCount(t, instance) != 0 {
+		t.Fatalf("canceled notification left a claim: %v", err)
+	}
+	instance.events = make(chan Notification, 1)
+	if err := handle.notifyDirectForSession(ctx, session, 1, id, expires, "hello"); err != nil {
 		t.Fatal(err)
 	}
-	if len(instance.events) != 1 || len(instance.receivedDMs.entries) != 1 {
-		t.Fatal("retry was not delivered and remembered")
+	if err := handle.notifyDirectForSession(ctx, session, 1, id, expires, "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if len(instance.events) != 1 || directTestRowCount(t, instance) != 1 {
+		t.Fatal("retry was not delivered exactly once and remembered")
+	}
+}
+
+func TestDirectNotificationReturnsStorageErrors(t *testing.T) {
+	instance := directTestClient(t)
+	if err := instance.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	session := &replica.Session{}
+	handle := &roomHandle{client: instance, session: session, sessionEpoch: 1}
+	if err := handle.notifyDirectForSession(context.Background(), session, 1, [32]byte{1}, time.Now().Add(time.Minute), "hello"); err == nil {
+		t.Fatal("database error was discarded")
+	}
+	if len(instance.events) != 0 {
+		t.Fatal("DM was emitted without persistent replay protection")
 	}
 }
 
 func TestDirectNotificationRejectsExpiredAndStaleInputs(t *testing.T) {
 	ctx := context.Background()
-	instance := &Client{ctx: ctx, identityEpoch: 1, events: make(chan Notification, 1)}
+	instance := directTestClient(t)
 	session := &replica.Session{}
 	handle := &roomHandle{client: instance, session: session, sessionEpoch: 1}
 	id := [32]byte{1}
@@ -204,7 +313,42 @@ func TestDirectNotificationRejectsExpiredAndStaleInputs(t *testing.T) {
 	if err := handle.notifyDirectForSession(ctx, session, 1, id, time.Now().Add(time.Minute), "closed session"); !errors.Is(err, errRoomSessionChanged) {
 		t.Fatalf("closed session accepted: %v", err)
 	}
-	if len(instance.events) != 0 || len(instance.receivedDMs.entries) != 0 {
-		t.Fatal("rejected input emitted a notification or populated the cache")
+	if len(instance.events) != 0 || directTestRowCount(t, instance) != 0 {
+		t.Fatal("rejected input emitted a notification or populated the database")
+	}
+}
+
+func TestClientStoreMigratesV2DirectReplayProtection(t *testing.T) {
+	ctx := context.Background()
+	filename := filepath.Join(t.TempDir(), "client.db")
+	database, err := openClientStore(ctx, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.setMeta(ctx, "author_name", "preserved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.db.ExecContext(ctx, "DROP TABLE received_direct_messages; UPDATE client_meta SET value='2' WHERE key='schema_version'"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := openClientStore(ctx, filename)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var version string
+	if err := restored.db.QueryRowContext(ctx, "SELECT value FROM client_meta WHERE key='schema_version'").Scan(&version); err != nil || version != "3" {
+		t.Fatalf("version=%s err=%v", version, err)
+	}
+	if name, _, err := restored.profile(ctx); err != nil || name != "preserved" {
+		t.Fatalf("migration lost existing data: name=%s err=%v", name, err)
+	}
+	recipient := clientTestPrivateKey(t).Public().(ed25519.PublicKey)
+	if inserted, err := restored.claimDirectMessage(ctx, recipient, [32]byte{1}, time.Now().Add(time.Minute), time.Now()); err != nil || !inserted {
+		t.Fatalf("migration did not create usable replay protection: inserted=%v err=%v", inserted, err)
 	}
 }

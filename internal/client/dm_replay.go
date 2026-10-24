@@ -2,6 +2,7 @@ package client
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"time"
 
@@ -9,45 +10,13 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 )
 
-const maxReceivedDMs = 8192
-
-var errDirectReplayCacheFull = errors.New("direct-message replay cache is full")
-
-type directReplayCache struct {
-	entries    map[[32]byte]time.Time
-	nextExpiry time.Time
-}
-
-func (cache *directReplayCache) prune(now time.Time) {
-	if cache.nextExpiry.IsZero() || !now.After(cache.nextExpiry) {
-		return
-	}
-	cache.nextExpiry = time.Time{}
-	for id, expires := range cache.entries {
-		if now.After(expires) {
-			delete(cache.entries, id)
-		} else if cache.nextExpiry.IsZero() || expires.Before(cache.nextExpiry) {
-			cache.nextExpiry = expires
-		}
-	}
-}
-
-func (cache *directReplayCache) record(id [32]byte, expires time.Time) {
-	if cache.entries == nil {
-		cache.entries = make(map[[32]byte]time.Time)
-	}
-	cache.entries[id] = expires
-	if cache.nextExpiry.IsZero() || expires.Before(cache.nextExpiry) {
-		cache.nextExpiry = expires
-	}
-}
-
 func (r *roomHandle) notifyDirectForSession(ctx context.Context, session *replica.Session, epoch uint64, id [32]byte, expires time.Time, params any) error {
 	c := r.client
 	c.identityOps.Lock()
 	defer c.identityOps.Unlock()
 	c.mu.RLock()
 	currentEpoch := c.identityEpoch
+	recipient := c.key.Public().(ed25519.PublicKey)
 	c.mu.RUnlock()
 	if currentEpoch != epoch || !r.isCurrentSession(session, epoch) {
 		return errRoomSessionChanged
@@ -64,16 +33,16 @@ func (r *roomHandle) notifyDirectForSession(ctx context.Context, session *replic
 	if now.After(expires) {
 		return community.ErrTimestamp
 	}
-	c.receivedDMs.prune(now)
-	if _, seen := c.receivedDMs.entries[id]; seen {
-		return nil
-	}
-	if len(c.receivedDMs.entries) >= maxReceivedDMs {
-		return errDirectReplayCacheFull
-	}
-	if err := c.notifyUntil(ctx, session.Done, "dm.message", params); err != nil {
+	inserted, err := c.store.claimDirectMessage(ctx, recipient, id, expires, now)
+	if err != nil {
 		return err
 	}
-	c.receivedDMs.record(id, expires)
+	if !inserted {
+		return nil
+	}
+	if err := c.notifyUntil(ctx, session.Done, "dm.message", params); err != nil {
+		// Notification failure commonly cancels ctx; cleanup must still reach SQLite.
+		return errors.Join(err, c.store.deleteDirectMessage(context.WithoutCancel(ctx), recipient, id))
+	}
 	return nil
 }

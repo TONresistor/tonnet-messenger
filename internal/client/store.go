@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	_ "modernc.org/sqlite"
 
@@ -34,7 +35,7 @@ type clientQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-const clientSchemaVersion = 2
+const clientSchemaVersion = 3
 
 func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -129,6 +130,13 @@ CREATE TABLE IF NOT EXISTS pending_operations (
     raw_proposal BLOB NOT NULL,
     raw_commit BLOB
 );
+CREATE TABLE IF NOT EXISTS received_direct_messages (
+    recipient_key BLOB NOT NULL CHECK(length(recipient_key)=32),
+    dm_id BLOB NOT NULL CHECK(length(dm_id)=32),
+    expires_at INTEGER NOT NULL,
+    PRIMARY KEY(recipient_key, dm_id)
+);
+CREATE INDEX IF NOT EXISTS idx_received_direct_messages_expiry ON received_direct_messages(expires_at);
 `); err != nil {
 		return fmt.Errorf("client store migration: %w", err)
 	}
@@ -142,6 +150,35 @@ ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.Itoa(clientSchemaV
 }
 
 func (s *clientStore) Close() error { return s.db.Close() }
+
+func (s *clientStore) claimDirectMessage(ctx context.Context, recipient []byte, id [32]byte, expires, now time.Time) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM received_direct_messages WHERE expires_at <= ?", now.UnixNano()); err != nil {
+		return false, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO received_direct_messages(recipient_key,dm_id,expires_at)
+VALUES (?,?,?) ON CONFLICT(recipient_key,dm_id) DO NOTHING`, recipient, id[:], expires.UnixNano())
+	if err != nil {
+		return false, err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return inserted != 0, nil
+}
+
+func (s *clientStore) deleteDirectMessage(ctx context.Context, recipient []byte, id [32]byte) error {
+	_, err := s.db.ExecContext(ctx, "DELETE FROM received_direct_messages WHERE recipient_key=? AND dm_id=?", recipient, id[:])
+	return err
+}
 
 func (s *clientStore) profile(ctx context.Context) (string, string, error) {
 	values := map[string]string{}
