@@ -78,7 +78,7 @@ func (n *Node) scorePeer(p *peer, score int, now time.Time, reason string) {
 	if p == nil {
 		return
 	}
-	total, evicted := n.peers.markBad(p.id, score, now)
+	total, evicted := n.peers.markBad(p, score, now)
 	if evicted == nil {
 		if total == score || total%peerBadScoreEvict == peerBadScoreEvict-1 {
 			log.Printf("peer warning %s…: %s (score %d/%d)", short(p.id), reason, total, peerBadScoreEvict)

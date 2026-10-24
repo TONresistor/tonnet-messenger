@@ -334,3 +334,32 @@ func TestSequencerReconnectReplacesNodeAndPreservesClassification(t *testing.T) 
 		t.Fatal("replacement disappeared")
 	}
 }
+
+func TestRelayReconnectReplacesNodeOnSequencer(t *testing.T) {
+	table := newPeerTable(DefaultMaxLeaves)
+	table.markKnown("relay")
+	oldConn, newConn := &roomnet.Peer{}, &roomnet.Peer{}
+	old, _, _ := table.addInbound("relay", oldConn)
+	next, added, displaced := table.addInbound("relay", newConn)
+	if !added || displaced != old || next.kind != kindNode || next.conn != newConn {
+		t.Fatal("authenticated relay reconnect was discarded")
+	}
+	if table.removePeer("relay", old) {
+		t.Fatal("late disconnect removed the new relay connection")
+	}
+}
+
+func TestReplacedNodeFailuresCannotPenalizeNewConnection(t *testing.T) {
+	table := newPeerTable(DefaultMaxLeaves)
+	table.markKnown("relay")
+	old, _, _ := table.addInbound("relay", &roomnet.Peer{})
+	next, _, _ := table.addInbound("relay", &roomnet.Peer{})
+	runtime := &Node{peers: table}
+	for i := 0; i < peerMaxFailures; i++ {
+		runtime.peerFailure(old, time.Now(), "late send failure")
+		runtime.scorePeer(old, peerBadScoreEvict, time.Now(), "late query failure")
+	}
+	if current, ok := table.get("relay"); !ok || current != next || next.failures != 0 || next.badScore != 0 {
+		t.Fatal("displaced connection penalized its replacement")
+	}
+}

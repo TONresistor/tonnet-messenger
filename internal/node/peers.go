@@ -108,7 +108,8 @@ func (t *peerTable) addInbound(id string, conn *roomnet.Peer) (*peer, bool, *pee
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
-		if p.conn == conn || (p.kind != kindLeaf && id != t.sequencerID) {
+		// The authenticated identity may reconnect before its old disconnect callback runs.
+		if p.conn == conn {
 			return p, false, nil
 		}
 		next := newPeer(id, p.kind, conn, p.signed)
@@ -318,11 +319,11 @@ func (t *peerTable) markSeen(id string, now time.Time) {
 	}
 }
 
-func (t *peerTable) markBad(id string, score int, now time.Time) (int, *peer) {
+func (t *peerTable) markBad(target *peer, score int, now time.Time) (int, *peer) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	p, ok := t.m[id]
-	if !ok {
+	p, ok := t.m[target.id]
+	if !ok || p != target {
 		return 0, nil
 	}
 	if score < 1 {
@@ -334,15 +335,15 @@ func (t *peerTable) markBad(id string, score int, now time.Time) (int, *peer) {
 		return p.badScore, nil
 	}
 	p.state = peerBad
-	delete(t.m, id)
+	delete(t.m, target.id)
 	return p.badScore, p
 }
 
-func (t *peerTable) markFailure(id string, now time.Time) (int, *peer) {
+func (t *peerTable) markFailure(target *peer, now time.Time) (int, *peer) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	p, ok := t.m[id]
-	if !ok {
+	p, ok := t.m[target.id]
+	if !ok || p != target {
 		return 0, nil
 	}
 	p.lastSeen = now
@@ -352,7 +353,7 @@ func (t *peerTable) markFailure(id string, now time.Time) (int, *peer) {
 		return p.failures, nil
 	}
 	p.state = peerBad
-	delete(t.m, id)
+	delete(t.m, target.id)
 	return p.failures, p
 }
 

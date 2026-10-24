@@ -52,7 +52,7 @@ func (n *Node) peerFailure(p *peer, now time.Time, reason string) {
 	if p == nil {
 		return
 	}
-	failures, evicted := n.peers.markFailure(p.id, now)
+	failures, evicted := n.peers.markFailure(p, now)
 	if failures == 0 {
 		return
 	}
