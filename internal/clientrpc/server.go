@@ -2,6 +2,7 @@ package clientrpc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -33,7 +34,7 @@ type request struct {
 
 type response struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      json.RawMessage `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id"`
 	Result  any             `json:"result,omitempty"`
 	Error   *rpcError       `json:"error,omitempty"`
 }
@@ -118,7 +119,18 @@ func (s *Server) Serve(ctx context.Context, input io.ReadCloser, output io.Write
 		}
 		var req request
 		if err := json.Unmarshal(line, &req); err != nil {
-			if err := s.write(output, response{JSONRPC: "2.0", Error: &rpcError{Code: -32700, Message: "parse error", Data: map[string]any{"code": "PARSE_ERROR"}}}); err != nil {
+			failure := &rpcError{Code: -32600, Message: "invalid request", Data: map[string]any{"code": "INVALID_REQUEST"}}
+			var syntaxError *json.SyntaxError
+			if errors.As(err, &syntaxError) {
+				failure = &rpcError{Code: -32700, Message: "parse error", Data: map[string]any{"code": "PARSE_ERROR"}}
+			}
+			if err := s.write(output, response{JSONRPC: "2.0", Error: failure}); err != nil {
+				return err
+			}
+			continue
+		}
+		if !validRequestID(req.ID) {
+			if err := s.write(output, response{JSONRPC: "2.0", Error: &rpcError{Code: -32600, Message: "invalid request", Data: map[string]any{"code": "INVALID_REQUEST"}}}); err != nil {
 				return err
 			}
 			continue
@@ -131,13 +143,31 @@ func (s *Server) Serve(ctx context.Context, input io.ReadCloser, output io.Write
 			continue
 		}
 		result, rpcErr := s.dispatch(serveCtx, req.Method, req.Params)
-		if len(req.ID) == 0 || string(req.ID) == "null" {
+		if len(req.ID) == 0 {
 			continue
 		}
 		value := fitResponse(req.Method, response{JSONRPC: "2.0", ID: req.ID, Result: result, Error: rpcErr})
 		if err := s.write(output, value); err != nil {
 			return err
 		}
+	}
+}
+
+func validRequestID(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var id any
+	if err := decoder.Decode(&id); err != nil {
+		return false
+	}
+	switch id.(type) {
+	case nil, string, json.Number:
+		return true
+	default:
+		return false
 	}
 }
 

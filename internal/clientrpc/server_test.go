@@ -54,6 +54,93 @@ func TestStdioIdentityAPI(t *testing.T) {
 	}
 }
 
+func TestServeValidatesRPCEnvelope(t *testing.T) {
+	mutation := `{"jsonrpc":"2.0","method":"identity.setName","params":{"name":"alice"}`
+	for _, tc := range []struct {
+		name         string
+		input        string
+		wantID       string
+		wantCode     int
+		wantResponse bool
+		wantMutation bool
+	}{
+		{"null ID", mutation + `,"id":null}`, "null", 0, true, true},
+		{"notification", mutation + `}`, "", 0, false, true},
+		{"string ID", mutation + `,"id":"request"}`, `"request"`, 0, true, true},
+		{"zero ID", mutation + `,"id":0}`, "0", 0, true, true},
+		{"large number ID", mutation + `,"id":1e1000}`, "1e1000", 0, true, true},
+		{"object ID", mutation + `,"id":{}}`, "null", -32600, true, false},
+		{"array ID", mutation + `,"id":[]}`, "null", -32600, true, false},
+		{"boolean ID", mutation + `,"id":true}`, "null", -32600, true, false},
+		{"malformed JSON", `{`, "null", -32700, true, false},
+		{"invalid method type", `{"jsonrpc":"2.0","id":1,"method":1}`, "null", -32600, true, false},
+		{"invalid version type", `{"jsonrpc":2,"id":1,"method":"identity.setName","params":{"name":"alice"}}`, "null", -32600, true, false},
+		{"missing method", `{"jsonrpc":"2.0"}`, "null", -32600, true, false},
+		{"null request", `null`, "null", -32600, true, false},
+		{"scalar request", `42`, "null", -32600, true, false},
+		{"array request", `[]`, "null", -32600, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			instance, err := client.Open(context.Background(), client.Config{StateDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			before := instance.Identity().Name
+			var output bytes.Buffer
+			if err := (&Server{Client: instance}).Serve(context.Background(), io.NopCloser(strings.NewReader(tc.input+"\n")), &output); err != nil {
+				t.Fatal(err)
+			}
+			wantName := before
+			if tc.wantMutation {
+				wantName = "alice"
+			}
+			if got := instance.Identity().Name; got != wantName {
+				t.Fatalf("name = %q, want %q", got, wantName)
+			}
+			var responses []map[string]json.RawMessage
+			decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+			for {
+				var value map[string]json.RawMessage
+				if err := decoder.Decode(&value); err != nil {
+					if errors.Is(err, io.EOF) {
+						break
+					}
+					t.Fatal(err)
+				}
+				if _, notification := value["method"]; !notification {
+					responses = append(responses, value)
+				}
+			}
+			if !tc.wantResponse {
+				if len(responses) != 0 {
+					t.Fatalf("notification responses = %s", output.String())
+				}
+				return
+			}
+			if len(responses) != 1 {
+				t.Fatalf("responses = %s", output.String())
+			}
+			value := responses[0]
+			if got := string(value["id"]); got != tc.wantID {
+				t.Fatalf("response ID = %q, want %q", got, tc.wantID)
+			}
+			if tc.wantCode == 0 {
+				if _, ok := value["result"]; !ok || value["error"] != nil {
+					t.Fatalf("success response = %s", output.String())
+				}
+				return
+			}
+			var failure rpcError
+			if err := json.Unmarshal(value["error"], &failure); err != nil {
+				t.Fatal(err)
+			}
+			if failure.Code != tc.wantCode || value["result"] != nil {
+				t.Fatalf("error response = %s", output.String())
+			}
+		})
+	}
+}
+
 func TestFitResponsePaginatesLargeTimelines(t *testing.T) {
 	items := make([]map[string]any, 100)
 	for i := range items {
