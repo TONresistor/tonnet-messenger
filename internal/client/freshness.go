@@ -16,7 +16,8 @@ import (
 
 const (
 	maxFreshnessChecks     = 4
-	initialSyncTimeout     = 5 * time.Minute
+	catchupSlack           = time.Minute
+	catchupRecovery        = time.Minute
 	relayFreshnessGrace    = time.Minute
 	relayExclusionTTL      = 2 * time.Minute
 	freshnessTimeout       = 15 * time.Second
@@ -24,12 +25,50 @@ const (
 	freshnessRepairTimeout = 15 * time.Second
 )
 
-// Durable progress is only a temporary catch-up allowance, never applied verification.
+var errCatchupRate = errors.New("relay catch-up rate below minimum")
+
+// For B initially missing events through fixed H, 1s credit per NEW persisted
+// event gives at most 60s+B*1s of rate allowance, plus ONE 60s recovery window.
+// From the first synchronization toward H, receipt or rejection takes B+120s.
+// Finalization has a separate 15s bound per attempt and never moves H. Rejecting a relay cannot guarantee network delivery.
+// Accounting belongs to H, never a session; rebuilding known history earns zero.
+type catchupRate struct {
+	target        int64
+	baseline      int64
+	credits       int64
+	started       time.Time
+	recoveryUntil time.Time
+	recoveryOwner *replica.Session
+}
+
+func (b *catchupRate) baseDeadline() time.Time {
+	// Saturate before multiplying untrusted sequence numbers into a duration.
+	seconds := min(b.credits, int64((time.Duration(1<<63-1)-catchupSlack)/time.Second))
+	return b.started.Add(catchupSlack + time.Duration(seconds)*time.Second)
+}
+
+func (b *catchupRate) deadline(now time.Time) (time.Time, error) {
+	base := b.baseDeadline()
+	if now.After(base) && b.recoveryUntil.IsZero() {
+		b.recoveryUntil = base.Add(catchupRecovery)
+	}
+	deadline := base
+	if b.recoveryUntil.IsZero() {
+		deadline = base.Add(catchupRecovery) // Reserve the one possible recovery, without rebasing it.
+	} else if b.recoveryUntil.After(deadline) {
+		deadline = b.recoveryUntil
+	}
+	if now.After(deadline) {
+		return deadline, errCatchupRate
+	}
+	return deadline, nil
+}
+
+// Durable progress is only a catch-up allowance, never applied verification.
 type roomSyncProgress struct {
-	session  *replica.Session
-	started  time.Time
-	advanced time.Time
-	seqno    int64
+	session         *replica.Session
+	seqno           int64
+	finalizingUntil time.Time
 }
 
 func (r *roomHandle) syncTime() time.Time {
@@ -40,21 +79,57 @@ func (r *roomHandle) syncTime() time.Time {
 }
 
 func (r *roomHandle) beginRoomSync(session *replica.Session) *roomSyncProgress {
-	now := r.syncTime()
-	progress := &roomSyncProgress{session: session, started: now, advanced: now}
+	progress := &roomSyncProgress{session: session}
 	r.mu.Lock()
 	r.syncProgress = progress
 	r.mu.Unlock()
 	return progress
 }
 
-func (r *roomHandle) advanceRoomSync(progress *roomSyncProgress, seqno int64) {
-	now := r.syncTime()
-	r.mu.Lock()
-	if r.syncProgress == progress && seqno > progress.seqno {
-		progress.seqno, progress.advanced = seqno, now
+func (r *roomHandle) ensureCatchupLocked(target, known int64, now time.Time) *catchupRate {
+	r.receivedHead = max(r.receivedHead, known)
+	b := r.freshness.rate
+	if b == nil || (r.receivedHead >= b.target && target > b.target) {
+		b = &catchupRate{target: target, baseline: r.receivedHead, started: now}
+		r.freshness.rate = b
+		if target > r.receivedHead && r.syncProgress != nil {
+			r.syncProgress.finalizingUntil = time.Time{}
+		}
+	} else if target < b.target {
+		b.target = target // An authenticated older target can only shorten the work.
+		b.credits = min(b.credits, max(int64(0), target-b.baseline))
 	}
-	r.mu.Unlock()
+	return b
+}
+
+func (r *roomHandle) advanceRoomSync(progress *roomSyncProgress, seqno int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if progress != nil && r.syncProgress == progress {
+		progress.seqno = max(progress.seqno, seqno)
+	}
+	if seqno != r.receivedHead+1 {
+		return
+	}
+	r.receivedHead = seqno
+	if b := r.freshness.rate; b != nil && seqno > b.baseline && seqno <= b.target {
+		// Observe any deficit BEFORE granting credit; late batches cannot erase recovery use.
+		unused := b.recoveryUntil.IsZero()
+		_, expired := b.deadline(r.syncTime())
+		if unused && !b.recoveryUntil.IsZero() {
+			b.recoveryOwner = r.session
+			if progress != nil {
+				b.recoveryOwner = progress.session
+			}
+		}
+		if expired == nil {
+			b.credits++
+		}
+	}
+	if progress != nil && r.syncProgress == progress && r.freshness.rate != nil &&
+		r.receivedHead >= r.freshness.rate.target && progress.finalizingUntil.IsZero() {
+		progress.finalizingUntil = r.syncTime().Add(freshnessRepairTimeout)
+	}
 }
 
 func (r *roomHandle) endRoomSync(progress *roomSyncProgress) {
@@ -63,6 +138,30 @@ func (r *roomHandle) endRoomSync(progress *roomSyncProgress) {
 		r.syncProgress = nil
 	}
 	r.mu.Unlock()
+}
+
+func (r *roomHandle) rateDeadlineLocked(b *catchupRate, session *replica.Session, now time.Time) (time.Time, error) {
+	unused := b.recoveryUntil.IsZero()
+	deadline, err := b.deadline(now)
+	if unused && !b.recoveryUntil.IsZero() {
+		b.recoveryOwner = session
+	}
+	if err == nil && b.recoveryOwner == session && now.After(b.baseDeadline()) {
+		err = errCatchupRate
+	}
+	return deadline, err
+}
+
+func (r *roomHandle) catchupContext(ctx context.Context, b *catchupRate, session *replica.Session) (context.Context, context.CancelFunc, error) {
+	now := r.syncTime()
+	r.mu.Lock()
+	deadline, err := r.rateDeadlineLocked(b, session, now)
+	r.mu.Unlock()
+	if err != nil {
+		return nil, nil, err
+	}
+	queryCtx, cancel := r.freshnessContext(ctx, min(10*time.Second, max(time.Duration(0), deadline.Sub(now))))
+	return queryCtx, cancel, nil
 }
 
 type headCheckpoint struct {
@@ -79,6 +178,7 @@ type relayFreshness struct {
 	pending      *headCheckpoint
 	failures     int
 	lastNotice   string
+	rate         *catchupRate
 }
 
 func (f relayFreshness) view() map[string]any {
@@ -332,11 +432,41 @@ func (r *roomHandle) failFreshness(ctx context.Context, session *replica.Session
 	}
 	r.freshness.status, r.freshness.reason = "unverified", reason
 	r.freshness.failures++
-	behind := reason == "sequencer_unavailable" && r.markBehindLocked(session, now)
+	pending := r.freshness.pending
+	needsRepair := reason == "sequencer_unavailable" && pending != nil && r.verifiedHead < pending.seqno && now.Sub(pending.observed) >= relayFreshnessGrace
 	r.mu.Unlock()
-	if behind {
-		r.closeSessionIf(session) // Never wait for the UI before retiring a known stale path.
-		return nil
+	if needsRepair {
+		lockCtx, cancel := r.freshnessContext(ctx, freshnessLockTimeout)
+		lockErr := r.lockFreshnessHistory(lockCtx)
+		cancel()
+		covered := false
+		if lockErr == nil {
+			repairCtx, repairCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
+			repairErr := r.syncSessionLocked(repairCtx, session, epoch)
+			if repairErr == nil {
+				var checkErr error
+				covered, checkErr = r.hasAppliedCheckpoint(repairCtx, pending)
+				if errors.Is(checkErr, errFreshnessConflict) {
+					reason = "checkpoint_conflict"
+				}
+			} else if errors.Is(repairErr, errFreshnessConflict) {
+				reason = "checkpoint_conflict"
+			}
+			repairCancel()
+			r.historyMu.Unlock()
+		}
+		r.mu.Lock()
+		if r.session != session || r.sessionEpoch != epoch {
+			r.mu.Unlock()
+			return errRoomSessionChanged
+		}
+		behind := !covered && reason != "checkpoint_conflict" && r.markBehindLocked(session, now)
+		r.freshness.reason = reason // Do not hide an unreachable sequencer behind catching_up/relay_behind.
+		r.mu.Unlock()
+		if behind {
+			r.closeSessionIf(session)
+			return nil
+		}
 	}
 	return r.emitFreshness(ctx, session, epoch)
 }
@@ -351,18 +481,22 @@ func (r *roomHandle) freshnessContext(ctx context.Context, budget time.Duration)
 // Retain authenticated evidence even if the relay disconnects during the probe.
 func (r *roomHandle) recordFreshnessHead(head *headCheckpoint, session *replica.Session, epoch uint64, now time.Time) error {
 	r.client.mu.RLock()
-	defer r.client.mu.RUnlock()
 	if r.client.closed || r.client.identityEpoch != epoch {
+		r.client.mu.RUnlock()
 		return errRoomSessionChanged
 	}
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	f := &r.freshness
 	if f.latest != nil && (head.seqno < f.latest.seqno ||
 		(head.seqno == f.latest.seqno && !bytes.Equal(head.hash, f.latest.hash))) {
+		r.mu.Unlock()
+		r.client.mu.RUnlock()
 		return errFreshnessConflict
 	}
 	f.failures = 0
+	if f.reason == "sequencer_unavailable" {
+		f.reason = "not_checked"
+	}
 	if f.latest == nil || head.seqno > f.latest.seqno {
 		head.observed = now
 		f.latest = head
@@ -370,8 +504,16 @@ func (r *roomHandle) recordFreshnessHead(head *headCheckpoint, session *replica.
 	if f.pending == nil && r.verifiedHead < head.seqno {
 		f.pending = f.latest
 	}
+	var retired *replica.Session
 	if r.session != nil && r.session != session && r.sessionEpoch == epoch && bytes.Equal(r.session.Peer.GetPubKey(), session.Peer.GetPubKey()) {
-		r.markBehindLocked(r.session, now)
+		if r.markBehindLocked(r.session, now) {
+			retired = r.session
+		}
+	}
+	r.mu.Unlock()
+	r.client.mu.RUnlock()
+	if retired != nil {
+		r.closeSessionIf(retired)
 	}
 	return nil
 }
@@ -383,17 +525,21 @@ func (r *roomHandle) markBehindLocked(session *replica.Session, now time.Time) b
 		return false
 	}
 	if progress := r.syncProgress; progress != nil && progress.session == session {
-		idleGrace := relayFreshnessGrace
-		if progress.seqno == 0 {
-			idleGrace = freshnessRepairTimeout
-		}
-		if now.Sub(progress.advanced) < idleGrace &&
-			now.Sub(progress.started) < initialSyncTimeout && now.Sub(f.pending.observed) < initialSyncTimeout {
-			f.status, f.reason = "unverified", "catching_up"
+		budget := r.ensureCatchupLocked(f.pending.seqno, r.receivedHead, now)
+		_, err := r.rateDeadlineLocked(budget, session, now)
+		finalizing := r.receivedHead >= budget.target && now.Before(progress.finalizingUntil)
+		if finalizing || (r.receivedHead < budget.target && err == nil) {
+			f.status = "unverified"
+			if f.reason != "sequencer_unavailable" {
+				f.reason = "catching_up"
+			}
 			return false
 		}
 	}
-	f.status, f.reason = "stale", "relay_behind"
+	f.status = "stale"
+	if f.reason != "sequencer_unavailable" {
+		f.reason = "relay_behind"
+	}
 	if r.excludedRelays == nil {
 		r.excludedRelays = make(map[string]time.Time)
 	}
@@ -408,7 +554,10 @@ func (r *roomHandle) busyFreshness(ctx context.Context, session *replica.Session
 		r.mu.Unlock()
 		return errRoomSessionChanged
 	}
-	r.freshness.status, r.freshness.reason = "unverified", reason
+	r.freshness.status = "unverified"
+	if r.freshness.reason != "sequencer_unavailable" {
+		r.freshness.reason = reason
+	}
 	behind := r.markBehindLocked(session, now)
 	r.mu.Unlock()
 	if behind {

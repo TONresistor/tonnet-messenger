@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -29,6 +30,7 @@ type freshnessTestServer struct {
 	eventGate    <-chan struct{}
 	pageLimit    int
 	beforeEvents func(community.GetEvents)
+	beforeState  func()
 }
 
 func (server *freshnessTestServer) setEvents(events ...community.CommittedEvent) {
@@ -52,6 +54,9 @@ func freshnessTestEndpoint(t *testing.T, key ed25519.PrivateKey, genesis communi
 			case community.GetRoomGenesis:
 				return query.Answer(genesis)
 			case community.GetRoomState:
+				if server.beforeState != nil {
+					server.beforeState()
+				}
 				if server.stateError {
 					return errors.New("state unavailable after commits")
 				}
@@ -113,7 +118,7 @@ func freshnessTestEndpoint(t *testing.T, key ed25519.PrivateKey, genesis communi
 	return packet.LocalAddr().String()
 }
 
-func freshnessTestRoom(t *testing.T) (*Client, *roomHandle, *freshnessTestServer, *freshnessTestServer, []community.CommittedEvent) {
+func freshnessTestRoom(t *testing.T, eventCount ...int) (*Client, *roomHandle, *freshnessTestServer, *freshnessTestServer, []community.CommittedEvent) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	t.Cleanup(cancel)
@@ -132,9 +137,13 @@ func freshnessTestRoom(t *testing.T) (*Client, *roomHandle, *freshnessTestServer
 	}
 	var events []community.CommittedEvent
 	previous := community.Zero256()
-	for seqno := int64(1); seqno <= 3; seqno++ {
+	count := 3
+	if len(eventCount) > 0 {
+		count = eventCount[0]
+	}
+	for seqno := int64(1); seqno <= int64(count); seqno++ {
 		nonce := make([]byte, 32)
-		nonce[0] = byte(seqno)
+		binary.LittleEndian.PutUint64(nonce, uint64(seqno))
 		proposal, err := community.SignProposal(room, genesis.NodeKey, community.EventProposal{
 			RoomID: genesis.RoomKey, Nonce: nonce, Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: "new commit"},
 		})
@@ -401,7 +410,7 @@ func TestFreshnessSlowAuthorityDoesNotConsumeRelayRepairBudget(t *testing.T) {
 	if handle.freshness.status != "verified" || !handle.isCurrentSession(session, 1) || len(handle.excludedRelays) != 0 {
 		t.Fatal("slow authority caused an honest relay to be rejected")
 	}
-	if budgets != 2 {
+	if budgets < 2 {
 		t.Fatalf("authority and repair did not get independent budgets: %d", budgets)
 	}
 }
@@ -775,7 +784,7 @@ func TestFreshnessBusyHistoryStillDetectsBehindRelay(t *testing.T) {
 	case <-handle.ctx.Done():
 		t.Fatal("gap sync did not request a page")
 	}
-	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now.Add(relayFreshnessGrace)); err != nil {
+	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if handle.freshness.status != "stale" || len(handle.excludedRelays) != 1 || handle.freshness.failures != 0 {
@@ -833,101 +842,139 @@ func TestFreshnessConflictRecoversWithoutDiscardingCheckpoint(t *testing.T) {
 	}
 }
 
-func TestFreshnessInitialSyncHasOverallBudget(t *testing.T) {
-	_, handle, _, _, _ := freshnessTestRoom(t)
+func TestFreshnessTwentyMinuteBacklogAtMinimumRateIsNotCut(t *testing.T) {
+	instance, handle, authority, relay, events := freshnessTestRoom(t, 1200)
+	authority.setEvents(events...)
+	now := time.Now()
+	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
+		t.Fatal(err)
+	}
 	handle.closeSession()
-	calls := 0
-	var dialed *replica.Session
-	handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
-		var err error
-		dialed, err = replica.DialRoom(ctx, cfg)
-		return dialed, err
-	}
-	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
-		calls++
-		if budget != initialSyncTimeout {
-			t.Fatalf("initial sync budget = %v", budget)
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	handle.syncNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	consumeCtx, cancel := context.WithCancel(handle.ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case _, ok := <-instance.events:
+				if !ok {
+					return
+				}
+			case <-consumeCtx.Done():
+				return
+			}
 		}
-		ctx, cancel := context.WithCancel(ctx)
-		cancel()
-		return ctx, cancel
+	}()
+	defer func() { cancel(); <-done }()
+	relay.setEvents(events...)
+	relay.mu.Lock()
+	relay.pageLimit = 1
+	relay.beforeEvents = func(req community.GetEvents) {
+		clock.Store(now.Add(time.Duration(req.AfterSeqno+1) * time.Second).UnixNano())
+		if req.AfterSeqno > 0 && req.AfterSeqno%60 == 0 {
+			handle.mu.RLock()
+			session, epoch := handle.session, handle.sessionEpoch
+			handle.mu.RUnlock()
+			if err := handle.busyFreshness(handle.ctx, session, epoch, "history_busy", handle.syncTime()); err != nil {
+				t.Error(err)
+			}
+		}
 	}
-	if err := handle.connect(handle.ctx); !errors.Is(err, context.Canceled) || calls != 1 {
-		t.Fatalf("initial sync was unbounded: %v calls=%d", err, calls)
+	relay.mu.Unlock()
+	if err := handle.connect(handle.ctx); err != nil {
+		t.Fatal(err)
 	}
-	if dialed == nil {
-		t.Fatal("sync was not attempted")
+	if handle.session == nil || handle.verifiedHead != 1200 || len(handle.excludedRelays) != 0 {
+		t.Fatal("honest minimum-rate backlog was cut")
 	}
-	select {
-	case <-dialed.Done:
-	case <-handle.ctx.Done():
-		t.Fatal("failed sync session leaked")
+	if handle.freshness.status == "verified" {
+		t.Fatal("progress alone became a freshness verification")
+	}
+	if handle.freshness.rate.credits != 1200 || !handle.freshness.rate.recoveryUntil.IsZero() {
+		t.Fatal("minimum-rate delivery consumed recovery")
 	}
 }
 
-func TestFreshnessInitialSyncProgressHasFixedCheckpointDeadline(t *testing.T) {
-	for _, completes := range []bool{true, false} {
-		t.Run(fmt.Sprint(completes), func(t *testing.T) {
-			_, handle, authority, relay, events := freshnessTestRoom(t)
-			authority.setEvents(events...)
-			now := time.Now()
-			if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
-				t.Fatal(err)
-			}
-			handle.closeSession()
-			var clock atomic.Int64
-			clock.Store(now.UnixNano())
-			handle.syncNow = func() time.Time { return time.Unix(0, clock.Load()) }
-			relay.setEvents(events...)
-			relay.mu.Lock()
-			relay.pageLimit = 1
-			relay.beforeEvents = func(req community.GetEvents) {
-				elapsed := 30*time.Second + time.Duration(req.AfterSeqno)*40*time.Second
-				if !completes {
-					elapsed = initialSyncTimeout - time.Second
-					if req.AfterSeqno > 0 {
-						elapsed = initialSyncTimeout + time.Second
-					}
-				}
-				clock.Store(now.Add(elapsed).UnixNano())
-				if req.AfterSeqno == 0 {
-					return
-				} // Deliver the first verified page before judging progress.
-				handle.mu.RLock()
-				current, epoch, progress := handle.session, handle.sessionEpoch, handle.syncProgress
-				if progress == nil || progress.seqno != req.AfterSeqno {
-					t.Error("signed durable progress was not tracked")
-				}
-				handle.mu.RUnlock()
-				if err := handle.busyFreshness(handle.ctx, current, epoch, "history_busy", handle.syncTime()); err != nil {
-					t.Error(err)
-				}
-			}
-			relay.mu.Unlock()
-			err := handle.connect(handle.ctx)
-			handle.mu.RLock()
-			current, applied, status, excluded := handle.session, handle.verifiedHead, handle.freshness.status, len(handle.excludedRelays)
-			handle.mu.RUnlock()
-			if completes {
-				if err != nil || current == nil || applied != 3 || excluded != 0 {
-					t.Fatalf("progressing honest backlog was blamed: err=%v applied=%d excluded=%d", err, applied, excluded)
-				}
-				if status == "verified" {
-					t.Fatal("progress alone was called verified")
-				}
-			} else {
-				if err == nil || current != nil || excluded != 1 || status != "stale" {
-					t.Fatalf("drip feeder escaped fixed deadline: err=%v current=%p excluded=%d status=%s", err, current, excluded, status)
-				}
-				record, lookupErr := handle.client.store.room(handle.ctx, handle.key)
-				if lookupErr != nil || record.HeadSeqno < 1 || applied != 0 {
-					t.Fatalf("test did not retain partial durable progress: %#v %v", record, lookupErr)
-				}
-			}
-			if !handle.freshness.pending.observed.Equal(now) {
-				t.Fatal("progress reset checkpoint deadline")
-			}
-		})
+func TestFreshnessBelowMinimumRateIsCut(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t, 200)
+	authority.setEvents(events...)
+	now := time.Now()
+	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	handle.closeSession()
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	handle.syncNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	relay.setEvents(events...)
+	relay.mu.Lock()
+	relay.pageLimit = 1
+	relay.beforeEvents = func(req community.GetEvents) {
+		clock.Store(now.Add(time.Duration(req.AfterSeqno+1) * 10 * time.Second).UnixNano())
+	}
+	relay.mu.Unlock()
+	if err := handle.connect(handle.ctx); !errors.Is(err, errCatchupRate) {
+		t.Fatalf("slow feeder escaped: %v", err)
+	}
+	if handle.session != nil || len(handle.excludedRelays) != 1 || handle.freshness.status != "stale" {
+		t.Fatal("below-rate relay was not closed/excluded")
+	}
+}
+
+func TestFreshnessRateCreditsAreUniqueAndBoundedByH(t *testing.T) {
+	instance := directTestClient(t)
+	now := time.Now()
+	handle := &roomHandle{client: instance, syncNow: func() time.Time { return now }}
+	handle.ensureCatchupLocked(3, 0, now)
+	progress := handle.beginRoomSync(&replica.Session{})
+	handle.advanceRoomSync(progress, 1)
+	handle.advanceRoomSync(progress, 1)   // replay
+	handle.ensureCatchupLocked(3, 2, now) // known cache, not a new arrival
+	handle.advanceRoomSync(progress, 2)
+	handle.advanceRoomSync(progress, 3)
+	handle.advanceRoomSync(progress, 4) // beyond fixed H
+	if handle.freshness.rate.credits != 2 || handle.freshness.rate.target != 3 {
+		t.Fatal("replay/known/after-H event earned credit")
+	}
+}
+
+func TestFreshnessRecoveryIsSharedAndSuccessorCanRepayDebt(t *testing.T) {
+	instance := directTestClient(t)
+	now := time.Now()
+	clock := now.Add(70 * time.Second)
+	handle := &roomHandle{client: instance, syncNow: func() time.Time { return clock }}
+	budget := handle.ensureCatchupLocked(1000, 0, now)
+	first := handle.beginRoomSync(&replica.Session{})
+	handle.advanceRoomSync(first, 1) // deficit starts recovery at t=60, ending t=120
+	if !budget.recoveryUntil.Equal(now.Add(120 * time.Second)) {
+		t.Fatal("recovery was rebased to detection time")
+	}
+	handle.endRoomSync(first)
+	second := handle.beginRoomSync(&replica.Session{})
+	for seqno := int64(2); seqno <= 11; seqno++ {
+		handle.advanceRoomSync(second, seqno)
+	}
+	if !budget.baseDeadline().After(clock) {
+		t.Fatal("honest successor did not repay deficit")
+	}
+	handle.endRoomSync(second)
+	for i := 0; i < 10; i++ {
+		progress := handle.beginRoomSync(&replica.Session{})
+		handle.ensureCatchupLocked(2000, handle.receivedHead, clock)
+		handle.endRoomSync(progress)
+	}
+	if budget.target != 1000 || !budget.started.Equal(now) || !budget.recoveryUntil.Equal(now.Add(120*time.Second)) {
+		t.Fatal("flapping/newer heads reset the shared budget")
+	}
+	if _, err := budget.deadline(now.Add(121 * time.Second)); !errors.Is(err, errCatchupRate) {
+		t.Fatal("second recovery window was granted")
+	}
+	budget.credits = int64(^uint64(0) >> 1)
+	if budget.baseDeadline().Before(now) {
+		t.Fatal("credit duration overflowed")
 	}
 }
 
@@ -966,7 +1013,7 @@ func TestFreshnessBusyRelayIsLeftAndAnotherRelayConnects(t *testing.T) {
 	case <-handle.ctx.Done():
 		t.Fatal("slow relay did not start sync")
 	}
-	if err := handle.busyFreshness(handle.ctx, slow, 1, "history_busy", now.Add(initialSyncTimeout)); err != nil {
+	if err := handle.busyFreshness(handle.ctx, slow, 1, "history_busy", now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -1174,7 +1221,7 @@ func TestFreshnessBusyClosureDoesNotWaitForNotifications(t *testing.T) {
 	}
 	done := make(chan error, 1)
 	go func() {
-		done <- handle.busyFreshness(handle.ctx, session, 1, "history_busy", now.Add(initialSyncTimeout))
+		done <- handle.busyFreshness(handle.ctx, session, 1, "history_busy", now.Add(catchupSlack+catchupRecovery+time.Second))
 	}()
 	select {
 	case err := <-done:
@@ -1205,7 +1252,7 @@ func TestFreshnessRetainedDeadlineAppliesWhenSequencerIsUnavailable(t *testing.T
 	handle.dialSequencer = func(context.Context, replica.Config) (*replica.Session, error) {
 		return nil, errors.New("sequencer unreachable")
 	}
-	if err := handle.checkFreshness(handle.ctx, session, 1, now.Add(initialSyncTimeout)); err != nil {
+	if err := handle.checkFreshness(handle.ctx, session, 1, now.Add(catchupSlack+catchupRecovery+time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if handle.session != nil || handle.freshness.status != "stale" || len(handle.excludedRelays) != 1 {
@@ -1213,25 +1260,174 @@ func TestFreshnessRetainedDeadlineAppliesWhenSequencerIsUnavailable(t *testing.T
 	}
 }
 
-func TestFreshnessInitialSyncDeadlineExcludesKnownLag(t *testing.T) {
+func TestFreshnessFinalizationFreezesJAndHasBoundedBudget(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t, 4)
+	authority.setEvents(events[0])
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	relay.setEvents(events...)
+	relay.mu.Lock()
+	relay.headLimit = 2
+	var cursors []int64
+	relay.beforeEvents = func(req community.GetEvents) {
+		cursors = append(cursors, req.AfterSeqno)
+		if req.AfterSeqno == 1 {
+			relay.headLimit = 4
+		} // head moves AFTER J=2 was captured
+	}
+	relay.mu.Unlock()
+	finalizations := 0
+	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		if budget == freshnessRepairTimeout {
+			finalizations++
+		}
+		return context.WithTimeout(ctx, budget)
+	}
+	if err := handle.syncSessionLocked(handle.ctx, session, 1); err != nil {
+		t.Fatal(err)
+	}
+	if handle.verifiedHead != 2 || handle.freshness.rate.target != 1 || handle.freshness.rate.credits != 1 || finalizations != 1 {
+		t.Fatal("moving state head extended H/finalization or earned credit")
+	}
+	relay.mu.Lock()
+	gotCursors := append([]int64(nil), cursors...)
+	relay.mu.Unlock()
+	if len(gotCursors) != 2 || gotCursors[0] != 0 || gotCursors[1] != 1 {
+		t.Fatalf("followed moving HasMore: %v", gotCursors)
+	}
+}
+
+func TestFreshnessFinalizationFailureNeverVerifies(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events[0])
+	session := handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	relay.setEvents(events[0])
+	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+		if budget == freshnessRepairTimeout {
+			return context.WithDeadline(ctx, time.Unix(0, 0))
+		}
+		return context.WithTimeout(ctx, budget)
+	}
+	if err := handle.syncSessionLocked(handle.ctx, session, 1); err == nil {
+		t.Fatal("expired finalization succeeded")
+	}
+	record, err := handle.client.store.room(handle.ctx, handle.key)
+	if err != nil || record.HeadSeqno != 1 || handle.verifiedHead != 0 || handle.freshness.status == "verified" {
+		t.Fatal("persisted H was mistaken for applied verification")
+	}
+}
+
+func TestFreshnessUnavailableSequencerRepairsMissedBroadcast(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events[0])
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	relay.setEvents(events[0])
+	handle.dialSequencer = func(context.Context, replica.Config) (*replica.Session, error) { return nil, errors.New("unreachable") }
+	if err := handle.checkFreshness(handle.ctx, session, 1, now.Add(relayFreshnessGrace)); err != nil {
+		t.Fatal(err)
+	}
+	if !handle.isCurrentSession(session, 1) || handle.verifiedHead != 1 || len(handle.excludedRelays) != 0 {
+		t.Fatal("honest missed broadcast was closed before repair")
+	}
+	if handle.freshness.status != "unverified" || handle.freshness.reason != "sequencer_unavailable" {
+		t.Fatal("repair hid unavailable authority or manufactured verification")
+	}
+}
+
+func TestFreshnessReconnectClosesExactSameIdentitySession(t *testing.T) {
 	_, handle, authority, _, events := freshnessTestRoom(t)
 	authority.setEvents(events[0])
+	now, old := time.Now(), handle.session
+	t.Cleanup(old.Close)
+	if err := handle.checkFreshness(handle.ctx, old, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	instance := handle.client
+	replacement, err := replica.DialRoom(handle.ctx, replica.Config{RoomID: handle.key, NodeKey: instance.key, DirectAddress: instance.directAddress, DirectPublic: instance.directPublic})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.installSession(replacement, instance.key, 1, old); err != nil {
+		replacement.Close()
+		t.Fatal(err)
+	}
+	head := *handle.freshness.latest
+	if err := handle.recordFreshnessHead(&head, old, 1, now.Add(relayFreshnessGrace)); err != nil {
+		t.Fatal(err)
+	}
+	if handle.session != nil || handle.freshness.status != "stale" {
+		t.Fatal("same-identity reconnect was not retired in the recording path")
+	}
+	select {
+	case <-replacement.Done:
+	case <-handle.ctx.Done():
+		t.Fatal("retired replacement remained open")
+	}
+}
+
+func TestFreshnessExpiredBudgetCannotBuyRepairPerReconnect(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events...)
 	now := time.Now()
 	if err := handle.checkFreshness(handle.ctx, handle.session, 1, now); err != nil {
 		t.Fatal(err)
 	}
 	handle.closeSession()
-	handle.syncNow = func() time.Time { return now.Add(initialSyncTimeout) }
-	handle.freshnessBudget = func(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
-		if budget != initialSyncTimeout {
-			t.Fatalf("unexpected budget %v", budget)
+	budget := handle.ensureCatchupLocked(3, 0, now)
+	handle.syncNow = func() time.Time { return now.Add(catchupSlack + catchupRecovery + time.Second) }
+	relay.setEvents(events...)
+	var queries atomic.Int32
+	relay.mu.Lock()
+	relay.beforeEvents = func(community.GetEvents) { queries.Add(1) }
+	relay.mu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		if err := handle.connect(handle.ctx); !errors.Is(err, errCatchupRate) {
+			t.Fatalf("expired reconnect %d: %v", attempt, err)
 		}
-		return context.WithDeadline(ctx, time.Unix(0, 0))
+		if handle.freshness.rate != budget || handle.session != nil {
+			t.Fatal("expired budget was replaced or session leaked")
+		}
 	}
-	if err := handle.connect(handle.ctx); err == nil {
-		t.Fatal("expired sync succeeded")
+	if queries.Load() != 0 || budget.credits != 0 {
+		t.Fatal("expired reconnect granted new I/O or credit")
 	}
-	if handle.session != nil || len(handle.excludedRelays) != 1 || handle.freshness.status != "stale" {
-		t.Fatal("expired initial sync failed to exclude known lag")
+}
+
+func TestFreshnessHonestFinalizationIsProtectedAfterH(t *testing.T) {
+	_, handle, authority, relay, events := freshnessTestRoom(t)
+	authority.setEvents(events[0])
+	now, session := time.Now(), handle.session
+	if err := handle.checkFreshness(handle.ctx, session, 1, now); err != nil {
+		t.Fatal(err)
+	}
+	var clock atomic.Int64
+	clock.Store(now.UnixNano())
+	handle.syncNow = func() time.Time { return time.Unix(0, clock.Load()) }
+	relay.setEvents(events[0])
+	relay.mu.Lock()
+	relay.beforeEvents = func(community.GetEvents) { clock.Store(now.Add(60 * time.Second).UnixNano()) }
+	relay.beforeState = func() {
+		clock.Store(now.Add(65 * time.Second).UnixNano())
+		if err := handle.busyFreshness(handle.ctx, session, 1, "history_busy", handle.syncTime()); err != nil {
+			t.Error(err)
+		}
+		if !handle.isCurrentSession(session, 1) {
+			t.Error("honest finalization was closed after H")
+		}
+	}
+	relay.mu.Unlock()
+	if err := handle.syncSessionLocked(handle.ctx, session, 1); err != nil {
+		t.Fatal(err)
+	}
+	if handle.verifiedHead != 1 || len(handle.excludedRelays) != 0 {
+		t.Fatal("bounded finalization failed to apply")
 	}
 }

@@ -112,6 +112,7 @@ type roomHandle struct {
 	state           community.RoomStateResult
 	projection      *community.Projection
 	verifiedHead    int64
+	receivedHead    int64
 	clockSession    *replica.Session
 	clockEpoch      uint64
 	clockRemote     int64
@@ -793,7 +794,7 @@ func (c *Client) startRoom(record RoomRecord, first chan<- error) *roomHandle {
 	ctx, cancel := context.WithCancel(c.ctx)
 	handle := &roomHandle{
 		client: c, key: append([]byte(nil), record.RoomKey...), ref: record.Reference,
-		boot: append([]byte(nil), record.Bootstrap...), ctx: ctx, cancel: cancel,
+		boot: append([]byte(nil), record.Bootstrap...), ctx: ctx, cancel: cancel, receivedHead: record.HeadSeqno,
 		events: make(chan canonicalEvent, canonicalEventQueueCapacity),
 	}
 	c.rooms[key] = handle
@@ -917,12 +918,9 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		session.Close()
 		return err
 	}
-	syncCtx, syncCancel := r.freshnessContext(ctx, initialSyncTimeout)
-	syncErr := r.syncSessionLocked(syncCtx, session, identityEpoch)
-	syncCancel()
+	syncErr := r.syncSessionLocked(ctx, session, identityEpoch)
 	if syncErr != nil {
-		// Retained authoritative evidence still applies if later probes cannot run.
-		if ctx.Err() == nil && errors.Is(syncCtx.Err(), context.DeadlineExceeded) {
+		if errors.Is(syncErr, errCatchupRate) {
 			r.mu.Lock()
 			if r.session == session && r.sessionEpoch == identityEpoch {
 				r.markBehindLocked(session, r.syncTime())
@@ -1004,18 +1002,57 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	if err != nil {
 		return err
 	}
-	for {
+	r.mu.Lock()
+	r.receivedHead = max(r.receivedHead, record.HeadSeqno) // Existing cache is not new progress.
+	var budget *catchupRate
+	if pending := r.freshness.pending; pending != nil {
+		budget = r.ensureCatchupLocked(pending.seqno, record.HeadSeqno, r.syncTime())
+	}
+	r.mu.Unlock()
+	var finalCtx context.Context
+	var finalCancel context.CancelFunc
+	defer func() {
+		if finalCancel != nil {
+			finalCancel()
+		}
+	}()
+	finalize := func() context.Context {
+		if finalCtx == nil {
+			phaseCtx, phaseCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
+			r.mu.Lock()
+			now := r.syncTime()
+			if progress.finalizingUntil.IsZero() {
+				progress.finalizingUntil = now.Add(freshnessRepairTimeout)
+			}
+			remaining := max(time.Duration(0), progress.finalizingUntil.Sub(now))
+			r.mu.Unlock()
+			var boundCancel context.CancelFunc
+			finalCtx, boundCancel = context.WithTimeout(phaseCtx, remaining)
+			finalCancel = func() { boundCancel(); phaseCancel() }
+		}
+		return finalCtx
+	}
+	queryPage := func(queryCtx context.Context, target int64, catchup bool) error {
+		limit := int64(community.MaxPageLimit)
+		if target >= 0 {
+			limit = max(int64(1), min(limit, target-record.HeadSeqno))
+		}
+		pageCtx, cancel := context.WithTimeout(queryCtx, 10*time.Second)
 		var page community.EventList
-		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := session.Peer.Query(queryCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: community.MaxPageLimit}, &page)
+		err := session.Peer.Query(pageCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: int32(limit)}, &page)
 		cancel()
 		if err != nil {
 			return err
 		}
-		if !r.isCurrentSession(expected, epoch) {
-			return errRoomSessionChanged
-		}
 		for _, event := range page.Events {
+			if catchup {
+				r.mu.RLock()
+				target = min(target, budget.target)
+				r.mu.RUnlock()
+			}
+			if target >= 0 && event.Seqno > target {
+				break
+			}
 			if !r.isCurrentSession(expected, epoch) {
 				return errRoomSessionChanged
 			}
@@ -1026,7 +1063,7 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 			if err != nil {
 				return err
 			}
-			inserted, err := r.client.store.appendEvent(ctx, r.key, event)
+			inserted, err := r.client.store.appendEvent(queryCtx, r.key, event)
 			if err != nil {
 				return err
 			}
@@ -1035,32 +1072,111 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 					return err
 				}
 				r.advanceRoomSync(progress, event.Seqno)
-				if err := r.client.emitEvent(ctx, event); err != nil {
+				if err := r.client.emitEvent(queryCtx, event); err != nil {
 					return err
 				}
 			}
 			record.HeadSeqno = event.Seqno
 		}
-		if !page.HasMore {
-			break
+		return nil
+	}
+	queryState := func(queryCtx context.Context) (community.RoomStateResult, error) {
+		var state community.RoomStateResult
+		stateCtx, cancel := context.WithTimeout(queryCtx, 10*time.Second)
+		err := session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
+		cancel()
+		if err != nil {
+			return state, err
 		}
-		if len(page.Events) == 0 {
-			return fmt.Errorf("empty event page with has_more")
+		if !r.isCurrentSession(expected, epoch) {
+			return state, errRoomSessionChanged
+		}
+		if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
+			return state, fmt.Errorf("invalid room state")
+		}
+		return state, nil
+	}
+	if budget == nil {
+		// Preserve the resume cursor, then freeze the relay's bootstrap head.
+		setupCtx, setupCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
+		err = queryPage(setupCtx, -1, false)
+		var initial community.RoomStateResult
+		if err == nil {
+			initial, err = queryState(setupCtx)
+		}
+		setupCancel()
+		if err != nil {
+			return err
+		}
+		r.mu.Lock()
+		target := initial.Stats.ReplicaSeqno
+		if pending := r.freshness.pending; pending != nil {
+			target = pending.seqno
+		}
+		budget = r.ensureCatchupLocked(target, record.HeadSeqno, r.syncTime())
+		r.mu.Unlock()
+	} else {
+		r.mu.RLock()
+		initialTarget := budget.target
+		r.mu.RUnlock()
+		if record.HeadSeqno >= initialTarget {
+			// This probe and all finalization work share the same fixed 15s budget.
+			if err := queryPage(finalize(), initialTarget, false); err != nil {
+				return err
+			}
 		}
 	}
-	var state community.RoomStateResult
-	stateCtx, stateCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
-	stateCancel()
+	// H never moves to follow a newer authority head or HasMore while catching up.
+	r.mu.RLock()
+	target := budget.target
+	r.mu.RUnlock()
+	for record.HeadSeqno < target {
+		r.mu.RLock()
+		target = min(target, budget.target)
+		r.mu.RUnlock()
+		if record.HeadSeqno >= target {
+			break
+		}
+		queryCtx, cancel, rateErr := r.catchupContext(ctx, budget, session)
+		if rateErr != nil {
+			return rateErr
+		}
+		before := record.HeadSeqno
+		err = queryPage(queryCtx, target, true)
+		cancel()
+		if err != nil {
+			return err
+		}
+		if record.HeadSeqno == before {
+			return fmt.Errorf("relay did not advance toward checkpoint")
+		}
+		r.mu.Lock()
+		_, err = r.rateDeadlineLocked(budget, session, r.syncTime())
+		r.mu.Unlock()
+		if err != nil {
+			return err
+		}
+	}
+	// Freeze ONE current-state response J after H. Fetch through J only, under F;
+	// continuous writes/HasMore cannot extend J or restart the finalization timer.
+	state, err := queryState(finalize())
 	if err != nil {
 		return err
+	}
+	finalTarget := state.Stats.ReplicaSeqno
+	for record.HeadSeqno < finalTarget {
+		before := record.HeadSeqno
+		if err := queryPage(finalCtx, finalTarget, false); err != nil {
+			return err
+		}
+		if record.HeadSeqno == before {
+			return fmt.Errorf("relay did not reach frozen state head")
+		}
 	}
 	if !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
-	if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
-		return fmt.Errorf("invalid room state")
-	}
+	ctx = finalCtx
 	if err := r.client.store.installRoom(ctx, r.key, session.Genesis, projection, state.State); err != nil {
 		return err
 	}
@@ -1290,6 +1406,7 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 	if err := projection.Commit(transition); err != nil {
 		return true, err
 	}
+	r.advanceRoomSync(nil, event.Seqno)
 	r.mu.Lock()
 	r.projection = projection
 	r.verifiedHead = event.Seqno
