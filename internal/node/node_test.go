@@ -5,15 +5,19 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/xssnick/tonutils-go/adnl/address"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 func TestParseTONQUICAdvertiseAddress(t *testing.T) {
@@ -209,5 +213,94 @@ func TestMessageLimitsAndSignaturePenaltyAreObservable(t *testing.T) {
 	runtime.handleCommunityMessage(peer, wrapper, time.Now())
 	if !runtime.penalties.banned(peer.id, time.Now()) {
 		t.Fatal("invalid signature did not penalize peer")
+	}
+}
+
+func TestDirectMessageChecksSenderBeforeRateLimitAndMembership(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	connectionKey, otherKey := integrationKey(t), integrationKey(t)
+	server, err := roomnet.NewGateway(connectionKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.SetConnectionHandler(func(*quic.Peer) error { return nil })
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	go server.Serve(packet)
+	gateway, err := roomnet.NewGateway(integrationKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	rawPeer, err := gateway.DialDefault(ctx, connectionKey.Public().(ed25519.PublicKey), packet.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connection := roomnet.Wrap(rawPeer)
+	if !bytes.Equal(connection.GetPubKey(), connectionKey.Public().(ed25519.PublicKey)) {
+		t.Fatal("connection has the wrong authenticated key")
+	}
+	roomKey, recipient := integrationKey(t), integrationKey(t)
+	for _, mode := range []string{"mismatched leaf", "missing connection", "valid leaf", "healthy node forwarding"} {
+		t.Run(mode, func(t *testing.T) {
+			now := time.Now()
+			sender := otherKey
+			p := newPeer("peer", kindLeaf, connection, nil)
+			accepted := false
+			switch mode {
+			case "missing connection":
+				p.conn = nil
+			case "valid leaf":
+				sender = connectionKey
+				accepted = true
+			case "healthy node forwarding":
+				p.kind, p.state = kindNode, peerHealthy
+				accepted = true
+			}
+			runtime := &Node{
+				genesis: community.Genesis{RoomKey: roomKey.Public().(ed25519.PublicKey)},
+				peers:   newPeerTable(DefaultMaxLeaves), sources: newSourceLimits(),
+				messages: newTokenBucket(10, 0), penalties: newPenaltyBox(), dedup: overlay.NewDedup(10),
+			}
+			runtime.peers.m[p.id] = p
+			direct, err := community.SignDirectMessage(sender, community.DirectMessage{
+				RoomID: runtime.genesis.RoomKey, ToKey: recipient.Public().(ed25519.PublicKey),
+				Timestamp: now.Unix(), Ciphertext: make([]byte, 28),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := community.Encode(direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapper, err := broadcast.Sign(sender, nil, raw, now.Unix())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtime.handleCommunityMessage(p, wrapper, now)
+			_, limited := runtime.sources.m[hex.EncodeToString(direct.FromKey)]
+			if limited != accepted || p.member != (accepted && p.kind == kindLeaf) {
+				t.Fatalf("accepted=%v source limiter=%v member=%v", accepted, limited, p.member)
+			}
+			wantInvalid := uint64(1)
+			if accepted {
+				wantInvalid = 0
+			}
+			if got := runtime.stats.invalidDrops.Load(); got != wantInvalid {
+				t.Fatalf("invalidDrops=%d, want %d", got, wantInvalid)
+			}
+			if runtime.dedup.Len() != 0 && !accepted || runtime.dedup.Len() != 1 && accepted {
+				t.Fatalf("accepted=%v committed broadcasts=%d", accepted, runtime.dedup.Len())
+			}
+			if !accepted && (p.state != peerQuarantine || !p.lastGood.IsZero()) {
+				t.Fatal("rejected sender changed peer health")
+			}
+		})
 	}
 }

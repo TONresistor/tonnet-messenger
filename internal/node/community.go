@@ -537,16 +537,17 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 		n.stats.invalidDrops.Add(1)
 		return
 	}
+	fromNode := n.peers.isHealthyNode(p)
+	if !fromNode && (p.conn == nil || !bytes.Equal(p.conn.GetPubKey(), direct.FromKey)) {
+		n.stats.invalidDrops.Add(1)
+		return
+	}
 	if !n.sources.allow(hex.EncodeToString(direct.FromKey), len(raw), now) {
 		n.stats.sourceRateDrops.Add(1)
 		return
 	}
-	fromNode := n.peers.isHealthyNode(p)
 	_, joined, accepted := n.peers.acceptInbound(p, now)
 	if !accepted {
-		return
-	}
-	if !fromNode && (p.conn == nil || !bytes.Equal(p.conn.GetPubKey(), direct.FromKey)) {
 		return
 	}
 	if joined {
