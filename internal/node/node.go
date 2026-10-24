@@ -435,6 +435,7 @@ func (n *Node) Run(ctx context.Context) error {
 	go n.databaseMaintenanceLoop(ctx)
 	go n.peerMaintenanceLoop(ctx)
 	if n.nodeRole == community.NodeRoleRelay {
+		go n.sequencerLinkLoop(ctx)
 		go n.replicaReconcileLoop(ctx)
 	}
 

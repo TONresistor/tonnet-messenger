@@ -108,10 +108,10 @@ func (t *peerTable) addInbound(id string, conn *roomnet.Peer) (*peer, bool, *pee
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if p, ok := t.m[id]; ok {
-		if p.kind != kindLeaf || p.conn == conn {
+		if p.conn == conn || (p.kind != kindLeaf && id != t.sequencerID) {
 			return p, false, nil
 		}
-		next := newPeer(id, kindLeaf, conn, nil)
+		next := newPeer(id, p.kind, conn, p.signed)
 		t.m[id] = next
 		return next, true, p
 	}

@@ -52,9 +52,6 @@ func (n *Node) discoverOnce(ctx context.Context) {
 	if pub == nil {
 		return
 	}
-	if err := n.ensureSequencerLink(ctx, pub.ResolveAll); err != nil && ctx.Err() == nil {
-		log.Printf("sequencer link: %v", err)
-	}
 	if list, err := pub.FindOverlayNodes(ctx, n.overlayKey()); err != nil {
 		log.Printf("discover: dht find: %v", err)
 	} else if list != nil {
@@ -77,6 +74,32 @@ func (n *Node) discoverOnce(ctx context.Context) {
 		nodes = capNodes(nodes)
 		for i := range nodes {
 			n.considerNode(ctx, &nodes[i])
+		}
+	}
+}
+
+func (n *Node) sequencerLinkLoop(ctx context.Context) {
+	n.runSequencerLink(ctx, func(ctx context.Context) error {
+		pub := n.publisher()
+		if pub == nil {
+			return nil
+		}
+		return n.ensureSequencerLink(ctx, pub.ResolveAll)
+	}, DiscoverEach)
+}
+
+func (n *Node) runSequencerLink(ctx context.Context, check func(context.Context) error, interval time.Duration) {
+	// This loop has its own reserved dial and deadline; gossip cannot delay it.
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := check(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("sequencer link: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
 		}
 	}
 }

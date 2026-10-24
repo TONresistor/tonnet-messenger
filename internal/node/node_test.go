@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"net"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -302,5 +303,34 @@ func TestDirectMessageChecksSenderBeforeRateLimitAndMembership(t *testing.T) {
 				t.Fatal("rejected sender changed peer health")
 			}
 		})
+	}
+}
+
+func TestSequencerLinkRunsIndependentlyOfDiscovery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	var calls atomic.Int32
+	runtime := &Node{}
+	runtime.runSequencerLink(ctx, func(context.Context) error { calls.Add(1); return nil }, 10*time.Millisecond)
+	if calls.Load() < 2 {
+		t.Fatal("authority link did not retry independently")
+	}
+}
+
+func TestSequencerReconnectReplacesNodeAndPreservesClassification(t *testing.T) {
+	table := newPeerTable(DefaultMaxLeaves)
+	table.sequencerID = "authority"
+	oldConn, newConn := &roomnet.Peer{}, &roomnet.Peer{}
+	old, _, _ := table.addInbound("authority", oldConn)
+	old.state = peerHealthy
+	next, added, displaced := table.addInbound("authority", newConn)
+	if !added || displaced != old || next == old || next.kind != kindNode || next.conn != newConn {
+		t.Fatal("new authoritative connection was discarded")
+	}
+	if table.removePeer("authority", old) {
+		t.Fatal("old disconnect callback removed its replacement")
+	}
+	if current, ok := table.get("authority"); !ok || current != next {
+		t.Fatal("replacement disappeared")
 	}
 }
