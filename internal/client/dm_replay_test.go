@@ -278,18 +278,23 @@ func TestFailedDirectNotificationRemainsRetryable(t *testing.T) {
 	}
 }
 
-func TestDirectNotificationReturnsStorageErrors(t *testing.T) {
+func TestClientDeliversDirectMessageWhenReplayStorageFails(t *testing.T) {
 	instance := directTestClient(t)
+	room, sender := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	roomID := room.Public().(ed25519.PublicKey)
+	wrapper := directTestBroadcast(t, roomID, sender, instance.key)
 	if err := instance.store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	session := &replica.Session{}
-	handle := &roomHandle{client: instance, session: session, sessionEpoch: 1}
-	if err := handle.notifyDirectForSession(context.Background(), session, 1, [32]byte{1}, time.Now().Add(time.Minute), "hello"); err == nil {
-		t.Fatal("database error was discarded")
+	handle := &roomHandle{client: instance, key: roomID, ctx: instance.ctx, session: session, sessionEpoch: 1}
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(instance.events) != 1 {
+		t.Fatalf("storage failure produced %d notifications, want 1", len(instance.events))
 	}
-	if len(instance.events) != 0 {
-		t.Fatal("DM was emitted without persistent replay protection")
+	notification := <-instance.events
+	if notification.Method != "dm.message" || notification.Params.(map[string]any)["text"] != "hello" {
+		t.Fatalf("notification = %#v", notification)
 	}
 }
 

@@ -35,7 +35,9 @@ func (r *roomHandle) notifyDirectForSession(ctx context.Context, session *replic
 	}
 	inserted, err := c.store.claimDirectMessage(ctx, recipient, id, expires, now)
 	if err != nil {
-		return err
+		// Senders do not control local storage errors; prefer a possible duplicate
+		// to losing a verified DM.
+		return c.notifyUntil(ctx, session.Done, "dm.message", params)
 	}
 	if !inserted {
 		return nil
