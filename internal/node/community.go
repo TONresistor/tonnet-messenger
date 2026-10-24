@@ -401,22 +401,40 @@ func (n *Node) batchItem(raw []byte, now time.Time) community.BatchItem {
 	case community.GetRoomState, *community.GetRoomState:
 		response, err = n.communityStateResult(context.Background(), now)
 	case community.GetEvents:
+		if value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.Events(context.Background(), value.AfterSeqno, int(value.Limit))
 	case community.GetMessagesRecent:
+		if value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.MessagesRecent(context.Background(), int(value.Limit))
 	case community.GetMessagesBefore:
+		if value.MessageID < 1 || value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.MessagesBefore(context.Background(), value.MessageID, int(value.Limit))
 	case *community.GetEvents:
+		if value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.Events(context.Background(), value.AfterSeqno, int(value.Limit))
 	case *community.GetMessagesRecent:
+		if value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.MessagesRecent(context.Background(), int(value.Limit))
 	case *community.GetMessagesBefore:
+		if value.MessageID < 1 || value.Limit < 0 || value.Limit > community.MaxPageLimit {
+			return community.BatchItem{Code: community.RejectMalformedRequest}
+		}
 		response, err = n.store.MessagesBefore(context.Background(), value.MessageID, int(value.Limit))
 	default:
 		return community.BatchItem{Code: community.RejectUnsupportedEvent}
 	}
 	if err != nil {
-		return community.BatchItem{Code: community.RejectMalformedRequest}
+		return community.BatchItem{Code: community.RejectPersistenceFailure}
 	}
 	encoded, err := community.Encode(response)
 	if err != nil {

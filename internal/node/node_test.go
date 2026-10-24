@@ -119,6 +119,46 @@ func testLocalSubmissionIdentityDomain(t *testing.T, domain string) {
 	}
 }
 
+func TestBatchItemDistinguishesStorageAndRequestErrors(t *testing.T) {
+	database, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	runtime := &Node{store: database}
+	for _, tc := range []struct {
+		name    string
+		request any
+		code    int32
+	}{
+		{"events default limit", community.GetEvents{}, community.RejectPersistenceFailure},
+		{"events maximum limit", community.GetEvents{Limit: community.MaxPageLimit}, community.RejectPersistenceFailure},
+		{"recent messages", community.GetMessagesRecent{Limit: 1}, community.RejectPersistenceFailure},
+		{"messages before", community.GetMessagesBefore{MessageID: 1, Limit: 1}, community.RejectPersistenceFailure},
+		{"room state", community.GetRoomState{}, community.RejectPersistenceFailure},
+		{"negative events limit", community.GetEvents{Limit: -1}, community.RejectMalformedRequest},
+		{"excessive events limit", community.GetEvents{Limit: community.MaxPageLimit + 1}, community.RejectMalformedRequest},
+		{"negative recent limit", community.GetMessagesRecent{Limit: -1}, community.RejectMalformedRequest},
+		{"excessive recent limit", community.GetMessagesRecent{Limit: community.MaxPageLimit + 1}, community.RejectMalformedRequest},
+		{"negative before limit", community.GetMessagesBefore{MessageID: 1, Limit: -1}, community.RejectMalformedRequest},
+		{"excessive before limit", community.GetMessagesBefore{MessageID: 1, Limit: community.MaxPageLimit + 1}, community.RejectMalformedRequest},
+		{"invalid message id", community.GetMessagesBefore{Limit: 1}, community.RejectMalformedRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := community.Encode(tc.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			item := runtime.batchItem(raw, time.Now())
+			if item.Code != tc.code || len(item.Data) != 0 {
+				t.Fatalf("batch item = %#v, want code %d with no data", item, tc.code)
+			}
+		})
+	}
+}
+
 func TestBatchResponseStaysWithinAnswerBudget(t *testing.T) {
 	items := make([]community.BatchItem, community.MaxBatchQueries)
 	for i := range items {
