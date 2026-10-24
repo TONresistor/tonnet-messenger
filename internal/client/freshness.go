@@ -292,46 +292,119 @@ func (r *roomHandle) failFreshness(ctx context.Context, session *replica.Session
 	return r.emitFreshness(ctx, session, epoch)
 }
 
-func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Session, epoch uint64, now time.Time) error {
-	// The authority budget ends before waiting for history or attempting relay repair.
-	authorityCtx, cancel := context.WithTimeout(ctx, freshnessTimeout)
-	var head *headCheckpoint
-	var checkErr error
-	select {
-	case r.client.freshnessChecks <- struct{}{}:
-		head, checkErr = r.sequencerHead(authorityCtx, session, epoch)
-		<-r.client.freshnessChecks
-	case <-authorityCtx.Done():
-		checkErr = authorityCtx.Err()
+func (r *roomHandle) freshnessContext(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	if r.freshnessBudget != nil {
+		return r.freshnessBudget(ctx, budget)
 	}
-	cancel()
-	if checkErr != nil {
-		return r.failFreshness(ctx, session, epoch, "sequencer_unavailable", checkErr)
-	}
-	lockCtx, lockCancel := context.WithTimeout(ctx, freshnessLockTimeout)
-	err := r.lockFreshnessHistory(lockCtx)
-	lockCancel()
-	if err != nil {
-		return r.failFreshness(ctx, session, epoch, "history_busy", err)
-	}
-	defer r.historyMu.Unlock()
-	if !r.isCurrentSession(session, epoch) {
+	return context.WithTimeout(ctx, budget)
+}
+
+// Retain authenticated evidence even if the relay disconnects during the probe.
+func (r *roomHandle) recordFreshnessHead(head *headCheckpoint, session *replica.Session, epoch uint64, now time.Time) error {
+	r.client.mu.RLock()
+	defer r.client.mu.RUnlock()
+	if r.client.closed || r.client.identityEpoch != epoch {
 		return errRoomSessionChanged
 	}
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	f := &r.freshness
 	if f.latest != nil && (head.seqno < f.latest.seqno ||
 		(head.seqno == f.latest.seqno && !bytes.Equal(head.hash, f.latest.hash))) {
-		r.mu.Unlock()
-		return r.failFreshness(ctx, session, epoch, "checkpoint_conflict", errFreshnessConflict)
+		return errFreshnessConflict
 	}
 	f.failures = 0
 	if f.latest == nil || head.seqno > f.latest.seqno {
 		head.observed = now
 		f.latest = head
 	}
-	latest, pending := f.latest, f.pending
-	r.mu.Unlock()
+	if f.pending == nil && r.verifiedHead < head.seqno {
+		f.pending = f.latest
+	}
+	if r.session != nil && r.session != session && r.sessionEpoch == epoch && bytes.Equal(r.session.Peer.GetPubKey(), session.Peer.GetPubKey()) {
+		r.markBehindLocked(session, now)
+	}
+	return nil
+}
+
+// A lower applied head proves lag without reading the mutable projection.
+func (r *roomHandle) markBehindLocked(session *replica.Session, now time.Time) bool {
+	f := &r.freshness
+	if f.pending == nil || r.verifiedHead >= f.pending.seqno || now.Sub(f.pending.observed) < relayFreshnessGrace {
+		return false
+	}
+	f.status, f.reason = "stale", "relay_behind"
+	if r.excludedRelays == nil {
+		r.excludedRelays = make(map[string]time.Time)
+	}
+	r.excludedRelays[keyText(session.Peer.GetPubKey())] = now.Add(relayExclusionTTL)
+	return true
+}
+
+func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Session, epoch uint64, now time.Time) error {
+	// Queueing is local contention, not a sequencer failure; it has its own budget.
+	slotCtx, slotCancel := r.freshnessContext(ctx, freshnessLockTimeout)
+	select {
+	case r.client.freshnessChecks <- struct{}{}:
+		slotCancel()
+	case <-slotCtx.Done():
+		slotCancel()
+		if !r.isCurrentSession(session, epoch) {
+			return errRoomSessionChanged
+		}
+		r.mu.Lock()
+		r.freshness.status, r.freshness.reason = "unverified", "check_busy"
+		r.markBehindLocked(session, now)
+		r.mu.Unlock()
+		return r.emitFreshness(ctx, session, epoch)
+	}
+	authorityCtx, cancel := r.freshnessContext(ctx, freshnessTimeout)
+	head, checkErr := r.sequencerHead(authorityCtx, session, epoch)
+	cancel()
+	<-r.client.freshnessChecks
+	if checkErr != nil {
+		return r.failFreshness(ctx, session, epoch, "sequencer_unavailable", checkErr)
+	}
+	if err := r.recordFreshnessHead(head, session, epoch, now); err != nil {
+		return r.failFreshness(ctx, session, epoch, "checkpoint_conflict", err)
+	}
+	if !r.isCurrentSession(session, epoch) {
+		r.mu.RLock()
+		current, currentEpoch := r.session, r.sessionEpoch
+		r.mu.RUnlock()
+		if current != nil && currentEpoch == epoch {
+			if err := r.emitFreshness(ctx, current, epoch); err != nil {
+				return errors.Join(errRoomSessionChanged, err)
+			}
+		}
+		return errRoomSessionChanged
+	}
+	lockCtx, lockCancel := r.freshnessContext(ctx, freshnessLockTimeout)
+	err := r.lockFreshnessHistory(lockCtx)
+	lockCancel()
+	if err != nil {
+		r.mu.Lock()
+		if r.session != session || r.sessionEpoch != epoch {
+			r.mu.Unlock()
+			return errRoomSessionChanged
+		}
+		r.freshness.status, r.freshness.reason = "unverified", "history_busy"
+		r.markBehindLocked(session, now)
+		r.mu.Unlock()
+		return r.emitFreshness(ctx, session, epoch)
+	}
+	locked := true
+	defer func() {
+		if locked {
+			r.historyMu.Unlock()
+		}
+	}()
+	if !r.isCurrentSession(session, epoch) {
+		return errRoomSessionChanged
+	}
+	r.mu.RLock()
+	latest, pending := r.freshness.latest, r.freshness.pending
+	r.mu.RUnlock()
 	localCtx, localCancel := context.WithTimeout(ctx, freshnessLockTimeout)
 	caughtUp, err := r.hasAppliedCheckpoint(localCtx, latest)
 	if err == nil && pending != nil {
@@ -350,7 +423,7 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 	}
 	var repairErr error
 	if !caughtUp && now.Sub(pending.observed) >= relayFreshnessGrace {
-		repairCtx, repairCancel := context.WithTimeout(ctx, freshnessRepairTimeout)
+		repairCtx, repairCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
 		repairErr = r.syncSessionLocked(repairCtx, session, epoch)
 		if repairErr == nil {
 			caughtUp, err = r.hasAppliedCheckpoint(repairCtx, latest)
@@ -368,7 +441,7 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 		}
 	}
 	r.mu.Lock()
-	f = &r.freshness
+	f := &r.freshness
 	f.pending = pending
 	f.status, f.reason = "unverified", "relay_lag"
 	stale := !caughtUp && now.Sub(pending.observed) >= relayFreshnessGrace
@@ -392,7 +465,9 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 		return err
 	}
 	if stale {
-		// Keep the old connection usable unless a different relay is fully synchronized.
+		// Dial outside the history lock so the old path can keep ingesting.
+		r.historyMu.Unlock()
+		locked = false
 		return r.replaceStaleRelay(ctx, session, epoch, now)
 	}
 	return repairErr
@@ -424,8 +499,15 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 			candidate.Close()
 		}
 	}()
+	lockCtx, lockCancel := r.freshnessContext(ctx, freshnessLockTimeout)
+	lockErr := r.lockFreshnessHistory(lockCtx)
+	lockCancel()
+	if lockErr != nil {
+		return nil
+	}
+	defer r.historyMu.Unlock()
 	// The old session stays current (including for DMs) throughout candidate validation.
-	repairCtx, repairCancel := context.WithTimeout(ctx, freshnessRepairTimeout)
+	repairCtx, repairCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
 	defer repairCancel()
 	if err := r.syncSessionFromLocked(repairCtx, candidate, old, epoch); err != nil {
 		return nil
@@ -449,13 +531,13 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	if !r.isCurrentSession(old, epoch) {
 		return errRoomSessionChanged
 	}
+	candidate.Peer.SetMessageHandler(func(message any) error { r.ingestSerializable(candidate, epoch, message); return nil })
 	if err := r.installSession(candidate, identity.key, epoch); err != nil {
 		return err
 	}
 	// The handle now owns candidate; this function always retires the displaced old path.
 	keepCandidate = true
 	defer old.Close()
-	candidate.Peer.SetMessageHandler(func(message any) error { r.ingestSerializable(candidate, epoch, message); return nil })
 	r.mu.Lock()
 	if r.session != candidate || r.sessionEpoch != epoch {
 		r.mu.Unlock()
@@ -464,6 +546,9 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	r.freshness.status, r.freshness.reason = "verified", ""
 	r.freshness.lastVerified, r.freshness.pending = now, nil
 	r.mu.Unlock()
+	if err := r.emitConnected(ctx, candidate, epoch); err != nil {
+		return err
+	}
 	return r.emitFreshness(ctx, candidate, epoch)
 }
 

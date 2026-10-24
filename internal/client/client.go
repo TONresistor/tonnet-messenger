@@ -124,6 +124,7 @@ type roomHandle struct {
 	freshness       relayFreshness
 	excludedRelays  map[string]time.Time
 	nextFreshnessAt time.Time
+	freshnessBudget func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 }
 
 type canonicalEvent struct {
@@ -814,8 +815,13 @@ func (c *Client) startRoom(record RoomRecord, first chan<- error) *roomHandle {
 func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 	delays := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 15 * time.Second}
 	firstPending := first != nil
+	var lastReconnectNotice time.Time
 	for attempt := 0; ctx.Err() == nil; attempt++ {
-		if attempt > 0 {
+		r.mu.RLock()
+		connected := r.session != nil
+		r.mu.RUnlock()
+		if attempt > 0 && !connected && time.Since(lastReconnectNotice) >= 15*time.Second {
+			lastReconnectNotice = time.Now()
 			if err := r.client.notify(ctx, "room.connection", map[string]any{"room": keyText(r.key), "status": "reconnecting", "attempt": attempt}); err != nil {
 				return
 			}
@@ -849,7 +855,9 @@ func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 			r.closeSessionIf(session)
 			return
 		case <-session.Done:
-			r.closeSessionIf(session)
+			if !r.closeSessionIf(session) {
+				continue // A freshness switch already installed a live replacement.
+			}
 			if pause := time.Second - time.Since(connectedAt); pause > 0 {
 				select {
 				case <-ctx.Done():
@@ -883,16 +891,16 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	session.Peer.SetMessageHandler(func(message any) error {
+		r.ingestSerializable(session, identityEpoch, message)
+		return nil
+	})
 	r.historyMu.Lock()
 	if err := r.installSession(session, identity, identityEpoch); err != nil {
 		r.historyMu.Unlock()
 		session.Close()
 		return err
 	}
-	session.Peer.SetMessageHandler(func(message any) error {
-		r.ingestSerializable(session, identityEpoch, message)
-		return nil
-	})
 	if err := r.syncSessionLocked(ctx, session, identityEpoch); err != nil {
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
@@ -901,28 +909,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		}
 		return err
 	}
-	r.mu.RLock()
-	if r.session != session || r.sessionEpoch != identityEpoch {
-		r.mu.RUnlock()
-		r.historyMu.Unlock()
-		return errRoomSessionChanged
-	}
-	state := r.state
-	verifiedHead := r.verifiedHead
-	r.mu.RUnlock()
-	connection, err := connectionView(session)
-	if err != nil {
-		detached := r.detachSessionIf(session)
-		r.historyMu.Unlock()
-		if detached != nil {
-			detached.Close()
-		}
-		return err
-	}
-	if err := r.notifyLiveSession(ctx, session, identityEpoch, "room.connection", map[string]any{
-		"room": keyText(r.key), "status": "connected",
-		"state": r.stateView(state.State, verifiedHead), "connection": connection, "presence": presenceView(state),
-	}); err != nil {
+	if err := r.emitConnected(ctx, session, identityEpoch); err != nil {
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
 		if detached != nil {
@@ -932,6 +919,20 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	}
 	r.historyMu.Unlock()
 	return nil
+}
+
+func (r *roomHandle) emitConnected(ctx context.Context, session *replica.Session, epoch uint64) error {
+	r.mu.RLock()
+	state, head := r.state, r.verifiedHead
+	r.mu.RUnlock()
+	connection, err := connectionView(session)
+	if err != nil {
+		return err
+	}
+	return r.notifyLiveSession(ctx, session, epoch, "room.connection", map[string]any{
+		"room": keyText(r.key), "status": "connected",
+		"state": r.stateView(state.State, head), "connection": connection, "presence": presenceView(state),
+	})
 }
 
 func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64) error {
@@ -1212,7 +1213,10 @@ func (r *roomHandle) processCanonical(ctx context.Context, session *replica.Sess
 		return false, err
 	}
 	if event.Seqno > record.HeadSeqno+1 {
-		if err := r.syncSessionLocked(ctx, session, epoch); err != nil {
+		gapCtx, gapCancel := r.freshnessContext(ctx, freshnessRepairTimeout)
+		err := r.syncSessionLocked(gapCtx, session, epoch)
+		gapCancel()
+		if err != nil {
 			durable, lookupErr := r.client.store.hasEvent(ctx, r.key, event)
 			if lookupErr != nil {
 				return false, errors.Join(err, lookupErr)
