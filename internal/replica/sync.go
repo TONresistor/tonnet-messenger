@@ -31,6 +31,8 @@ type Config struct {
 	DirectAddress      string
 	DirectPublic       ed25519.PublicKey
 	ExcludedPublicKeys [][]byte
+	AllowExcluded      bool
+	Discovery          *Discovery
 }
 
 type Result struct {
@@ -159,6 +161,12 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 			return nil, nil, fmt.Errorf("replica: direct target requires an Ed25519 public key")
 		}
 		targets = []target{{address: cfg.DirectAddress, public: append(ed25519.PublicKey(nil), cfg.DirectPublic...)}}
+	} else if cfg.Discovery != nil {
+		var err error
+		targets, err = cfg.Discovery.targets(ctx, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
 	} else {
 		_, ephemeral, err := ed25519.GenerateKey(cryptorand.Reader)
 		if err != nil {
@@ -173,7 +181,7 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 			discoveryGateway.Close()
 			return nil, nil, err
 		}
-		targets, err = resolveTargets(ctx, dhtClient, cfg.RoomID, cfg.BootstrapADNL, cfg.ExcludedPublicKeys)
+		targets, err = resolveTargets(ctx, dhtClient, cfg.RoomID, cfg.BootstrapADNL, cfg.ExcludedPublicKeys, cfg.AllowExcluded)
 		discoveryGateway.Close()
 		if err != nil {
 			return nil, nil, err
@@ -185,7 +193,7 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 	}
 	closeClient := func() { gateway.Close() }
 	for _, candidate := range targets {
-		if excludedPublicKey(candidate.public, cfg.ExcludedPublicKeys) {
+		if !cfg.AllowExcluded && excludedPublicKey(candidate.public, cfg.ExcludedPublicKeys) {
 			continue
 		}
 		peer, err := gateway.DialDefault(ctx, candidate.public, candidate.address)
@@ -231,11 +239,15 @@ type targetResolver interface {
 	FindOverlayNodes(context.Context, []byte, ...*tondht.Continuation) (*tonoverlay.NodesList, *tondht.Continuation, error)
 }
 
-func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, bootstrapADNL []byte, excluded [][]byte) ([]target, error) {
+func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, bootstrapADNL []byte, excluded [][]byte, allowExcluded bool) ([]target, error) {
+	var fallbackBootstrap []byte
 	for _, public := range excluded {
 		id, err := community.KeyID(public)
 		if err == nil && bytes.Equal(id, bootstrapADNL) {
 			// A stale bootstrap must not prevent trying another room node.
+			if allowExcluded {
+				fallbackBootstrap = bootstrapADNL
+			}
 			bootstrapADNL = nil
 			break
 		}
@@ -246,17 +258,22 @@ func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, boots
 	} else {
 		list, _, err := dhtClient.FindOverlayNodes(ctx, roomID)
 		if err != nil {
-			return nil, err
+			if len(fallbackBootstrap) == 0 {
+				return nil, err
+			}
 		}
 		if list == nil {
-			return nil, fmt.Errorf("replica: no room nodes in DHT")
+			if len(fallbackBootstrap) == 0 {
+				return nil, fmt.Errorf("replica: no room nodes in DHT")
+			}
+			list = &tonoverlay.NodesList{}
 		}
 		for _, node := range messengerdht.FilterOverlayNodes(list.List, roomID, time.Now()) {
 			public, ok := node.ID.(tonkeys.PublicKeyED25519)
 			if !ok || len(public.Key) != ed25519.PublicKeySize {
 				continue
 			}
-			if excludedPublicKey(public.Key, excluded) {
+			if !allowExcluded && excludedPublicKey(public.Key, excluded) {
 				continue
 			}
 			id, err := tl.Hash(node.ID)
@@ -264,6 +281,9 @@ func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, boots
 				ids = append(ids, id)
 			}
 		}
+	}
+	if len(fallbackBootstrap) > 0 {
+		ids = append(ids, fallbackBootstrap)
 	}
 	var targets []target
 	for _, id := range ids {
@@ -275,7 +295,7 @@ func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, boots
 		if err != nil || !bytes.Equal(resolvedID, id) {
 			continue
 		}
-		if excludedPublicKey(public, excluded) {
+		if !allowExcluded && excludedPublicKey(public, excluded) {
 			continue
 		}
 		for _, candidate := range addresses.Addresses {
@@ -294,12 +314,23 @@ func resolveTargets(ctx context.Context, dhtClient targetResolver, roomID, boots
 			})
 		}
 	}
-	rand.Shuffle(len(targets), func(i, j int) { targets[i], targets[j] = targets[j], targets[i] })
-	if len(targets) > 16 {
-		targets = targets[:16]
-	}
+	targets = preferTargets(targets, excluded)
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("replica: no dialable TON QUIC room nodes")
 	}
 	return targets, nil
+}
+func preferTargets(targets []target, excluded [][]byte) []target {
+	var preferred, fallback []target
+	for _, item := range targets {
+		if excludedPublicKey(item.public, excluded) {
+			fallback = append(fallback, item)
+		} else {
+			preferred = append(preferred, item)
+		}
+	}
+	for _, group := range [][]target{preferred, fallback} {
+		rand.Shuffle(len(group), func(i, j int) { group[i], group[j] = group[j], group[i] })
+	}
+	return append(preferred[:min(len(preferred), 16)], fallback[:min(len(fallback), 16)]...)
 }

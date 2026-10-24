@@ -91,6 +91,7 @@ type Client struct {
 	notifyWG        sync.WaitGroup
 	notifyClosed    bool
 	freshnessChecks chan struct{}
+	discovery       *replica.Discovery
 }
 
 type roomHandle struct {
@@ -116,11 +117,13 @@ type roomHandle struct {
 	clockRemote     int64
 	clockCalibrated time.Time
 	dialSequencer   func(context.Context, replica.Config) (*replica.Session, error)
+	dialRoom        func(context.Context, replica.Config) (*replica.Session, error)
 	events          chan canonicalEvent
 	workers         sync.WaitGroup
 	ingestDone      bool
 	freshness       relayFreshness
 	excludedRelays  map[string]time.Time
+	nextFreshnessAt time.Time
 }
 
 type canonicalEvent struct {
@@ -199,6 +202,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 		freshnessChecks: make(chan struct{}, 1),
+		discovery:       replica.NewDiscovery(cfg.ConfigURL),
 	}
 	return c, nil
 }
@@ -248,6 +252,7 @@ func (c *Client) Close() error {
 	close(c.events)
 	c.submissionMu.Lock()
 	defer c.submissionMu.Unlock()
+	c.discovery.Close()
 	err := c.store.Close()
 	releaseStateLock(c.lock)
 	return err
@@ -652,6 +657,8 @@ func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot,
 func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdentitySnapshot) (int64, error) {
 	r.clockMu.Lock()
 	defer r.clockMu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, freshnessTimeout)
+	defer cancel()
 
 	now := time.Now()
 	if r.clockSession == snapshot.session && r.clockEpoch == snapshot.epoch && !r.clockCalibrated.IsZero() {
@@ -674,8 +681,13 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 		if dial == nil {
 			dial = replica.DialSequencer
 		}
+		readKey, err := ephemeralReadKey()
+		if err != nil {
+			return 0, err
+		}
 		authority, err = dial(ctx, replica.Config{
-			ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: snapshot.key, BootstrapADNL: sequencerID,
+			ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: readKey, BootstrapADNL: sequencerID,
+			Discovery: r.client.discovery,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -782,7 +794,7 @@ func (c *Client) startRoom(record RoomRecord, first chan<- error) *roomHandle {
 		events: make(chan canonicalEvent, canonicalEventQueueCapacity),
 	}
 	c.rooms[key] = handle
-	handle.workers.Add(2)
+	handle.workers.Add(3)
 	c.mu.Unlock()
 	go func() {
 		defer handle.workers.Done()
@@ -791,6 +803,10 @@ func (c *Client) startRoom(record RoomRecord, first chan<- error) *roomHandle {
 	go func() {
 		defer handle.workers.Done()
 		handle.run(ctx, first)
+	}()
+	go func() {
+		defer handle.workers.Done()
+		handle.freshnessLoop(ctx)
 	}()
 	return handle
 }
@@ -823,26 +839,25 @@ func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 		}
 		r.mu.RLock()
 		session := r.session
-		epoch := r.sessionEpoch
 		r.mu.RUnlock()
 		if session == nil {
 			continue
 		}
-		timer := time.NewTimer(r.nextFreshnessCheck())
-		for r.isCurrentSession(session, epoch) {
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				r.closeSessionIf(session)
-				return
-			case <-session.Done:
-				r.closeSessionIf(session)
-			case <-timer.C:
-				_ = r.checkFreshness(ctx, session, epoch, time.Now())
-				timer.Reset(r.nextFreshnessCheck())
+		connectedAt := time.Now()
+		select {
+		case <-ctx.Done():
+			r.closeSessionIf(session)
+			return
+		case <-session.Done:
+			r.closeSessionIf(session)
+			if pause := time.Second - time.Since(connectedAt); pause > 0 {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(pause):
+				}
 			}
 		}
-		timer.Stop()
 	}
 }
 
@@ -863,6 +878,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
 		DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
 		ExcludedPublicKeys: r.excludedRelayKeys(time.Now()),
+		AllowExcluded:      true, Discovery: r.client.discovery,
 	})
 	if err != nil {
 		return err
@@ -930,11 +946,18 @@ func (r *roomHandle) installSession(session *replica.Session, identity ed25519.P
 	r.session = session
 	r.sessionEpoch = epoch
 	r.freshness.status, r.freshness.reason = "unverified", "not_checked"
+	if time.Now().Before(r.excludedRelays[keyText(session.Peer.GetPubKey())]) {
+		r.freshness.status, r.freshness.reason = "stale", "excluded_fallback"
+	}
 	return nil
 }
 
 func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Session, epoch uint64) error {
-	if session == nil || !r.isCurrentSession(session, epoch) {
+	return r.syncSessionFromLocked(ctx, session, session, epoch)
+}
+
+func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expected *replica.Session, epoch uint64) error {
+	if session == nil || !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
 	if err := r.client.store.pinGenesis(ctx, r.key, session.Genesis); err != nil {
@@ -956,11 +979,11 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 		if err != nil {
 			return err
 		}
-		if !r.isCurrentSession(session, epoch) {
+		if !r.isCurrentSession(expected, epoch) {
 			return errRoomSessionChanged
 		}
 		for _, event := range page.Events {
-			if !r.isCurrentSession(session, epoch) {
+			if !r.isCurrentSession(expected, epoch) {
 				return errRoomSessionChanged
 			}
 			if err := event.Verify(r.key, session.Genesis.NodeKey); err != nil {
@@ -998,7 +1021,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	if err != nil {
 		return err
 	}
-	if !r.isCurrentSession(session, epoch) {
+	if !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
 	if state.Stats.OnlineUsers < 0 || state.Stats.ReplicaSeqno < record.HeadSeqno || !state.Stats.Ready {
@@ -1009,18 +1032,27 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	}
 	verifiedHead, _ := projection.Head()
 	r.mu.Lock()
-	if r.session != session {
+	if r.session != expected || r.sessionEpoch != epoch {
 		r.mu.Unlock()
 		return errRoomSessionChanged
 	}
+	previousRaw, _ := community.Encode(r.state.State)
+	nextRaw, _ := community.Encode(state.State)
+	stateChanged := r.projection == nil || r.verifiedHead != verifiedHead || !bytes.Equal(previousRaw, nextRaw)
+	presenceChanged := r.projection == nil || r.state.Stats.OnlineUsers != state.Stats.OnlineUsers
 	r.state = state
 	r.projection = projection
 	r.verifiedHead = verifiedHead
 	r.mu.Unlock()
-	if err := r.notifyForSession(ctx, session, epoch, "room.state", r.stateView(state.State, verifiedHead)); err != nil {
-		return err
+	if stateChanged {
+		if err := r.notifyForSession(ctx, expected, epoch, "room.state", r.stateView(state.State, verifiedHead)); err != nil {
+			return err
+		}
 	}
-	return r.notifyForSession(ctx, session, epoch, "room.presence", presenceView(state))
+	if presenceChanged {
+		return r.notifyForSession(ctx, expected, epoch, "room.presence", presenceView(state))
+	}
+	return nil
 }
 
 func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, serialized tl.Serializable) {

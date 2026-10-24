@@ -42,7 +42,7 @@ func TestSequencerTimestampNeverTrustsRelayClock(t *testing.T) {
 		client: &Client{configURL: "unused"}, key: genesis.RoomKey,
 		session: relaySession, sessionEpoch: 1,
 		dialSequencer: func(_ context.Context, cfg replica.Config) (*replica.Session, error) {
-			if !bytes.Equal(cfg.RoomID, genesis.RoomKey) || !bytes.Equal(cfg.NodeKey, identity) ||
+			if !bytes.Equal(cfg.RoomID, genesis.RoomKey) || len(cfg.NodeKey) != ed25519.PrivateKeySize || bytes.Equal(cfg.NodeKey, identity) ||
 				!bytes.Equal(cfg.BootstrapADNL, sequencerID) {
 				t.Fatal("unexpected sequencer dial configuration")
 			}
