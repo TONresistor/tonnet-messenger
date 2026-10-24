@@ -15,12 +15,55 @@ import (
 )
 
 const (
+	maxFreshnessChecks     = 4
+	initialSyncTimeout     = 5 * time.Minute
 	relayFreshnessGrace    = time.Minute
 	relayExclusionTTL      = 2 * time.Minute
 	freshnessTimeout       = 15 * time.Second
 	freshnessLockTimeout   = 5 * time.Second
 	freshnessRepairTimeout = 15 * time.Second
 )
+
+// Durable progress is only a temporary catch-up allowance, never applied verification.
+type roomSyncProgress struct {
+	session  *replica.Session
+	started  time.Time
+	advanced time.Time
+	seqno    int64
+}
+
+func (r *roomHandle) syncTime() time.Time {
+	if r.syncNow != nil {
+		return r.syncNow()
+	}
+	return time.Now()
+}
+
+func (r *roomHandle) beginRoomSync(session *replica.Session) *roomSyncProgress {
+	now := r.syncTime()
+	progress := &roomSyncProgress{session: session, started: now, advanced: now}
+	r.mu.Lock()
+	r.syncProgress = progress
+	r.mu.Unlock()
+	return progress
+}
+
+func (r *roomHandle) advanceRoomSync(progress *roomSyncProgress, seqno int64) {
+	now := r.syncTime()
+	r.mu.Lock()
+	if r.syncProgress == progress && seqno > progress.seqno {
+		progress.seqno, progress.advanced = seqno, now
+	}
+	r.mu.Unlock()
+}
+
+func (r *roomHandle) endRoomSync(progress *roomSyncProgress) {
+	r.mu.Lock()
+	if r.syncProgress == progress {
+		r.syncProgress = nil
+	}
+	r.mu.Unlock()
+}
 
 type headCheckpoint struct {
 	seqno    int64
@@ -278,17 +321,23 @@ func (r *roomHandle) hasAppliedCheckpoint(ctx context.Context, checkpoint *headC
 	return matches, err
 }
 
-func (r *roomHandle) failFreshness(ctx context.Context, session *replica.Session, epoch uint64, reason string, err error) error {
-	if !r.isCurrentSession(session, epoch) {
-		return errRoomSessionChanged
-	}
+func (r *roomHandle) failFreshness(ctx context.Context, session *replica.Session, epoch uint64, reason string, err error, now time.Time) error {
 	if errors.Is(err, errFreshnessConflict) {
 		reason = "checkpoint_conflict"
 	}
 	r.mu.Lock()
+	if r.session != session || r.sessionEpoch != epoch {
+		r.mu.Unlock()
+		return errRoomSessionChanged
+	}
 	r.freshness.status, r.freshness.reason = "unverified", reason
 	r.freshness.failures++
+	behind := reason == "sequencer_unavailable" && r.markBehindLocked(session, now)
 	r.mu.Unlock()
+	if behind {
+		r.closeSessionIf(session) // Never wait for the UI before retiring a known stale path.
+		return nil
+	}
 	return r.emitFreshness(ctx, session, epoch)
 }
 
@@ -322,7 +371,7 @@ func (r *roomHandle) recordFreshnessHead(head *headCheckpoint, session *replica.
 		f.pending = f.latest
 	}
 	if r.session != nil && r.session != session && r.sessionEpoch == epoch && bytes.Equal(r.session.Peer.GetPubKey(), session.Peer.GetPubKey()) {
-		r.markBehindLocked(session, now)
+		r.markBehindLocked(r.session, now)
 	}
 	return nil
 }
@@ -333,12 +382,40 @@ func (r *roomHandle) markBehindLocked(session *replica.Session, now time.Time) b
 	if f.pending == nil || r.verifiedHead >= f.pending.seqno || now.Sub(f.pending.observed) < relayFreshnessGrace {
 		return false
 	}
+	if progress := r.syncProgress; progress != nil && progress.session == session {
+		idleGrace := relayFreshnessGrace
+		if progress.seqno == 0 {
+			idleGrace = freshnessRepairTimeout
+		}
+		if now.Sub(progress.advanced) < idleGrace &&
+			now.Sub(progress.started) < initialSyncTimeout && now.Sub(f.pending.observed) < initialSyncTimeout {
+			f.status, f.reason = "unverified", "catching_up"
+			return false
+		}
+	}
 	f.status, f.reason = "stale", "relay_behind"
 	if r.excludedRelays == nil {
 		r.excludedRelays = make(map[string]time.Time)
 	}
 	r.excludedRelays[keyText(session.Peer.GetPubKey())] = now.Add(relayExclusionTTL)
 	return true
+}
+
+// A busy history lock cannot protect a relay beyond its bounded progress allowance.
+func (r *roomHandle) busyFreshness(ctx context.Context, session *replica.Session, epoch uint64, reason string, now time.Time) error {
+	r.mu.Lock()
+	if r.session != session || r.sessionEpoch != epoch {
+		r.mu.Unlock()
+		return errRoomSessionChanged
+	}
+	r.freshness.status, r.freshness.reason = "unverified", reason
+	behind := r.markBehindLocked(session, now)
+	r.mu.Unlock()
+	if behind {
+		r.closeSessionIf(session) // The retained state remains readable through RoomState.
+		return nil
+	}
+	return r.emitFreshness(ctx, session, epoch)
 }
 
 func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Session, epoch uint64, now time.Time) error {
@@ -349,24 +426,17 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 		slotCancel()
 	case <-slotCtx.Done():
 		slotCancel()
-		if !r.isCurrentSession(session, epoch) {
-			return errRoomSessionChanged
-		}
-		r.mu.Lock()
-		r.freshness.status, r.freshness.reason = "unverified", "check_busy"
-		r.markBehindLocked(session, now)
-		r.mu.Unlock()
-		return r.emitFreshness(ctx, session, epoch)
+		return r.busyFreshness(ctx, session, epoch, "check_busy", now)
 	}
 	authorityCtx, cancel := r.freshnessContext(ctx, freshnessTimeout)
 	head, checkErr := r.sequencerHead(authorityCtx, session, epoch)
 	cancel()
 	<-r.client.freshnessChecks
 	if checkErr != nil {
-		return r.failFreshness(ctx, session, epoch, "sequencer_unavailable", checkErr)
+		return r.failFreshness(ctx, session, epoch, "sequencer_unavailable", checkErr, now)
 	}
 	if err := r.recordFreshnessHead(head, session, epoch, now); err != nil {
-		return r.failFreshness(ctx, session, epoch, "checkpoint_conflict", err)
+		return r.failFreshness(ctx, session, epoch, "checkpoint_conflict", err, now)
 	}
 	if !r.isCurrentSession(session, epoch) {
 		r.mu.RLock()
@@ -383,15 +453,7 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 	err := r.lockFreshnessHistory(lockCtx)
 	lockCancel()
 	if err != nil {
-		r.mu.Lock()
-		if r.session != session || r.sessionEpoch != epoch {
-			r.mu.Unlock()
-			return errRoomSessionChanged
-		}
-		r.freshness.status, r.freshness.reason = "unverified", "history_busy"
-		r.markBehindLocked(session, now)
-		r.mu.Unlock()
-		return r.emitFreshness(ctx, session, epoch)
+		return r.busyFreshness(ctx, session, epoch, "history_busy", now)
 	}
 	locked := true
 	defer func() {
@@ -416,7 +478,7 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 	}
 	localCancel()
 	if err != nil {
-		return r.failFreshness(ctx, session, epoch, "check_failed", err)
+		return r.failFreshness(ctx, session, epoch, "check_failed", err, now)
 	}
 	if !caughtUp && pending == nil {
 		pending = latest
@@ -437,7 +499,7 @@ func (r *roomHandle) checkFreshness(ctx context.Context, session *replica.Sessio
 		}
 		repairCancel()
 		if err != nil {
-			return r.failFreshness(ctx, session, epoch, "check_failed", err)
+			return r.failFreshness(ctx, session, epoch, "check_failed", err, now)
 		}
 	}
 	r.mu.Lock()
@@ -517,7 +579,7 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	r.mu.RUnlock()
 	caughtUp, err := r.hasAppliedCheckpoint(repairCtx, latest)
 	if err != nil {
-		return r.failFreshness(ctx, old, epoch, "check_failed", err)
+		return r.failFreshness(ctx, old, epoch, "check_failed", err, now)
 	}
 	if !caughtUp {
 		r.mu.Lock()
@@ -532,7 +594,7 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 		return errRoomSessionChanged
 	}
 	candidate.Peer.SetMessageHandler(func(message any) error { r.ingestSerializable(candidate, epoch, message); return nil })
-	if err := r.installSession(candidate, identity.key, epoch); err != nil {
+	if err := r.installSession(candidate, identity.key, epoch, old); err != nil {
 		return err
 	}
 	// The handle now owns candidate; this function always retires the displaced old path.

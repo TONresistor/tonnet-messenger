@@ -125,6 +125,8 @@ type roomHandle struct {
 	excludedRelays  map[string]time.Time
 	nextFreshnessAt time.Time
 	freshnessBudget func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+	syncProgress    *roomSyncProgress
+	syncNow         func() time.Time
 }
 
 type canonicalEvent struct {
@@ -202,7 +204,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		directAddress: cfg.DirectAddress, directPublic: append(ed25519.PublicKey(nil), cfg.DirectPublic...),
 		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
-		freshnessChecks: make(chan struct{}, 1),
+		freshnessChecks: make(chan struct{}, maxFreshnessChecks),
 		discovery:       replica.NewDiscovery(cfg.ConfigURL),
 	}
 	return c, nil
@@ -843,6 +845,7 @@ func (r *roomHandle) run(ctx context.Context, first chan<- error) {
 				continue
 			}
 		}
+		lastReconnectNotice = time.Time{} // Reset even if the connected session already dropped.
 		r.mu.RLock()
 		session := r.session
 		r.mu.RUnlock()
@@ -882,7 +885,11 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	identity := append(ed25519.PrivateKey(nil), r.client.key...)
 	identityEpoch := r.client.identityEpoch
 	r.client.mu.RUnlock()
-	session, err := replica.DialRoom(ctx, replica.Config{
+	dial := r.dialRoom
+	if dial == nil {
+		dial = replica.DialRoom
+	}
+	session, err := dial(ctx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
 		DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
 		ExcludedPublicKeys: r.excludedRelayKeys(time.Now()),
@@ -896,18 +903,38 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		return nil
 	})
 	r.historyMu.Lock()
-	if err := r.installSession(session, identity, identityEpoch); err != nil {
+	// A validated replacement may have won while this reconnect was dialing.
+	r.mu.RLock()
+	alreadyConnected = r.session != nil
+	r.mu.RUnlock()
+	if alreadyConnected {
+		r.historyMu.Unlock()
+		session.Close()
+		return nil
+	}
+	if err := r.installSession(session, identity, identityEpoch, nil); err != nil {
 		r.historyMu.Unlock()
 		session.Close()
 		return err
 	}
-	if err := r.syncSessionLocked(ctx, session, identityEpoch); err != nil {
+	syncCtx, syncCancel := r.freshnessContext(ctx, initialSyncTimeout)
+	syncErr := r.syncSessionLocked(syncCtx, session, identityEpoch)
+	syncCancel()
+	if syncErr != nil {
+		// Retained authoritative evidence still applies if later probes cannot run.
+		if ctx.Err() == nil && errors.Is(syncCtx.Err(), context.DeadlineExceeded) {
+			r.mu.Lock()
+			if r.session == session && r.sessionEpoch == identityEpoch {
+				r.markBehindLocked(session, r.syncTime())
+			}
+			r.mu.Unlock()
+		}
 		detached := r.detachSessionIf(session)
 		r.historyMu.Unlock()
 		if detached != nil {
 			detached.Close()
 		}
-		return err
+		return syncErr
 	}
 	if err := r.emitConnected(ctx, session, identityEpoch); err != nil {
 		detached := r.detachSessionIf(session)
@@ -935,7 +962,7 @@ func (r *roomHandle) emitConnected(ctx context.Context, session *replica.Session
 	})
 }
 
-func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64) error {
+func (r *roomHandle) installSession(session *replica.Session, identity ed25519.PrivateKey, epoch uint64, expected *replica.Session) error {
 	r.client.mu.RLock()
 	defer r.client.mu.RUnlock()
 	if r.client.closed || r.client.identityEpoch != epoch ||
@@ -944,6 +971,9 @@ func (r *roomHandle) installSession(session *replica.Session, identity ed25519.P
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.session != expected {
+		return errRoomSessionChanged
+	}
 	r.session = session
 	r.sessionEpoch = epoch
 	r.freshness.status, r.freshness.reason = "unverified", "not_checked"
@@ -961,6 +991,8 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 	if session == nil || !r.isCurrentSession(expected, epoch) {
 		return errRoomSessionChanged
 	}
+	progress := r.beginRoomSync(session)
+	defer r.endRoomSync(progress)
 	if err := r.client.store.pinGenesis(ctx, r.key, session.Genesis); err != nil {
 		return err
 	}
@@ -1002,6 +1034,7 @@ func (r *roomHandle) syncSessionFromLocked(ctx context.Context, session, expecte
 				if err := projection.Commit(transition); err != nil {
 					return err
 				}
+				r.advanceRoomSync(progress, event.Seqno)
 				if err := r.client.emitEvent(ctx, event); err != nil {
 					return err
 				}
