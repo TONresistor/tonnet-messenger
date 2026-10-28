@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/dm"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/xssnick/tonutils-go/adnl/quic"
@@ -31,6 +33,7 @@ type freshnessTestServer struct {
 	pageLimit    int
 	beforeEvents func(community.GetEvents)
 	beforeState  func()
+	onGenesis    func(*roomnet.Peer)
 }
 
 func (server *freshnessTestServer) setEvents(events ...community.CommittedEvent) {
@@ -47,11 +50,15 @@ func freshnessTestEndpoint(t *testing.T, key ed25519.PrivateKey, genesis communi
 	}
 	t.Cleanup(func() { gateway.Close() })
 	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
-		roomnet.Wrap(raw).SetQueryHandler(func(query *roomnet.Query) error {
+		peer := roomnet.Wrap(raw)
+		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			server.mu.Lock()
 			defer server.mu.Unlock()
 			switch req := query.Data.(type) {
 			case community.GetRoomGenesis:
+				if server.onGenesis != nil {
+					server.onGenesis(peer)
+				}
 				return query.Answer(genesis)
 			case community.GetRoomState:
 				if server.beforeState != nil {
@@ -1410,6 +1417,83 @@ func TestFreshnessExpiredBudgetDoesNotBrickRoom(t *testing.T) {
 	}
 	if handle.freshness.status != "verified" {
 		t.Fatal("honest relay did not complete validation")
+	}
+}
+
+func TestRelayReplacementReceivesDMDuringGenesis(t *testing.T) {
+	for _, failCandidate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("candidate_failure_%v", failCandidate), func(t *testing.T) {
+			instance, handle, _, _, _ := freshnessTestRoom(t, 0)
+			old := handle.session
+			if err := handle.checkFreshness(handle.ctx, old, 1, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			sender, candidateKey := clientTestPrivateKey(t), clientTestPrivateKey(t)
+			box, err := dm.SealForRoom(handle.key, sender, instance.key.Public().(ed25519.PublicKey), []byte("during handoff"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().Unix()
+			direct, err := community.SignDirectMessage(sender, community.DirectMessage{RoomID: handle.key, ToKey: instance.key.Public().(ed25519.PublicKey), Timestamp: now, Ciphertext: box})
+			if err != nil {
+				t.Fatal(err)
+			}
+			raw, err := community.Encode(direct)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wrapper, err := broadcast.Sign(sender, nil, raw, now)
+			if err != nil {
+				t.Fatal(err)
+			}
+			received := make(chan struct{}, 1)
+			server := &freshnessTestServer{role: community.NodeRoleRelay, stateError: failCandidate, onGenesis: func(peer *roomnet.Peer) {
+				if err := peer.SendMessage(handle.ctx, wrapper); err != nil {
+					t.Error(err)
+				}
+				select {
+				case <-received:
+				case <-handle.ctx.Done():
+					t.Error("candidate did not receive the message during genesis")
+				}
+			}}
+			endpoint := freshnessTestEndpoint(t, candidateKey, old.Genesis, handle.state.State, server)
+			handle.dialRoom = func(ctx context.Context, cfg replica.Config) (*replica.Session, error) {
+				cfg.DirectAddress, cfg.DirectPublic = endpoint, candidateKey.Public().(ed25519.PublicKey)
+				factory := cfg.OnPeer
+				cfg.OnPeer = func(peer *roomnet.Peer) func(any) error {
+					handler := factory(peer)
+					return func(message any) error {
+						err := handler(message)
+						select {
+						case received <- struct{}{}:
+						default:
+						}
+						return err
+					}
+				}
+				return replica.DialRoom(ctx, cfg)
+			}
+			if err := handle.replaceStaleRelay(handle.ctx, old, 1, time.Now()); err != nil {
+				t.Fatal(err)
+			}
+			if (handle.session == old) != failCandidate {
+				t.Fatal("unexpected candidate installation")
+			}
+			for {
+				select {
+				case notice := <-instance.events:
+					if notice.Method == "dm.message" {
+						if notice.Params.(map[string]any)["text"] != "during handoff" {
+							t.Fatal("wrong message")
+						}
+						return
+					}
+				case <-handle.ctx.Done():
+					t.Fatal("message during handoff was lost")
+				}
+			}
+		})
 	}
 }
 

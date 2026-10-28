@@ -8,11 +8,61 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"sync"
 	"time"
 
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
+
+// relayHandoff buffers messages until a candidate becomes the current session.
+// Overflow aborts the switch instead of silently installing a lossy candidate.
+type relayHandoff struct {
+	mu        sync.Mutex
+	queued    []any
+	overflow  bool
+	deliver   func(any)
+	room      *roomHandle
+	old       *replica.Session
+	candidate *replica.Session
+	epoch     uint64
+}
+
+func (h *relayHandoff) receive(message any) error {
+	h.mu.Lock()
+	deliver := h.deliver
+	if deliver != nil {
+		h.mu.Unlock()
+		deliver(message)
+	} else if wrapper, ok := broadcast.AsBroadcast(message); ok {
+		if _, err := community.DecodeDirectMessage(wrapper.Data); err == nil {
+			h.mu.Unlock()
+			h.room.ingestSerializable(h.old, h.epoch, message)
+			h.mu.Lock()
+			candidate := h.candidate
+			h.mu.Unlock()
+			if candidate != nil {
+				h.room.ingestSerializable(candidate, h.epoch, message)
+			}
+			return nil
+		}
+		if len(h.queued) < 256 {
+			h.queued = append(h.queued, message)
+		} else {
+			h.overflow = true
+		}
+		h.mu.Unlock()
+	} else if len(h.queued) < 256 {
+		h.queued = append(h.queued, message)
+		h.mu.Unlock()
+	} else {
+		h.overflow = true
+		h.mu.Unlock()
+	}
+	return nil
+}
 
 const (
 	maxFreshnessChecks     = 4
@@ -861,14 +911,28 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	if dial == nil {
 		dial = replica.DialRoom
 	}
+	var handoff *relayHandoff
+	var handoffPeer *roomnet.Peer
 	candidate, err := dial(dialCtx, replica.Config{
 		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity.key,
 		BootstrapADNL: r.boot, DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
 		ExcludedPublicKeys: excluded, Discovery: r.client.discovery,
+		OnPeer: func(peer *roomnet.Peer) func(any) error {
+			handoff = &relayHandoff{room: r, old: old, epoch: epoch}
+			handoffPeer = peer
+			return handoff.receive
+		},
 	})
 	if err != nil {
 		return nil // No alternative: continue reading the existing stale relay.
 	}
+	if handoff == nil || handoffPeer != candidate.Peer {
+		handoff = &relayHandoff{room: r, old: old, epoch: epoch}
+		candidate.Peer.SetMessageHandler(handoff.receive)
+	}
+	handoff.mu.Lock()
+	handoff.candidate = candidate
+	handoff.mu.Unlock()
 	keepCandidate := false
 	defer func() {
 		if !keepCandidate {
@@ -881,7 +945,12 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	if lockErr != nil {
 		return nil
 	}
-	defer r.historyMu.Unlock()
+	historyLocked := true
+	defer func() {
+		if historyLocked {
+			r.historyMu.Unlock()
+		}
+	}()
 	// The old session stays current (including for DMs) throughout candidate validation.
 	if err := r.syncSessionFromLocked(ctx, candidate, old, epoch); err != nil {
 		return nil
@@ -904,13 +973,27 @@ func (r *roomHandle) replaceStaleRelay(ctx context.Context, old *replica.Session
 	if !r.isCurrentSession(old, epoch) {
 		return errRoomSessionChanged
 	}
-	candidate.Peer.SetMessageHandler(func(message any) error { r.ingestSerializable(candidate, epoch, message); return nil })
+	handoff.mu.Lock()
+	if handoff.overflow {
+		handoff.mu.Unlock()
+		return nil
+	}
 	if err := r.installSession(candidate, identity.key, epoch, old); err != nil {
+		handoff.mu.Unlock()
 		return err
 	}
+	handoff.deliver = func(message any) { r.ingestSerializable(candidate, epoch, message) }
+	buffered := handoff.queued
+	handoff.queued = nil
+	handoff.mu.Unlock()
 	// The handle now owns candidate; this function always retires the displaced old path.
 	keepCandidate = true
 	defer old.Close()
+	r.historyMu.Unlock()
+	historyLocked = false
+	for _, message := range buffered {
+		r.ingestSerializable(candidate, epoch, message)
+	}
 	r.mu.Lock()
 	if r.session != candidate || r.sessionEpoch != epoch {
 		r.mu.Unlock()

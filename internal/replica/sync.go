@@ -33,6 +33,7 @@ type Config struct {
 	ExcludedPublicKeys [][]byte
 	AllowExcluded      bool
 	Discovery          *Discovery
+	OnPeer             func(*roomnet.Peer) func(any) error
 }
 
 type Result struct {
@@ -201,6 +202,9 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 			continue
 		}
 		wrapper := roomnet.Wrap(peer)
+		if cfg.OnPeer != nil {
+			wrapper.SetMessageHandler(cfg.OnPeer(wrapper))
+		}
 		var genesis community.Genesis
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
 		queryErr := wrapper.Query(queryCtx, community.GetRoomGenesis{}, &genesis)
