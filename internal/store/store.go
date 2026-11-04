@@ -236,7 +236,7 @@ func (s *Store) Initialize(ctx context.Context, genesis community.Genesis, roomP
 	if err != nil {
 		return err
 	}
-	state, err := community.SignRoomState(roomPrivate, community.RoomState{
+	state, err := community.SignRoomStateV3(roomPrivate, community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionSeqno: 0, RevisionHash: genesisHash,
 		Name: genesis.Name, Description: genesis.Description,
 		WritePolicy: genesis.WritePolicy, Admins: genesis.InitialAdmins,
@@ -319,15 +319,15 @@ func (s *Store) ValidateGenesis(ctx context.Context, genesis community.Genesis) 
 	return nil
 }
 
-func (s *Store) State(ctx context.Context) (community.RoomState, error) {
+func (s *Store) State(ctx context.Context) (community.RoomStateV3, error) {
 	var raw []byte
 	if err := s.db.QueryRowContext(ctx, "SELECT raw_signed_state FROM room_state WHERE singleton_id=1").Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return community.RoomState{}, ErrNotInitialized
+			return community.RoomStateV3{}, ErrNotInitialized
 		}
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
-	return community.DecodeRoomState(raw)
+	return community.DecodeRoomStateV3(raw)
 }
 
 func (s *Store) Head(ctx context.Context) (Head, error) {

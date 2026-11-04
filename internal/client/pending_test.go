@@ -20,6 +20,7 @@ import (
 )
 
 type pendingFixture struct {
+	room     ed25519.PrivateKey
 	genesis  community.Genesis
 	database *store.Store
 	address  string
@@ -43,7 +44,7 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 	if err := database.Initialize(context.Background(), genesis, roomKey); err != nil {
 		t.Fatal(err)
 	}
-	fixture := &pendingFixture{genesis: genesis, database: database, proposal: make(chan community.EventProposal, 8)}
+	fixture := &pendingFixture{room: roomKey, genesis: genesis, database: database, proposal: make(chan community.EventProposal, 8)}
 	gateway, err := roomnet.NewGateway(nodeKey)
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +66,17 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 				head, err := database.Head(ctx)
 				if err != nil {
 					return err
+				}
+				if fixture.mode.Load() == 4 && head.Seqno > 1 {
+					old, err := community.SignRoomState(roomKey, community.RoomState{
+						RoomID: state.RoomID, RevisionSeqno: state.RevisionSeqno, RevisionHash: state.RevisionHash,
+						Name: state.Name, Description: state.Description, WritePolicy: state.WritePolicy,
+						Admins: state.Admins, Moderators: state.Moderators, PinnedMessages: state.PinnedMessages,
+					})
+					if err != nil {
+						return err
+					}
+					return query.Answer(old)
 				}
 				return query.Answer(community.RoomStateResult{State: state, Stats: community.RoomStats{NodeRole: community.NodeRoleSequencer, Ready: true, ReplicaSeqno: head.Seqno, ReplicaHash: head.Hash}})
 			case community.GetEvents:
@@ -257,5 +269,36 @@ func TestPendingRejectionsAndDiscard(t *testing.T) {
 	}
 	if pending, err := instance.GetPending(context.Background(), room); err != nil || pending == nil {
 		t.Fatalf("unknown rejection lost operation: %#v %v", pending, err)
+	}
+}
+
+func TestV2StateDuringMutationIsProtocolErrorAndKeepsCommit(t *testing.T) {
+	fixture := newPendingFixture(t)
+	instance, handle := fixture.connect(t, t.TempDir())
+	grant, err := community.SignProposal(fixture.room, fixture.genesis.NodeKey, community.EventProposal{
+		RoomID: fixture.genesis.RoomKey, Nonce: make([]byte, 32), Timestamp: time.Now().Unix(),
+		Body: community.EventAdminGrant{SubjectKey: instance.key.Public().(ed25519.PublicKey)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.database.Commit(context.Background(), grant, fixture.room, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	handle.historyMu.Lock()
+	err = handle.syncSessionLocked(context.Background(), handle.session, handle.sessionEpoch)
+	handle.historyMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.mode.Store(4)
+	_, err = instance.SubmitMutation(context.Background(), keyText(fixture.genesis.RoomKey), community.EventMetadata{Name: "Updated"})
+	var operation *OperationError
+	if !errors.As(err, &operation) || operation.Code != "PROTOCOL_ERROR" || operation.Outcome != "committed" {
+		t.Fatalf("mutation error=%v", err)
+	}
+	pending, err := instance.GetPending(context.Background(), keyText(fixture.genesis.RoomKey))
+	if err != nil || pending == nil || pending.Status != "committed" {
+		t.Fatalf("pending=%#v err=%v", pending, err)
 	}
 }

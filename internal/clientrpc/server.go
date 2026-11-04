@@ -235,7 +235,7 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 	switch method {
 	case "client.info":
 		return map[string]any{
-			"version": s.Version, "protocol": "0.4.0", "transport": "stdio-jsonrpc",
+			"version": s.Version, "protocol": "0.5.0", "transport": "stdio-jsonrpc",
 			"room_transport": "ton-quic", "identity": s.Client.Identity(),
 		}, nil
 	case "identity.get":
@@ -552,6 +552,8 @@ func classify(err error) *rpcError {
 		default:
 			code = "ROOM_REJECTED"
 		}
+	} else if errors.Is(err, client.ErrProtocol) {
+		code, numeric = "PROTOCOL_ERROR", -32034
 	} else if errors.Is(err, client.ErrSequencerUnavailable) {
 		code, numeric = "SEQUENCER_UNAVAILABLE", -32030
 	} else if errors.Is(err, client.ErrSequencerClockSkew) {

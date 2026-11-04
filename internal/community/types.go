@@ -141,8 +141,8 @@ type RoomStats struct {
 }
 
 type RoomStateResult struct {
-	State RoomState `tl:"struct boxed"`
-	Stats RoomStats `tl:"struct boxed"`
+	State RoomStateV3 `tl:"struct boxed"`
+	Stats RoomStats   `tl:"struct boxed"`
 }
 
 type EventMessage struct {

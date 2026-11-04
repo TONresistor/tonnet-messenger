@@ -15,10 +15,18 @@ func TestStateViewExcludesNodeLocalStats(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := community.RoomStateResult{
-		State: community.RoomState{RoomID: room, Name: "Room"},
+		State: community.RoomStateV3{RoomID: room, Name: "Room", Banned: [][]byte{room}},
 		Stats: community.RoomStats{OnlineUsers: 12, ReplicaSeqno: 99, NodeRole: community.NodeRoleRelay, Ready: true},
 	}
 	view := stateView(result.State, 7)
+	banned, ok := view["banned"].([]string)
+	if !ok || len(banned) != 1 || banned[0] != keyText(room) {
+		t.Fatalf("banned = %#v", view["banned"])
+	}
+	empty := stateView(community.RoomStateV3{}, 0)
+	if values, ok := empty["banned"].([]string); !ok || values == nil || len(values) != 0 {
+		t.Fatalf("empty banned = %#v", empty["banned"])
+	}
 	for _, field := range []string{"online_users", "node_role", "ready"} {
 		if _, exists := view[field]; exists {
 			t.Fatalf("verified room state contains %q", field)

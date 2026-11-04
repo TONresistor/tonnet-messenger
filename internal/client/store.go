@@ -20,7 +20,7 @@ type RoomRecord struct {
 	Reference string
 	Bootstrap []byte
 	Genesis   community.Genesis
-	State     community.RoomState
+	State     community.RoomStateV3
 	HeadSeqno int64
 	HeadHash  []byte
 }
@@ -218,7 +218,7 @@ FROM joined_rooms ORDER BY reference`)
 		if len(item.rawState) == 0 {
 			continue
 		}
-		state, err := community.DecodeRoomState(item.rawState)
+		state, err := community.DecodeRoomStateV3(item.rawState)
 		if err != nil || projection.ValidateState(state) != nil {
 			if err := s.clearRoomState(ctx, record.RoomKey); err != nil {
 				return err
@@ -273,7 +273,7 @@ func (s *clientStore) pinGenesis(ctx context.Context, roomKey []byte, genesis co
 	return tx.Commit()
 }
 
-func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
+func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomStateV3) error {
 	rawState, err := community.Encode(state)
 	if err != nil {
 		return err
@@ -292,7 +292,7 @@ func (s *clientStore) installRoom(ctx context.Context, roomKey []byte, genesis c
 	return tx.Commit()
 }
 
-func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
+func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomStateV3) error {
 	raw, err := community.Encode(state)
 	if err != nil {
 		return err
@@ -311,7 +311,7 @@ func (s *clientStore) updateState(ctx context.Context, roomKey []byte, genesis c
 	return tx.Commit()
 }
 
-func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
+func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomStateV3) error {
 	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
@@ -320,7 +320,7 @@ func (s *clientStore) validateRoomState(ctx context.Context, roomKey []byte, gen
 	return validateRoomState(ctx, tx, roomKey, genesis, projection, state)
 }
 
-func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomState) error {
+func validateRoomState(ctx context.Context, query clientQueryer, roomKey []byte, genesis community.Genesis, projection *community.Projection, state community.RoomStateV3) error {
 	if !bytes.Equal(genesis.RoomKey, roomKey) || !bytes.Equal(state.RoomID, roomKey) {
 		return fmt.Errorf("client store: room state belongs to another room")
 	}
@@ -417,7 +417,7 @@ func (s *clientStore) rooms(ctx context.Context) ([]RoomRecord, error) {
 			}
 		}
 		if len(rawState) > 0 {
-			record.State, err = community.DecodeRoomState(rawState)
+			record.State, err = community.DecodeRoomStateV3(rawState)
 			if err != nil {
 				return nil, err
 			}
@@ -446,7 +446,7 @@ func queryRoom(ctx context.Context, query clientQueryer, roomKey []byte) (RoomRe
 		}
 	}
 	if len(rawState) > 0 {
-		record.State, err = community.DecodeRoomState(rawState)
+		record.State, err = community.DecodeRoomStateV3(rawState)
 	}
 	return record, err
 }

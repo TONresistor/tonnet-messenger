@@ -4,15 +4,24 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/replica"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
+	"github.com/TONresistor/tonnet-messenger/internal/store"
+	"github.com/xssnick/tonutils-go/adnl/quic"
+	"github.com/xssnick/tonutils-go/tl"
 )
 
 func TestStdioIdentityAPI(t *testing.T) {
@@ -45,7 +54,7 @@ func TestStdioIdentityAPI(t *testing.T) {
 		t.Fatalf("responses = %s", output.String())
 	}
 	info := responses[0]["result"].(map[string]any)
-	if info["room_transport"] != "ton-quic" {
+	if info["room_transport"] != "ton-quic" || info["protocol"] != "0.5.0" {
 		t.Fatalf("client info = %#v", info)
 	}
 	identity := responses[2]["result"].(map[string]any)
@@ -157,6 +166,7 @@ func TestClassifyAuthoritativeClockErrors(t *testing.T) {
 	}{
 		{client.ErrSequencerUnavailable, "SEQUENCER_UNAVAILABLE", -32030},
 		{client.ErrSequencerClockSkew, "CLOCK_SKEW", -32031},
+		{client.ErrProtocol, "PROTOCOL_ERROR", -32034},
 	}
 	for _, test := range tests {
 		got := classify(test.err)
@@ -200,5 +210,120 @@ func TestPendingMethodsPreserveExistingRPC(t *testing.T) {
 	}
 	if _, failure := server.dispatch(context.Background(), "room.retryPending", parameters); failure == nil {
 		t.Fatal("retry without connected room accepted")
+	}
+}
+
+func rpcTestKey(t *testing.T) ed25519.PrivateKey {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestRoomJoinRejectsV2StateAsProtocolError(t *testing.T) {
+	for _, wrapped := range []bool{false, true} {
+		name := "bare V2"
+		if wrapped {
+			name = "V2 inside result"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			room, node := rpcTestKey(t), rpcTestKey(t)
+			genesis, err := community.NewGenesis(room, node, time.Now(), "Room", "", true, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			hash, err := genesis.Hash()
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, err := community.SignRoomState(room, community.RoomState{
+				RoomID: genesis.RoomKey, RevisionHash: hash, Name: genesis.Name, WritePolicy: genesis.WritePolicy,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacy, err := community.Encode(old)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wrapped {
+				stats := community.RoomStats{NodeRole: community.NodeRoleSequencer, Ready: true, ReplicaHash: community.Zero256()}
+				outer, err := community.Encode(community.RoomStateResult{State: community.RoomStateV3{
+					RoomID: genesis.RoomKey, RevisionHash: hash, Name: genesis.Name, WritePolicy: genesis.WritePolicy,
+				}, Stats: stats})
+				if err != nil {
+					t.Fatal(err)
+				}
+				statsRaw, err := community.Encode(stats)
+				if err != nil {
+					t.Fatal(err)
+				}
+				legacy = append(append(append([]byte(nil), outer[:4]...), legacy...), statsRaw...)
+			}
+			gateway, err := roomnet.NewGateway(node)
+			if err != nil {
+				t.Fatal(err)
+			}
+			gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+				peer := roomnet.Wrap(raw)
+				peer.SetQueryHandler(func(query *roomnet.Query) error {
+					switch query.Data.(type) {
+					case community.GetRoomGenesis:
+						return query.Answer(genesis)
+					case community.GetEvents:
+						return query.Answer(community.EventList{})
+					case community.GetRoomState:
+						return query.Answer(tl.Raw(legacy))
+					default:
+						return roomnet.ErrNoAnswer
+					}
+				})
+				return nil
+			})
+			listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() { _ = gateway.Serve(listener); close(done) }()
+			defer func() { gateway.Close(); listener.Close(); <-done }()
+			instance, err := client.Open(ctx, client.Config{StateDir: t.TempDir(), DirectAddress: listener.LocalAddr().String(), DirectPublic: genesis.NodeKey})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer instance.Close()
+			roomText, err := community.RoomKeyText(genesis.RoomKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			params, err := json.Marshal(map[string]string{"reference": roomText})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, rpcErr := (&Server{Client: instance}).dispatch(ctx, "room.join", params)
+			if result != nil || rpcErr == nil || rpcErr.Code != -32034 || rpcErr.Data["code"] != "PROTOCOL_ERROR" {
+				t.Fatalf("result=%#v error=%#v", result, rpcErr)
+			}
+			database, err := store.Open(ctx, filepath.Join(t.TempDir(), "replica.db"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer database.Close()
+			if err := database.InitializeReplica(ctx, genesis); err != nil {
+				t.Fatal(err)
+			}
+			_, err = replica.Sync(ctx, replica.Config{RoomID: genesis.RoomKey, NodeKey: rpcTestKey(t),
+				DirectAddress: listener.LocalAddr().String(), DirectPublic: genesis.NodeKey}, database)
+			if !errors.Is(err, roomnet.ErrMalformedAnswer) {
+				t.Fatalf("replica accepted V2 state: %v", err)
+			}
+			if err := database.ReplicaReady(ctx); err == nil {
+				t.Fatal("replica with V2 peer state became ready")
+			}
+		})
 	}
 }

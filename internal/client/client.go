@@ -22,6 +22,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/dm"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
 )
 
@@ -33,6 +34,7 @@ const (
 )
 
 var (
+	ErrProtocol             = errors.New("protocol error")
 	ErrSequencerUnavailable = errors.New("sequencer unavailable")
 	ErrSequencerClockSkew   = errors.New("sequencer clock skew")
 	errRoomSessionChanged   = errors.New("room session changed")
@@ -981,6 +983,9 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	err = session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
 	stateCancel()
 	if err != nil {
+		if errors.Is(err, roomnet.ErrMalformedAnswer) {
+			return fmt.Errorf("%w: room state: %w", ErrProtocol, err)
+		}
 		return err
 	}
 	if !r.isCurrentSession(session, epoch) {
@@ -1118,7 +1123,7 @@ func (r *roomHandle) ingestLoop(ctx context.Context) {
 			if err != nil {
 				r.closeSessionIf(item.session)
 			}
-			if durable {
+			if durable && !errors.Is(err, ErrProtocol) {
 				completeCanonical(item, nil)
 			} else {
 				completeCanonical(item, err)
@@ -1244,6 +1249,9 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 	err := session.Peer.Query(queryCtx, community.GetRoomState{}, &state)
 	cancel()
 	if err != nil {
+		if errors.Is(err, roomnet.ErrMalformedAnswer) {
+			err = fmt.Errorf("%w: room state: %w", ErrProtocol, err)
+		}
 		return community.RoomStateResult{}, err
 	}
 	if !r.isCurrentSession(session, epoch) {
@@ -1413,7 +1421,7 @@ func ParseKeyText(value string) ([]byte, error) {
 	return community.ParseRoomKeyText(strings.TrimSpace(value))
 }
 
-func stateView(state community.RoomState, latestSeqno int64) map[string]any {
+func stateView(state community.RoomStateV3, latestSeqno int64) map[string]any {
 	admins := make([]string, len(state.Admins))
 	for i, key := range state.Admins {
 		admins[i] = keyText(key)
@@ -1421,6 +1429,10 @@ func stateView(state community.RoomState, latestSeqno int64) map[string]any {
 	moderators := make([]string, len(state.Moderators))
 	for i, key := range state.Moderators {
 		moderators[i] = keyText(key)
+	}
+	banned := make([]string, len(state.Banned))
+	for i, key := range state.Banned {
+		banned[i] = keyText(key)
 	}
 	pins := make([]string, len(state.PinnedMessages))
 	for i, id := range state.PinnedMessages {
@@ -1432,7 +1444,7 @@ func stateView(state community.RoomState, latestSeqno int64) map[string]any {
 	}
 	return map[string]any{
 		"room": keyText(state.RoomID), "name": state.Name, "description": state.Description,
-		"write_policy": policy, "admins": admins, "moderators": moderators, "pinned_messages": pins,
+		"write_policy": policy, "admins": admins, "moderators": moderators, "pinned_messages": pins, "banned": banned,
 		"revision_seqno": fmt.Sprintf("%d", state.RevisionSeqno), "latest_seqno": fmt.Sprintf("%d", latestSeqno),
 	}
 }

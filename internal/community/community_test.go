@@ -659,3 +659,111 @@ func TestV050RelayOfferProtocolMaxima(t *testing.T) {
 		}
 	}
 }
+
+func TestRoomStateV3Validation(t *testing.T) {
+	private := testPrivate(t)
+	key := []byte(private.Public().(ed25519.PublicKey))
+	keys := func(n int) [][]byte {
+		values := make([][]byte, n)
+		for i := range values {
+			values[i] = Zero256()
+			binary.BigEndian.PutUint64(values[i][24:], uint64(i+1))
+		}
+		return values
+	}
+	base := func() RoomStateV3 {
+		return RoomStateV3{RoomID: key, RevisionHash: Zero256(), Name: "Room"}
+	}
+	tests := []struct {
+		name   string
+		change func(*RoomStateV3)
+		valid  bool
+	}{
+		{"empty lists", func(s *RoomStateV3) {}, true},
+		{"all caps", func(s *RoomStateV3) {
+			s.Admins = keys(64)
+			s.Moderators = keys(256)
+			s.Banned = keys(256)
+			s.PinnedMessages = make([]int64, 100)
+			for i := range s.PinnedMessages {
+				s.PinnedMessages[i] = int64(i + 1)
+			}
+			s.Name = string(bytes.Repeat([]byte{'n'}, 64))
+			s.Description = string(bytes.Repeat([]byte{'d'}, 512))
+		}, true},
+		{"admins cap", func(s *RoomStateV3) { s.Admins = keys(65) }, false},
+		{"moderators cap", func(s *RoomStateV3) { s.Moderators = keys(257) }, false},
+		{"banned cap", func(s *RoomStateV3) { s.Banned = keys(257) }, false},
+		{"pins cap", func(s *RoomStateV3) {
+			s.PinnedMessages = make([]int64, 101)
+			for i := range s.PinnedMessages {
+				s.PinnedMessages[i] = int64(i + 1)
+			}
+		}, false},
+		{"admins order", func(s *RoomStateV3) { s.Admins = keys(2); s.Admins[0], s.Admins[1] = s.Admins[1], s.Admins[0] }, false},
+		{"moderators order", func(s *RoomStateV3) {
+			s.Moderators = keys(2)
+			s.Moderators[0], s.Moderators[1] = s.Moderators[1], s.Moderators[0]
+		}, false},
+		{"banned order", func(s *RoomStateV3) { s.Banned = keys(2); s.Banned[0], s.Banned[1] = s.Banned[1], s.Banned[0] }, false},
+		{"pins order", func(s *RoomStateV3) { s.PinnedMessages = []int64{2, 1} }, false},
+		{"duplicate admins", func(s *RoomStateV3) { s.Admins = [][]byte{key, key} }, false},
+		{"duplicate moderators", func(s *RoomStateV3) { s.Moderators = [][]byte{key, key} }, false},
+		{"duplicate banned", func(s *RoomStateV3) { s.Banned = [][]byte{key, key} }, false},
+		{"duplicate pins", func(s *RoomStateV3) { s.PinnedMessages = []int64{1, 1} }, false},
+		{"zero pin", func(s *RoomStateV3) { s.PinnedMessages = []int64{0} }, false},
+		{"short admin", func(s *RoomStateV3) { s.Admins = [][]byte{{1}} }, false},
+		{"short moderator", func(s *RoomStateV3) { s.Moderators = [][]byte{{1}} }, false},
+		{"short banned", func(s *RoomStateV3) { s.Banned = [][]byte{{1}} }, false},
+		{"short room key", func(s *RoomStateV3) { s.RoomID = []byte{1} }, false},
+		{"short revision hash", func(s *RoomStateV3) { s.RevisionHash = []byte{1} }, false},
+		{"negative revision", func(s *RoomStateV3) { s.RevisionSeqno = -1 }, false},
+		{"empty name", func(s *RoomStateV3) { s.Name = "" }, false},
+		{"name size", func(s *RoomStateV3) { s.Name = string(bytes.Repeat([]byte{'n'}, 65)) }, false},
+		{"name utf8", func(s *RoomStateV3) { s.Name = string([]byte{0xff}) }, false},
+		{"name control", func(s *RoomStateV3) { s.Name = "room\n" }, false},
+		{"description size", func(s *RoomStateV3) { s.Description = string(bytes.Repeat([]byte{'d'}, 513)) }, false},
+		{"description utf8", func(s *RoomStateV3) { s.Description = string([]byte{0xff}) }, false},
+		{"description nul", func(s *RoomStateV3) { s.Description = "a\x00b" }, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			state := base()
+			test.change(&state)
+			// Sign directly so invalid order is not repaired by SignRoomStateV3.
+			digest, err := HashBoxed(state.toSign())
+			if err == nil {
+				state.Signature = ed25519.Sign(private, digest)
+			}
+			if err := state.Verify(); (err == nil) != test.valid {
+				t.Fatalf("valid=%v err=%v", test.valid, err)
+			}
+		})
+	}
+	state := base()
+	state.Admins, state.Moderators, state.Banned = keys(2), keys(2), keys(2)
+	for _, values := range [][][]byte{state.Admins, state.Moderators, state.Banned} {
+		values[0], values[1] = values[1], values[0]
+	}
+	state.PinnedMessages = []int64{2, 1}
+	signed, err := SignRoomStateV3(private, state)
+	if err != nil || signed.Verify() != nil {
+		t.Fatalf("canonical signing: %v", err)
+	}
+	if bytes.Compare(state.Banned[0], state.Banned[1]) < 0 || state.PinnedMessages[0] != 2 {
+		t.Fatal("signer mutated input lists")
+	}
+	for _, values := range [][][]byte{signed.Admins, signed.Moderators, signed.Banned} {
+		if bytes.Compare(values[0], values[1]) >= 0 {
+			t.Fatal("signed keys are not sorted")
+		}
+	}
+	if signed.PinnedMessages[0] != 1 {
+		t.Fatal("signed pins are not sorted")
+	}
+	tooMany := base()
+	tooMany.Banned = keys(257)
+	if _, err := SignRoomStateV3(private, tooMany); err == nil {
+		t.Fatal("signer accepted banned overflow")
+	}
+}

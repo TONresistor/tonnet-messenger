@@ -28,6 +28,7 @@ const (
 	MaxAdmins           = 64
 	MaxModerators       = 256
 	MaxPins             = 100
+	MaxBanned           = 256
 	MutationClockSkew   = 5 * time.Minute
 	NonceRetention      = 24 * time.Hour
 )
@@ -748,6 +749,21 @@ func (s RoomStateV3) toSign() RoomStateV3ToSign {
 }
 
 func SignRoomStateV3(privateKey ed25519.PrivateKey, state RoomStateV3) (RoomStateV3, error) {
+	if len(privateKey) != ed25519.PrivateKeySize || !bytes.Equal(privateKey.Public().(ed25519.PublicKey), state.RoomID) {
+		return RoomStateV3{}, ErrWrongRoom
+	}
+	state.Admins = copyKeys(state.Admins)
+	state.Moderators = copyKeys(state.Moderators)
+	state.Banned = copyKeys(state.Banned)
+	state.PinnedMessages = append([]int64(nil), state.PinnedMessages...)
+	sort.Slice(state.Admins, func(i, j int) bool { return bytes.Compare(state.Admins[i], state.Admins[j]) < 0 })
+	sort.Slice(state.Moderators, func(i, j int) bool { return bytes.Compare(state.Moderators[i], state.Moderators[j]) < 0 })
+	sort.Slice(state.Banned, func(i, j int) bool { return bytes.Compare(state.Banned[i], state.Banned[j]) < 0 })
+	sort.Slice(state.PinnedMessages, func(i, j int) bool { return state.PinnedMessages[i] < state.PinnedMessages[j] })
+	state.Signature = nil
+	if err := state.validateFields(); err != nil {
+		return RoomStateV3{}, err
+	}
 	signature, err := signWire(privateKey, state.RoomID, state.toSign())
 	if err != nil {
 		return RoomStateV3{}, err
@@ -756,7 +772,24 @@ func SignRoomStateV3(privateKey ed25519.PrivateKey, state RoomStateV3) (RoomStat
 	return state, nil
 }
 
+func (s RoomStateV3) validateFields() error {
+	if err := (RoomState{
+		RoomID: s.RoomID, RevisionSeqno: s.RevisionSeqno, RevisionHash: s.RevisionHash,
+		Name: s.Name, Description: s.Description, WritePolicy: s.WritePolicy,
+		Admins: s.Admins, Moderators: s.Moderators, PinnedMessages: s.PinnedMessages,
+	}).validateFields(); err != nil {
+		return err
+	}
+	if len(s.Banned) > MaxBanned || !canonicalKeys(s.Banned) {
+		return ErrInvalidStateOrder
+	}
+	return nil
+}
+
 func (s RoomStateV3) Verify() error {
+	if err := s.validateFields(); err != nil {
+		return err
+	}
 	return verifyWire(s.RoomID, s.Signature, s.toSign())
 }
 

@@ -37,7 +37,7 @@ func TestSubmitRejectsUnrelatedCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := community.SignRoomState(roomKey, projection.State())
+	state, err := community.SignRoomStateV3(roomKey, projection.State())
 	if err != nil {
 		t.Fatal(err)
 	}

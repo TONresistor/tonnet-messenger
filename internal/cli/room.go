@@ -252,6 +252,7 @@ type roomShowOutput struct {
 	WritePolicy    string   `json:"write_policy"`
 	Admins         []string `json:"admins"`
 	Moderators     []string `json:"moderators"`
+	Banned         []string `json:"banned"`
 	PinnedMessages []int64  `json:"pinned_messages"`
 	RevisionSeqno  int64    `json:"revision_seqno"`
 	LatestSeqno    int64    `json:"latest_seqno"`
@@ -286,6 +287,7 @@ func newRoomShowCmd() *cobra.Command {
 			fmt.Printf("events      %d (state revision %d)\n", output.LatestSeqno, output.RevisionSeqno)
 			fmt.Printf("roles       %d admin(s), %d moderator(s)\n", len(output.Admins), len(output.Moderators))
 			fmt.Printf("pins        %d\n", len(output.PinnedMessages))
+			fmt.Printf("banned      %d\n", len(output.Banned))
 			return nil
 		},
 	}
@@ -343,7 +345,7 @@ func inspectRoom(ctx context.Context, dir string, now time.Time) (roomShowOutput
 		RoomID: roomText, OverlayID: base64.RawURLEncoding.EncodeToString(overlayID),
 		GenesisHash: hex.EncodeToString(genesisHash), NodeKey: base64.RawURLEncoding.EncodeToString(genesis.NodeKey),
 		Name: state.Name, Description: state.Description, WritePolicy: writePolicy,
-		Admins: encodeKeys(state.Admins), Moderators: encodeKeys(state.Moderators),
+		Admins: encodeKeys(state.Admins), Moderators: encodeKeys(state.Moderators), Banned: encodeKeys(state.Banned),
 		PinnedMessages: state.PinnedMessages, RevisionSeqno: state.RevisionSeqno,
 		LatestSeqno: head.Seqno,
 	}, nil

@@ -23,7 +23,7 @@ func (s *Store) InitializeReplica(ctx context.Context, genesis community.Genesis
 	if err != nil {
 		return err
 	}
-	unsignedState := community.RoomState{
+	unsignedState := community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionHash: genesisHash, Name: genesis.Name,
 		Description: genesis.Description, WritePolicy: genesis.WritePolicy,
 		Admins: genesis.InitialAdmins,
@@ -153,7 +153,7 @@ VALUES (?, ?, ?, ?)`, event.Proposal.AuthorKey, event.Proposal.Nonce, event.Comm
 	return true, nil
 }
 
-func (s *Store) InstallReplicaState(ctx context.Context, state community.RoomState) error {
+func (s *Store) InstallReplicaState(ctx context.Context, state community.RoomStateV3) error {
 	if err := state.Verify(); err != nil {
 		return fmt.Errorf("store: invalid replica state: %w", err)
 	}

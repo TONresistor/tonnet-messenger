@@ -113,7 +113,7 @@ FROM events ORDER BY seqno ASC`)
 	return nil
 }
 
-func (s *Store) auditStateProjection(ctx context.Context, state community.RoomState) error {
+func (s *Store) auditStateProjection(ctx context.Context, state community.RoomStateV3) error {
 	var name, description string
 	var policy int
 	if err := s.db.QueryRowContext(ctx, "SELECT name,description,anyone_can_write FROM room_state WHERE singleton_id=1").Scan(&name, &description, &policy); err != nil {

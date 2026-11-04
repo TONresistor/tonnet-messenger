@@ -222,6 +222,9 @@ func (instance *Client) sendPending(ctx context.Context, handle *roomHandle, sna
 		}
 		if err := handle.ingestCanonical(ctx, snapshot.session, snapshot.epoch, event); err != nil {
 			handle.closeSessionIf(snapshot.session)
+			if errors.Is(err, ErrProtocol) {
+				return nil, &OperationError{Code: "PROTOCOL_ERROR", Room: keyText(handle.key), EventID: keyText(pending.ID), Outcome: "committed", Cause: err}
+			}
 			return nil, failure("SEND_UNCERTAIN", err)
 		}
 		if err := instance.store.clearPending(ctx, handle.key, pending.ID); err != nil {

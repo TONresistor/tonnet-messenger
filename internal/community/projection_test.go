@@ -79,7 +79,7 @@ func TestProjectionAppliesCanonicalAuthorizationAndState(t *testing.T) {
 	if len(state.Admins) != 1 || len(state.Moderators) != 1 || len(state.PinnedMessages) != 1 || state.Name != "Updated" {
 		t.Fatalf("projected state = %+v", state)
 	}
-	signed, err := SignRoomState(room, state)
+	signed, err := SignRoomStateV3(room, state)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestProjectionAppliesCanonicalAuthorizationAndState(t *testing.T) {
 		t.Fatal(err)
 	}
 	signed.Name = "Forged"
-	signed, err = SignRoomState(room, signed)
+	signed, err = SignRoomStateV3(room, signed)
 	if err != nil {
 		t.Fatal(err)
 	}

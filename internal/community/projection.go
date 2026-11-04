@@ -18,7 +18,7 @@ var (
 // contiguous canonical event chain.
 type Projection struct {
 	genesis  Genesis
-	state    RoomState
+	state    RoomStateV3
 	headSeq  int64
 	headHash []byte
 	messages map[int64]struct{}
@@ -33,7 +33,7 @@ type Transition struct {
 	nextSeq      int64
 	nextHash     []byte
 	stateChanged bool
-	nextState    RoomState
+	nextState    RoomStateV3
 	messageID    int64
 }
 
@@ -47,7 +47,7 @@ func NewProjection(genesis Genesis) (*Projection, error) {
 	}
 	return &Projection{
 		genesis: genesis,
-		state: RoomState{
+		state: RoomStateV3{
 			RoomID: genesis.RoomKey, RevisionHash: genesisHash,
 			Name: genesis.Name, Description: genesis.Description, WritePolicy: genesis.WritePolicy,
 			Admins: copyKeys(genesis.InitialAdmins),
@@ -64,9 +64,9 @@ func (p *Projection) Head() (int64, []byte) {
 	return p.headSeq, copyBytes(p.headHash)
 }
 
-func (p *Projection) State() RoomState {
+func (p *Projection) State() RoomStateV3 {
 	if p == nil {
-		return RoomState{}
+		return RoomStateV3{}
 	}
 	return copyProjectedState(p.state)
 }
@@ -133,7 +133,7 @@ func (p *Projection) Commit(transition Transition) error {
 	return nil
 }
 
-func (p *Projection) ValidateState(state RoomState) error {
+func (p *Projection) ValidateState(state RoomStateV3) error {
 	if p == nil {
 		return errors.New("community: nil projection")
 	}
@@ -145,13 +145,14 @@ func (p *Projection) ValidateState(state RoomState) error {
 		!bytes.Equal(state.RevisionHash, expected.RevisionHash) || state.Name != expected.Name ||
 		state.Description != expected.Description || state.WritePolicy != expected.WritePolicy ||
 		!equalProjectedKeys(state.Admins, expected.Admins) || !equalProjectedKeys(state.Moderators, expected.Moderators) ||
-		!equalProjectedLongs(state.PinnedMessages, expected.PinnedMessages) {
+		!equalProjectedLongs(state.PinnedMessages, expected.PinnedMessages) ||
+		!equalProjectedKeys(state.Banned, expected.Banned) {
 		return errors.New("community: signed room state disagrees with canonical events")
 	}
 	return nil
 }
 
-func applyProjectedStateBody(roomKey []byte, state *RoomState, messages map[int64]struct{}, body any) error {
+func applyProjectedStateBody(roomKey []byte, state *RoomStateV3, messages map[int64]struct{}, body any) error {
 	switch body := body.(type) {
 	case EventMetadata:
 		state.Name, state.Description = body.Name, body.Description
@@ -199,7 +200,7 @@ func applyProjectedStateBody(roomKey []byte, state *RoomState, messages map[int6
 	return nil
 }
 
-func grantProjectedRole(roomKey []byte, state *RoomState, key []byte, admin bool) error {
+func grantProjectedRole(roomKey []byte, state *RoomStateV3, key []byte, admin bool) error {
 	if bytes.Equal(key, roomKey) {
 		return ErrProjectionConflict
 	}
@@ -218,7 +219,7 @@ func grantProjectedRole(roomKey []byte, state *RoomState, key []byte, admin bool
 	return nil
 }
 
-func revokeProjectedRole(roomKey []byte, state *RoomState, key []byte, admin bool) error {
+func revokeProjectedRole(roomKey []byte, state *RoomStateV3, key []byte, admin bool) error {
 	if bytes.Equal(key, roomKey) {
 		return ErrProjectionConflict
 	}
@@ -234,7 +235,7 @@ func revokeProjectedRole(roomKey []byte, state *RoomState, key []byte, admin boo
 	return nil
 }
 
-func projectionAuthorized(roomKey []byte, state RoomState, proposal EventProposal) bool {
+func projectionAuthorized(roomKey []byte, state RoomStateV3, proposal EventProposal) bool {
 	owner := bytes.Equal(proposal.AuthorKey, roomKey)
 	admin := containsProjectedKey(state.Admins, proposal.AuthorKey)
 	moderator := containsProjectedKey(state.Moderators, proposal.AuthorKey)
@@ -254,11 +255,12 @@ func projectionAuthorized(roomKey []byte, state RoomState, proposal EventProposa
 	}
 }
 
-func copyProjectedState(state RoomState) RoomState {
+func copyProjectedState(state RoomStateV3) RoomStateV3 {
 	state.RoomID = copyBytes(state.RoomID)
 	state.RevisionHash = copyBytes(state.RevisionHash)
 	state.Admins = copyKeys(state.Admins)
 	state.Moderators = copyKeys(state.Moderators)
+	state.Banned = copyKeys(state.Banned)
 	state.PinnedMessages = append([]int64(nil), state.PinnedMessages...)
 	state.Signature = copyBytes(state.Signature)
 	return state

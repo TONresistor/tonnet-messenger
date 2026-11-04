@@ -20,7 +20,10 @@ const (
 	maxQUICObjectSize    = MaxWireObjectSize + 8
 )
 
-var ErrNoAnswer = errors.New("room transport: query handler returned no answer")
+var (
+	ErrNoAnswer        = errors.New("room transport: query handler returned no answer")
+	ErrMalformedAnswer = errors.New("room transport: malformed answer")
+)
 
 func NewGateway(keys ...ed25519.PrivateKey) (*quic.Gateway, error) {
 	return quic.NewGatewayWithConfig(quic.GatewayConfig{
@@ -89,7 +92,10 @@ func (p *Peer) Query(ctx context.Context, request, result any) error {
 	if err != nil {
 		return err
 	}
-	return decodeInto(answer, result)
+	if err := decodeInto(answer, result); err != nil {
+		return fmt.Errorf("%w: %w", ErrMalformedAnswer, err)
+	}
+	return nil
 }
 
 func (p *Peer) SendMessage(ctx context.Context, message any) error {

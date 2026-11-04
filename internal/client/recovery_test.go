@@ -45,7 +45,7 @@ func TestClientReopenPreservesVerifiedHistory(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			state, err := community.SignRoomState(room, projection.State())
+			state, err := community.SignRoomStateV3(room, projection.State())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -87,7 +87,7 @@ func TestClientReopenPreservesVerifiedHistory(t *testing.T) {
 
 				count = 2
 				if mode == "metadata_state_current" {
-					state, e = community.SignRoomState(room, handle.projection.State())
+					state, e = community.SignRoomStateV3(room, handle.projection.State())
 					if e != nil {
 						t.Fatal(e)
 					}
@@ -138,7 +138,7 @@ func TestClientReopenPreservesVerifiedHistory(t *testing.T) {
 			if e != nil {
 				t.Fatal(e)
 			}
-			state, e = community.SignRoomState(room, projection.State())
+			state, e = community.SignRoomStateV3(room, projection.State())
 			if e != nil {
 				t.Fatal(e)
 			}
@@ -210,13 +210,13 @@ func TestReconnectRecoversStateWithoutRewindingHistory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := community.SignRoomState(f.room, projection.State())
+	state, err := community.SignRoomStateV3(f.room, projection.State())
 	if err != nil {
 		t.Fatal(err)
 	}
 	conflict := projection.State()
 	conflict.Name = "Conflicting"
-	conflict, err = community.SignRoomState(f.room, conflict)
+	conflict, err = community.SignRoomStateV3(f.room, conflict)
 	if err != nil {
 		t.Fatal(err)
 	}

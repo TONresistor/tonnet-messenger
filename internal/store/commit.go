@@ -133,7 +133,7 @@ VALUES (?, ?, ?, ?)`, proposal.AuthorKey, proposal.Nonce, now.Unix(), now.Add(co
 	return CommitResult{Event: commit}, nil
 }
 
-func authorize(ctx context.Context, tx *sql.Tx, genesis community.Genesis, state community.RoomState, proposal community.EventProposal) error {
+func authorize(ctx context.Context, tx *sql.Tx, genesis community.Genesis, state community.RoomStateV3, proposal community.EventProposal) error {
 	owner := bytes.Equal(proposal.AuthorKey, genesis.RoomKey)
 	admin, err := hasRole(ctx, tx, proposal.AuthorKey, "admin")
 	if err != nil {
@@ -308,7 +308,7 @@ func persistStateSnapshot(ctx context.Context, tx *sql.Tx, roomPrivate ed25519.P
 	}
 	state.RevisionSeqno = seqno
 	state.RevisionHash = revisionHash
-	state, err = community.SignRoomState(roomPrivate, state)
+	state, err = community.SignRoomStateV3(roomPrivate, state)
 	if err != nil {
 		return err
 	}
@@ -320,29 +320,29 @@ func persistStateSnapshot(ctx context.Context, tx *sql.Tx, roomPrivate ed25519.P
 	return err
 }
 
-func projectedState(ctx context.Context, tx *sql.Tx) (community.RoomState, error) {
+func projectedState(ctx context.Context, tx *sql.Tx) (community.RoomStateV3, error) {
 	genesis, _, err := genesisTx(ctx, tx)
 	if err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
 	var name, description string
 	var policy int
 	if err := tx.QueryRowContext(ctx, "SELECT name, description, anyone_can_write FROM room_state WHERE singleton_id=1").Scan(&name, &description, &policy); err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
 	admins, err := roleKeys(ctx, tx, "admin")
 	if err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
 	moderators, err := roleKeys(ctx, tx, "moderator")
 	if err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
 	pins, err := pinIDs(ctx, tx)
 	if err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
-	return community.RoomState{
+	return community.RoomStateV3{
 		RoomID: genesis.RoomKey, Name: name, Description: description,
 		WritePolicy: community.WritePolicy{AnyoneCanWrite: policy != 0},
 		Admins:      admins, Moderators: moderators, PinnedMessages: pins,
@@ -411,12 +411,12 @@ func genesisTx(ctx context.Context, tx *sql.Tx) (community.Genesis, []byte, erro
 	return g, hash, err
 }
 
-func stateTx(ctx context.Context, tx *sql.Tx) (community.RoomState, error) {
+func stateTx(ctx context.Context, tx *sql.Tx) (community.RoomStateV3, error) {
 	var raw []byte
 	if err := tx.QueryRowContext(ctx, "SELECT raw_signed_state FROM room_state WHERE singleton_id=1").Scan(&raw); err != nil {
-		return community.RoomState{}, err
+		return community.RoomStateV3{}, err
 	}
-	return community.DecodeRoomState(raw)
+	return community.DecodeRoomStateV3(raw)
 }
 
 func bodyType(body any) (string, bool) {

@@ -60,7 +60,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := community.SignRoomState(room, community.RoomState{
+	current, err := community.SignRoomStateV3(room, community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionSeqno: 1, RevisionHash: eventHash,
 		Name: "Updated", Description: "Current", WritePolicy: genesis.WritePolicy,
 	})
@@ -74,7 +74,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err := store.validateRoomState(ctx, genesis.RoomKey, genesis, projection, current); err != nil {
 		t.Fatalf("valid state rejected: %v", err)
 	}
-	inconsistent, err := community.SignRoomState(room, community.RoomState{
+	inconsistent, err := community.SignRoomStateV3(room, community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionSeqno: 1, RevisionHash: eventHash,
 		Name: "Forged", Description: "Current", WritePolicy: genesis.WritePolicy,
 	})
@@ -89,7 +89,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stale, err := community.SignRoomState(room, community.RoomState{
+	stale, err := community.SignRoomStateV3(room, community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionHash: genesisHash,
 		Name: genesis.Name, Description: genesis.Description, WritePolicy: genesis.WritePolicy,
 	})
@@ -102,7 +102,7 @@ func TestClientStoreValidatesRoomStateRevision(t *testing.T) {
 
 	otherRoom := clientTestPrivateKey(t)
 	otherHash := make([]byte, 32)
-	wrongRoom, err := community.SignRoomState(otherRoom, community.RoomState{
+	wrongRoom, err := community.SignRoomStateV3(otherRoom, community.RoomStateV3{
 		RoomID: otherRoom.Public().(ed25519.PublicKey), RevisionHash: otherHash,
 		Name: "Other", Description: "Other", WritePolicy: genesis.WritePolicy,
 	})
@@ -237,7 +237,7 @@ func TestClientOpenRepairsDerivedCacheButPinsGenesis(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	state, err := community.SignRoomState(room, community.RoomState{
+	state, err := community.SignRoomStateV3(room, community.RoomStateV3{
 		RoomID: genesis.RoomKey, RevisionHash: genesisHash, Name: genesis.Name,
 		Description: genesis.Description, WritePolicy: genesis.WritePolicy,
 	})

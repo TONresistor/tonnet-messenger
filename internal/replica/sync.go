@@ -33,7 +33,7 @@ type Config struct {
 
 type Result struct {
 	Genesis community.Genesis
-	State   community.RoomState
+	State   community.RoomStateV3
 	Head    store.Head
 }
 
