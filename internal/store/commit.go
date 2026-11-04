@@ -90,7 +90,17 @@ SELECT 1 FROM request_nonces WHERE author_key=? AND nonce=? AND expires_at>?)`,
 	if err := tx.QueryRowContext(ctx, "SELECT latest_seqno, latest_hash FROM replica_head WHERE singleton_id=1").Scan(&headSeqno, &headHash); err != nil {
 		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot load event head", err)
 	}
-	commit, err := community.SignCommit(roomPrivate, proposal, headSeqno+1, headHash, now)
+	committedAt := now
+	if headSeqno > 0 {
+		var previousTime int64
+		if err := tx.QueryRowContext(ctx, "SELECT committed_at FROM events WHERE seqno=?", headSeqno).Scan(&previousTime); err != nil {
+			return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot load previous commit time", err)
+		}
+		if previousTime > committedAt.Unix() {
+			committedAt = time.Unix(previousTime, 0)
+		}
+	}
+	commit, err := community.SignCommit(roomPrivate, proposal, headSeqno+1, headHash, committedAt)
 	if err != nil {
 		return CommitResult{}, reject(community.RejectPersistenceFailure, "cannot sign commit", err)
 	}
@@ -134,6 +144,13 @@ VALUES (?, ?, ?, ?)`, proposal.AuthorKey, proposal.Nonce, now.Unix(), now.Add(co
 }
 
 func authorize(ctx context.Context, tx *sql.Tx, genesis community.Genesis, state community.RoomStateV3, proposal community.EventProposal) error {
+	banned, err := isBanned(ctx, tx, proposal.AuthorKey)
+	if err != nil {
+		return reject(community.RejectPersistenceFailure, "cannot load author ban", err)
+	}
+	if banned {
+		return reject(community.RejectPermissionDenied, "author is banned", nil)
+	}
 	owner := bytes.Equal(proposal.AuthorKey, genesis.RoomKey)
 	admin, err := hasRole(ctx, tx, proposal.AuthorKey, "admin")
 	if err != nil {
@@ -153,7 +170,8 @@ func authorize(ctx context.Context, tx *sql.Tx, genesis community.Genesis, state
 		allowed = owner || admin || moderator
 	case community.EventAdminGrant, *community.EventAdminGrant, community.EventAdminRevoke, *community.EventAdminRevoke:
 		allowed = owner
-	case community.EventModeratorGrant, *community.EventModeratorGrant, community.EventModeratorRevoke, *community.EventModeratorRevoke:
+	case community.EventModeratorGrant, *community.EventModeratorGrant, community.EventModeratorRevoke, *community.EventModeratorRevoke,
+		community.EventBanV1, *community.EventBanV1, community.EventUnbanV1, *community.EventUnbanV1:
 		allowed = owner || admin
 	default:
 		return reject(community.RejectUnsupportedEvent, "unsupported event type", nil)
@@ -167,6 +185,14 @@ func authorize(ctx context.Context, tx *sql.Tx, genesis community.Genesis, state
 func applyProjection(ctx context.Context, tx *sql.Tx, genesis community.Genesis, event community.CommittedEvent, rawCommit []byte) error {
 	author := event.Proposal.AuthorKey
 	switch body := event.Proposal.Body.(type) {
+	case community.EventBanV1:
+		return ban(ctx, tx, genesis, event.Seqno, body.SubjectKey, author)
+	case *community.EventBanV1:
+		return ban(ctx, tx, genesis, event.Seqno, body.SubjectKey, author)
+	case community.EventUnbanV1:
+		return unban(ctx, tx, body.SubjectKey)
+	case *community.EventUnbanV1:
+		return unban(ctx, tx, body.SubjectKey)
 	case community.EventMessage:
 		return insertMessage(ctx, tx, event, body, rawCommit)
 	case *community.EventMessage:
@@ -342,7 +368,12 @@ func projectedState(ctx context.Context, tx *sql.Tx) (community.RoomStateV3, err
 	if err != nil {
 		return community.RoomStateV3{}, err
 	}
+	banned, err := bannedKeys(ctx, tx)
+	if err != nil {
+		return community.RoomStateV3{}, err
+	}
 	return community.RoomStateV3{
+		Banned: banned,
 		RoomID: genesis.RoomKey, Name: name, Description: description,
 		WritePolicy: community.WritePolicy{AnyoneCanWrite: policy != 0},
 		Admins:      admins, Moderators: moderators, PinnedMessages: pins,
@@ -421,6 +452,10 @@ func stateTx(ctx context.Context, tx *sql.Tx) (community.RoomStateV3, error) {
 
 func bodyType(body any) (string, bool) {
 	switch body.(type) {
+	case community.EventBanV1, *community.EventBanV1:
+		return "ban", true
+	case community.EventUnbanV1, *community.EventUnbanV1:
+		return "unban", true
 	case community.EventMessage, *community.EventMessage:
 		return "message", false
 	case community.EventPin, *community.EventPin:
@@ -465,4 +500,76 @@ func persistenceProjection(err error) error {
 
 func isConstraint(err error) bool {
 	return err != nil && (bytes.Contains([]byte(err.Error()), []byte("constraint failed")) || bytes.Contains([]byte(err.Error()), []byte("UNIQUE constraint")))
+}
+
+func isBanned(ctx context.Context, tx *sql.Tx, key []byte) (bool, error) {
+	var exists int
+	err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM bans WHERE subject_key=?)", key).Scan(&exists)
+	return exists != 0, err
+}
+
+func ban(ctx context.Context, tx *sql.Tx, genesis community.Genesis, seqno int64, subject, author []byte) error {
+	if bytes.Equal(subject, genesis.RoomKey) {
+		return reject(community.RejectRoleConflict, "owner cannot be banned", nil)
+	}
+	if !bytes.Equal(author, genesis.RoomKey) {
+		admin, err := hasRole(ctx, tx, subject, "admin")
+		if err != nil {
+			return persistenceProjection(err)
+		}
+		if admin {
+			return reject(community.RejectPermissionDenied, "only the owner may ban an admin", nil)
+		}
+	}
+	exists, err := isBanned(ctx, tx, subject)
+	if err != nil {
+		return persistenceProjection(err)
+	}
+	if exists {
+		return reject(community.RejectRoleConflict, "identity already banned", nil)
+	}
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM bans").Scan(&count); err != nil {
+		return persistenceProjection(err)
+	}
+	if count >= community.MaxBanned {
+		return reject(community.RejectLimitExceeded, "banned-identity limit reached", nil)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO bans(subject_key,banned_seqno,banned_by) VALUES (?,?,?)", subject, seqno, author); err != nil {
+		return persistenceProjection(err)
+	}
+	_, err = tx.ExecContext(ctx, "DELETE FROM roles WHERE subject_key=?", subject)
+	return persistenceProjection(err)
+}
+
+func unban(ctx context.Context, tx *sql.Tx, subject []byte) error {
+	result, err := tx.ExecContext(ctx, "DELETE FROM bans WHERE subject_key=?", subject)
+	if err != nil {
+		return persistenceProjection(err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return persistenceProjection(err)
+	}
+	if rows == 0 {
+		return reject(community.RejectRoleConflict, "identity is not banned", nil)
+	}
+	return nil
+}
+
+func bannedKeys(ctx context.Context, tx *sql.Tx) ([][]byte, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT subject_key FROM bans ORDER BY subject_key")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys [][]byte
+	for rows.Next() {
+		var key []byte
+		if err := rows.Scan(&key); err != nil {
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	return keys, rows.Err()
 }

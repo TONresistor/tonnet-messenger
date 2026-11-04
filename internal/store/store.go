@@ -18,7 +18,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
-const schemaVersion = 2
+const schemaVersion = 3
 
 var (
 	ErrAlreadyInitialized = errors.New("store: room is already initialized")
@@ -191,6 +191,11 @@ CREATE TABLE IF NOT EXISTS roles (
     granted_seqno INTEGER NOT NULL,
     granted_by BLOB NOT NULL CHECK (length(granted_by) = 32),
     PRIMARY KEY(subject_key, role)
+);
+CREATE TABLE IF NOT EXISTS bans (
+    subject_key BLOB PRIMARY KEY CHECK(length(subject_key)=32),
+    banned_seqno INTEGER NOT NULL,
+    banned_by BLOB NOT NULL CHECK(length(banned_by)=32)
 );
 CREATE TABLE IF NOT EXISTS request_nonces (
     author_key BLOB NOT NULL CHECK (length(author_key) = 32),

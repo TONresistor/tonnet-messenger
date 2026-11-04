@@ -5,8 +5,10 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -255,4 +257,291 @@ func rejectionCode(err error) int32 {
 		return rejection.Code
 	}
 	return 0
+}
+
+func TestBanAuthorizationAndCanonicalReplay(t *testing.T) {
+	for _, test := range []struct {
+		name, actor, target string
+		unban, preban       bool
+		code                int32
+	}{
+		{"owner bans member", "owner", "member", false, false, 0},
+		{"admin bans member", "admin", "member", false, false, 0},
+		{"admin bans moderator", "admin", "moderator", false, false, 0},
+		{"owner bans admin", "owner", "admin", false, false, 0},
+		{"admin bans other admin", "admin", "other-admin", false, false, 6},
+		{"admin bans itself", "admin", "admin", false, false, 6},
+		{"moderator cannot ban", "moderator", "member", false, false, 6},
+		{"member cannot ban", "member", "moderator", false, false, 6},
+		{"owner cannot ban itself", "owner", "owner", false, false, 8},
+		{"admin cannot ban owner", "admin", "owner", false, false, 8},
+		{"already banned", "owner", "member", false, true, 8},
+		{"owner unbans", "owner", "member", true, true, 0},
+		{"admin unbans", "admin", "member", true, true, 0},
+		{"moderator cannot unban", "moderator", "member", true, true, 6},
+		{"member cannot unban", "member", "moderator", true, true, 6},
+		{"banned member cannot unban itself", "member", "member", true, true, 6},
+		{"unban absent", "owner", "member", true, false, 8},
+		{"admin unban absent", "admin", "member", true, false, 8},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f := newFixture(t)
+			keys := map[string]ed25519.PrivateKey{"owner": f.room, "admin": f.admin, "member": f.user,
+				"moderator": privateKey(t), "other-admin": privateKey(t)}
+			projection, err := community.NewProjection(f.genesis)
+			if err != nil {
+				t.Fatal(err)
+			}
+			commit := func(body any) {
+				t.Helper()
+				p := f.proposal(t, f.room, body, randomNonce(t), f.now)
+				result, err := f.store.Commit(f.ctx, p, f.room, f.now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := projection.Apply(result.Event); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, role := range []string{"admin", "other-admin"} {
+				commit(community.EventAdminGrant{SubjectKey: keys[role].Public().(ed25519.PublicKey)})
+			}
+			commit(community.EventModeratorGrant{SubjectKey: keys["moderator"].Public().(ed25519.PublicKey)})
+			subject := keys[test.target].Public().(ed25519.PublicKey)
+			if test.preban {
+				commit(community.EventBanV1{SubjectKey: subject})
+			}
+			var body any = community.EventBanV1{SubjectKey: subject}
+			if test.unban {
+				body = community.EventUnbanV1{SubjectKey: subject}
+			}
+			proposal := f.proposal(t, keys[test.actor], body, randomNonce(t), f.now)
+			before, err := f.store.Head(f.ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := f.store.Commit(f.ctx, proposal, f.room, f.now)
+			if got := rejectionCode(err); got != test.code || (test.code == 0 && err != nil) {
+				t.Fatalf("code=%d want=%d err=%v", got, test.code, err)
+			}
+			if test.code == 0 {
+				if err := projection.Apply(result.Event); err != nil {
+					t.Fatal(err)
+				}
+				state, err := f.store.State(f.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := projection.ValidateState(state); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.store.Audit(f.ctx); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				forged, err := community.SignCommit(f.room, proposal, before.Seqno+1, before.Hash, f.now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := community.ErrProjectionConflict
+				if test.code == 6 {
+					want = community.ErrProjectionUnauthorized
+				}
+				if err := projection.Apply(forged); !errors.Is(err, want) {
+					t.Fatalf("canonical replay accepted invalid transition: %v", err)
+				}
+				after, err := f.store.Head(f.ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if before.Seqno != after.Seqno || !bytes.Equal(before.Hash, after.Hash) {
+					t.Fatal("rejection advanced the chain")
+				}
+			}
+		})
+	}
+}
+
+func TestBanRemovesRolesPersistsAndBlocksEveryProposal(t *testing.T) {
+	f := newFixture(t)
+	subject := f.user.Public().(ed25519.PublicKey)
+	commit := func(author ed25519.PrivateKey, body any) CommitResult {
+		t.Helper()
+		result, err := f.store.Commit(f.ctx, f.proposal(t, author, body, randomNonce(t), f.now), f.room, f.now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	original := f.proposal(t, f.user, community.EventMessage{Text: "before ban"}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, original, f.room, f.now); err != nil {
+		t.Fatal(err)
+	}
+	commit(f.room, community.EventAdminGrant{SubjectKey: subject})
+	commit(f.room, community.EventModeratorGrant{SubjectKey: subject})
+	ban := commit(f.room, community.EventBanV1{SubjectKey: subject})
+	state, err := f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Banned) != 1 || !bytes.Equal(state.Banned[0], subject) || len(state.Admins) != 0 || len(state.Moderators) != 0 || state.RevisionSeqno != ban.Event.Seqno {
+		t.Fatalf("state after ban=%+v", state)
+	}
+	for _, body := range []any{
+		community.EventMessage{Text: "denied"}, community.EventMetadata{Name: "Denied"}, community.EventWritePolicy{AnyoneCanWrite: false},
+		community.EventPin{MessageID: 1}, community.EventUnpin{MessageID: 1},
+		community.EventAdminGrant{SubjectKey: f.admin.Public().(ed25519.PublicKey)}, community.EventAdminRevoke{SubjectKey: subject},
+		community.EventModeratorGrant{SubjectKey: f.admin.Public().(ed25519.PublicKey)}, community.EventModeratorRevoke{SubjectKey: subject},
+		community.EventBanV1{SubjectKey: f.admin.Public().(ed25519.PublicKey)}, community.EventUnbanV1{SubjectKey: subject},
+	} {
+		p := f.proposal(t, f.user, body, randomNonce(t), f.now)
+		if _, err := f.store.Commit(f.ctx, p, f.room, f.now); rejectionCode(err) != 6 {
+			t.Fatalf("%T from banned author: %v", body, err)
+		}
+	}
+	duplicate, err := f.store.Commit(f.ctx, original, f.room, f.now.Add(time.Hour))
+	if err != nil || !duplicate.Duplicate || duplicate.Event.Seqno != 1 {
+		t.Fatalf("duplicate after ban=%+v err=%v", duplicate, err)
+	}
+	reused := f.proposal(t, f.user, community.EventMessage{Text: "nonce reused"}, original.Nonce, f.now)
+	if _, err := f.store.Commit(f.ctx, reused, f.room, f.now); rejectionCode(err) != 4 {
+		t.Fatalf("nonce precedence changed: %v", err)
+	}
+	if err := f.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.store, err = Open(f.ctx, f.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Audit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := f.store.State(f.ctx)
+	if err != nil || !reflect.DeepEqual(state, reopened) {
+		t.Fatalf("reopened state=%+v err=%v", reopened, err)
+	}
+	commit(f.room, community.EventUnbanV1{SubjectKey: subject})
+	state, err = f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Banned) != 0 || len(state.Admins) != 0 || len(state.Moderators) != 0 {
+		t.Fatal("unban restored removed roles")
+	}
+	commit(f.user, community.EventMessage{Text: "after unban"})
+}
+
+func TestBanLimitAndSortedProjection(t *testing.T) {
+	f := newFixture(t)
+	projection, err := community.NewProjection(f.genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 256; i > 0; i-- {
+		subject := community.Zero256()
+		binary.BigEndian.PutUint64(subject[24:], uint64(i))
+		proposal := f.proposal(t, f.room, community.EventBanV1{SubjectKey: subject}, randomNonce(t), f.now)
+		result, err := f.store.Commit(f.ctx, proposal, f.room, f.now)
+		if err != nil {
+			t.Fatalf("ban %d: %v", i, err)
+		}
+		if err := projection.Apply(result.Event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	state, err := f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Banned) != 256 {
+		t.Fatalf("banned count=%d", len(state.Banned))
+	}
+	for i, key := range state.Banned {
+		if binary.BigEndian.Uint64(key[24:]) != uint64(i+1) {
+			t.Fatal("bans are not sorted by raw key bytes")
+		}
+	}
+	if err := projection.ValidateState(state); err != nil {
+		t.Fatal(err)
+	}
+	subject := community.Zero256()
+	binary.BigEndian.PutUint64(subject[24:], 257)
+	proposal := f.proposal(t, f.room, community.EventBanV1{SubjectKey: subject}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); rejectionCode(err) != 9 {
+		t.Fatalf("257th ban: %v", err)
+	}
+	head, err := f.store.Head(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged, err := community.SignCommit(f.room, proposal, head.Seqno+1, head.Hash, f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := projection.Apply(forged); !errors.Is(err, community.ErrProjectionLimit) {
+		t.Fatalf("projection overflow: %v", err)
+	}
+	duplicate := f.proposal(t, f.room, community.EventBanV1{SubjectKey: state.Banned[0]}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, duplicate, f.room, f.now); rejectionCode(err) != 8 {
+		t.Fatalf("duplicate at cap: %v", err)
+	}
+	if err := f.store.Audit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, "DELETE FROM bans WHERE subject_key=?", state.Banned[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Audit(f.ctx); err == nil {
+		t.Fatal("audit accepted a corrupt ban projection")
+	}
+}
+
+func TestCommitTimeClampKeepsHistoricalTolerance(t *testing.T) {
+	f := newFixture(t)
+	first, err := f.store.Commit(f.ctx, f.proposal(t, f.user, community.EventMessage{Text: "first"}, randomNonce(t), f.now), f.room, f.now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	earlier := f.now.Add(-time.Minute)
+	proposal := f.proposal(t, f.user, community.EventMessage{Text: "clock moved back"}, randomNonce(t), earlier)
+	second, err := f.store.Commit(f.ctx, proposal, f.room, earlier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Event.CommittedAt != first.Event.CommittedAt {
+		t.Fatalf("commit time decreased: %d -> %d", first.Event.CommittedAt, second.Event.CommittedAt)
+	}
+	replica, err := Open(f.ctx, filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replica.Close()
+	if err := replica.InitializeReplica(f.ctx, f.genesis); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.AppendReplica(f.ctx, first.Event); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := first.Event.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+	historical, err := community.SignCommit(f.room, proposal, 2, hash, earlier)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := replica.AppendReplica(f.ctx, historical); err != nil {
+		t.Fatalf("decreasing historical timestamp rejected: %v", err)
+	}
+	state, err := f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.InstallReplicaState(f.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Audit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
 }

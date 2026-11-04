@@ -460,3 +460,114 @@ func TestIdentityQUICAuthorsProposalWithoutBinding(t *testing.T) {
 		t.Fatalf("replica head = %d, want 1", synced.Head.Seqno)
 	}
 }
+
+func TestRoomBansRefreshReplicaStateAndRejectAuthors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	room, nodeKey, member := integrationKey(t), integrationKey(t), integrationKey(t)
+	genesis, err := community.NewGenesis(room, nodeKey, time.Now(), "Bans", "", true, [][]byte{member.Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := store.Open(ctx, filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authority.Close()
+	if err := authority.Initialize(ctx, genesis, room); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := authority.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listen := integrationAddress(t)
+	runtime, err := New(Config{Key: nodeKey, Listen: listen, Socket: filepath.Join(t.TempDir(), "node.sock"), Genesis: &genesis, Store: authority, RoomKey: room, NodeRole: community.NodeRoleSequencer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	dial := func(key ed25519.PrivateKey) *replica.Session {
+		t.Helper()
+		session, err := replica.DialSequencer(ctx, replica.Config{RoomID: genesis.RoomKey, NodeKey: key, DirectAddress: listen, DirectPublic: genesis.NodeKey})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(session.Close)
+		return session
+	}
+	ownerSession, memberSession, sourceSession := dial(room), dial(member), dial(integrationKey(t))
+	destinationStore, err := store.Open(ctx, filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer destinationStore.Close()
+	if err := destinationStore.InitializeReplica(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	if err := destinationStore.InstallReplicaState(ctx, initial); err != nil {
+		t.Fatal(err)
+	}
+	peers := newPeerTable(DefaultMaxLeaves)
+	source := newPeer("sequencer", kindNode, sourceSession.Peer, nil)
+	source.state = peerHealthy
+	peers.m[source.id] = source
+	destination := &Node{store: destinationStore, peers: peers, genesis: genesis}
+	submit := func(session *replica.Session, author ed25519.PrivateKey, body any) any {
+		t.Helper()
+		nonce := make([]byte, 32)
+		if _, err := rand.Read(nonce); err != nil {
+			t.Fatal(err)
+		}
+		proposal, err := community.SignProposal(author, genesis.NodeKey, community.EventProposal{RoomID: genesis.RoomKey, Nonce: nonce, Timestamp: time.Now().Unix(), Body: body})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var answer any
+		if err := session.Peer.Query(ctx, community.SubmitEvent{Proposal: proposal}, &answer); err != nil {
+			t.Fatal(err)
+		}
+		return answer
+	}
+	subject := member.Public().(ed25519.PublicKey)
+	for _, body := range []any{community.EventBanV1{SubjectKey: subject}, community.EventUnbanV1{SubjectKey: subject}} {
+		answer := submit(ownerSession, room, body)
+		accepted, ok := answer.(community.SubmitAccepted)
+		if !ok {
+			t.Fatalf("submit=%#v", answer)
+		}
+		if err := destination.persistReplicaEvent(source, accepted.Event); err != nil {
+			t.Fatal(err)
+		}
+		if err := destinationStore.ReplicaReady(ctx); err != nil {
+			t.Fatal(err)
+		}
+		state, err := destinationStore.State(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if state.RevisionSeqno != accepted.Event.Seqno || len(state.Admins) != 0 {
+			t.Fatalf("replica state=%+v", state)
+		}
+		if _, banning := body.(community.EventBanV1); banning {
+			if len(state.Banned) != 1 || !bytes.Equal(state.Banned[0], subject) {
+				t.Fatal("replica missed ban state refresh")
+			}
+			answer = submit(memberSession, member, community.EventMessage{Text: "blocked"})
+			if rejected, ok := answer.(community.SubmitRejected); !ok || rejected.Code != 6 {
+				t.Fatalf("banned author response=%#v", answer)
+			}
+			answer = submit(ownerSession, room, community.EventBanV1{SubjectKey: subject})
+			if rejected, ok := answer.(community.SubmitRejected); !ok || rejected.Code != 8 {
+				t.Fatalf("repeat ban response=%#v", answer)
+			}
+		} else {
+			if len(state.Banned) != 0 {
+				t.Fatal("replica missed unban state refresh")
+			}
+			if _, ok := submit(memberSession, member, community.EventMessage{Text: "allowed again"}).(community.SubmitAccepted); !ok {
+				t.Fatal("unbanned author still rejected")
+			}
+		}
+	}
+}

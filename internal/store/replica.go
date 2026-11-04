@@ -193,7 +193,8 @@ func (s *Store) InstallReplicaState(ctx context.Context, state community.RoomSta
 	}
 	if state.Name != projected.Name || state.Description != projected.Description ||
 		state.WritePolicy != projected.WritePolicy || !equalKeys(state.Admins, projected.Admins) ||
-		!equalKeys(state.Moderators, projected.Moderators) || !equalLongs(state.PinnedMessages, projected.PinnedMessages) {
+		!equalKeys(state.Moderators, projected.Moderators) || !equalLongs(state.PinnedMessages, projected.PinnedMessages) ||
+		!equalKeys(state.Banned, projected.Banned) {
 		return fmt.Errorf("store: signed state disagrees with event projections")
 	}
 	raw, err := community.Encode(state)

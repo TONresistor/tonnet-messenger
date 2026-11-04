@@ -1507,6 +1507,14 @@ func eventView(event community.CommittedEvent) (map[string]any, error) {
 
 func roleBody(body any) ([]byte, string) {
 	switch value := body.(type) {
+	case community.EventBanV1:
+		return value.SubjectKey, "ban"
+	case *community.EventBanV1:
+		return value.SubjectKey, "ban"
+	case community.EventUnbanV1:
+		return value.SubjectKey, "unban"
+	case *community.EventUnbanV1:
+		return value.SubjectKey, "unban"
 	case community.EventAdminGrant:
 		return value.SubjectKey, "admin-grant"
 	case *community.EventAdminGrant:

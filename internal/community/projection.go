@@ -154,6 +154,25 @@ func (p *Projection) ValidateState(state RoomStateV3) error {
 
 func applyProjectedStateBody(roomKey []byte, state *RoomStateV3, messages map[int64]struct{}, body any) error {
 	switch body := body.(type) {
+	case EventBanV1, *EventBanV1:
+		key, _ := subjectKey(body)
+		if bytes.Equal(key, roomKey) || containsProjectedKey(state.Banned, key) {
+			return ErrProjectionConflict
+		}
+		if len(state.Banned) >= MaxBanned {
+			return ErrProjectionLimit
+		}
+		state.Banned = append(state.Banned, copyBytes(key))
+		sort.Slice(state.Banned, func(i, j int) bool { return bytes.Compare(state.Banned[i], state.Banned[j]) < 0 })
+		state.Admins, _ = removeProjectedKey(state.Admins, key)
+		state.Moderators, _ = removeProjectedKey(state.Moderators, key)
+	case EventUnbanV1, *EventUnbanV1:
+		key, _ := subjectKey(body)
+		var removed bool
+		state.Banned, removed = removeProjectedKey(state.Banned, key)
+		if !removed {
+			return ErrProjectionConflict
+		}
 	case EventMetadata:
 		state.Name, state.Description = body.Name, body.Description
 	case *EventMetadata:
@@ -236,6 +255,9 @@ func revokeProjectedRole(roomKey []byte, state *RoomStateV3, key []byte, admin b
 }
 
 func projectionAuthorized(roomKey []byte, state RoomStateV3, proposal EventProposal) bool {
+	if containsProjectedKey(state.Banned, proposal.AuthorKey) {
+		return false
+	}
 	owner := bytes.Equal(proposal.AuthorKey, roomKey)
 	admin := containsProjectedKey(state.Admins, proposal.AuthorKey)
 	moderator := containsProjectedKey(state.Moderators, proposal.AuthorKey)
@@ -248,7 +270,10 @@ func projectionAuthorized(roomKey []byte, state RoomStateV3, proposal EventPropo
 		return owner || admin || moderator
 	case EventAdminGrant, *EventAdminGrant, EventAdminRevoke, *EventAdminRevoke:
 		return owner
-	case EventModeratorGrant, *EventModeratorGrant, EventModeratorRevoke, *EventModeratorRevoke:
+	case EventBanV1, *EventBanV1:
+		key, _ := subjectKey(proposal.Body)
+		return owner || (admin && !containsProjectedKey(state.Admins, key))
+	case EventModeratorGrant, *EventModeratorGrant, EventModeratorRevoke, *EventModeratorRevoke, EventUnbanV1, *EventUnbanV1:
 		return owner || admin
 	default:
 		return false

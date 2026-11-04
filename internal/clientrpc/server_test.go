@@ -17,6 +17,7 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/node"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
@@ -325,5 +326,204 @@ func TestRoomJoinRejectsV2StateAsProtocolError(t *testing.T) {
 				t.Fatal("replica with V2 peer state became ready")
 			}
 		})
+	}
+}
+
+func TestRoomBanRPCStateEventsAndReopen(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	room, nodeKey, target := rpcTestKey(t), rpcTestKey(t), rpcTestKey(t)
+	listener, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	address := listener.LocalAddr().String()
+	listener.Close()
+	dir := t.TempDir()
+	cfg := client.Config{StateDir: dir, DirectAddress: address, DirectPublic: nodeKey.Public().(ed25519.PublicKey)}
+	instance, err := client.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if instance != nil {
+			instance.Close()
+		}
+	}()
+	admin, err := client.ParseKeyText(instance.Identity().Key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	genesis, err := community.NewGenesis(room, nodeKey, time.Now(), "RPC Bans", "", true, [][]byte{admin})
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := store.Open(ctx, filepath.Join(t.TempDir(), "room.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	if err := database.Initialize(ctx, genesis, room); err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := node.New(node.Config{Key: nodeKey, Listen: address, Socket: filepath.Join(t.TempDir(), "node.sock"), Genesis: &genesis, Store: database, RoomKey: room, NodeRole: community.NodeRoleSequencer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer runtime.Close()
+	states, events := make(chan map[string]any, 16), make(chan map[string]any, 16)
+	drain := func(c *client.Client) {
+		go func() {
+			for notification := range c.Notifications() {
+				value, ok := notification.Params.(map[string]any)
+				if !ok {
+					continue
+				}
+				var output chan map[string]any
+				switch notification.Method {
+				case "room.state":
+					output = states
+				case "room.event":
+					output = events
+				default:
+					continue
+				}
+				select {
+				case output <- value:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+	drain(instance)
+	roomText, err := community.RoomKeyText(genesis.RoomKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetText, err := community.RoomKeyText(target.Public().(ed25519.PublicKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{Client: instance}
+	call := func(method string, params map[string]string) (any, *rpcError) {
+		t.Helper()
+		raw, err := json.Marshal(params)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return server.dispatch(ctx, method, raw)
+	}
+	joined, rpcErr := call("room.join", map[string]string{"reference": roomText})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if banned := joined.(client.JoinResult).State["banned"].([]string); banned == nil || len(banned) != 0 {
+		t.Fatalf("initial banned=%#v", banned)
+	}
+	result, rpcErr := call("room.ban", map[string]string{"room": roomText, "identity_key": targetText})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if event := result.(map[string]any); event["kind"] != "ban" || event["subject_key"] != targetText || event["seqno"] != "1" {
+		t.Fatalf("ban event=%#v", event)
+	}
+	checkState := func(want int) {
+		t.Helper()
+		value, rpcErr := call("room.getState", map[string]string{"room": roomText})
+		if rpcErr != nil {
+			t.Fatal(rpcErr)
+		}
+		banned := value.(map[string]any)["banned"].([]string)
+		if len(banned) != want || (want == 1 && banned[0] != targetText) {
+			t.Fatalf("banned=%#v want count %d", banned, want)
+		}
+	}
+	checkState(1)
+	for {
+		select {
+		case state := <-states:
+			if state["revision_seqno"] != "1" {
+				continue
+			}
+			banned := state["banned"].([]string)
+			if len(banned) != 1 || banned[0] != targetText {
+				t.Fatalf("room.state=%#v", state)
+			}
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+		break
+	}
+	select {
+	case event := <-events:
+		if event["kind"] != "ban" || event["subject_key"] != targetText {
+			t.Fatalf("room.event=%#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	for _, test := range []struct{ subject, code string }{
+		{instance.Identity().Key, "PERMISSION_DENIED"},
+		{roomText, "ROLE_CONFLICT"},
+		{targetText, "ROLE_CONFLICT"},
+	} {
+		_, rpcErr := call("room.ban", map[string]string{"room": roomText, "identity_key": test.subject})
+		if rpcErr == nil || rpcErr.Data["code"] != test.code {
+			t.Fatalf("ban %s: %#v", test.code, rpcErr)
+		}
+	}
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
+	}
+	instance = nil
+	instance, err = client.Open(ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(instance)
+	server.Client = instance
+	joined, rpcErr = call("room.join", map[string]string{"reference": roomText})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if banned := joined.(client.JoinResult).State["banned"].([]string); len(banned) != 1 || banned[0] != targetText {
+		t.Fatalf("rejoined banned=%#v", banned)
+	}
+	checkState(1)
+	result, rpcErr = call("room.unban", map[string]string{"room": roomText, "identity_key": targetText})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	if event := result.(map[string]any); event["kind"] != "unban" || event["subject_key"] != targetText {
+		t.Fatalf("unban event=%#v", event)
+	}
+	checkState(0)
+	value, rpcErr := call("room.getTimeline", map[string]string{"room": roomText})
+	if rpcErr != nil {
+		t.Fatal(rpcErr)
+	}
+	items := value.(map[string]any)["items"].([]map[string]any)
+	if len(items) != 2 || items[0]["kind"] != "ban" || items[1]["kind"] != "unban" {
+		t.Fatalf("timeline=%#v", items)
+	}
+	_, rpcErr = call("room.unban", map[string]string{"room": roomText, "identity_key": targetText})
+	if rpcErr == nil || rpcErr.Data["code"] != "ROLE_CONFLICT" {
+		t.Fatalf("unban absent=%#v", rpcErr)
+	}
+}
+
+func TestBanRejectionCodesReachClientAPI(t *testing.T) {
+	for _, test := range []struct {
+		wire    int32
+		code    string
+		numeric int
+	}{
+		{6, "PERMISSION_DENIED", -32016}, {8, "ROLE_CONFLICT", -32018}, {9, "LIMIT_EXCEEDED", -32019},
+	} {
+		got := classify(&client.RejectedError{Code: test.wire, Message: "rejected"})
+		if got.Code != test.numeric || got.Data["code"] != test.code {
+			t.Fatalf("wire %d=%#v", test.wire, got)
+		}
 	}
 }

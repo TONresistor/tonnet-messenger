@@ -767,3 +767,30 @@ func TestRoomStateV3Validation(t *testing.T) {
 		t.Fatal("signer accepted banned overflow")
 	}
 }
+
+func TestBanProposalSignaturesAndSubjectKeys(t *testing.T) {
+	room, node, author := testPrivate(t), testPrivate(t), testPrivate(t)
+	now := time.Now()
+	for _, body := range []any{EventBanV1{SubjectKey: room.Public().(ed25519.PublicKey)}, EventUnbanV1{SubjectKey: room.Public().(ed25519.PublicKey)}} {
+		proposal, err := SignProposal(author, node.Public().(ed25519.PublicKey), EventProposal{
+			RoomID: room.Public().(ed25519.PublicKey), Nonce: testNonce(t), Timestamp: now.Unix(), Body: body,
+		})
+		if err != nil || proposal.Verify(node.Public().(ed25519.PublicKey), now) != nil {
+			t.Fatalf("ban signing: %v", err)
+		}
+		switch body.(type) {
+		case EventBanV1:
+			proposal.Body = EventBanV1{SubjectKey: node.Public().(ed25519.PublicKey)}
+		case EventUnbanV1:
+			proposal.Body = EventUnbanV1{SubjectKey: node.Public().(ed25519.PublicKey)}
+		}
+		if err := proposal.Verify(node.Public().(ed25519.PublicKey), now); !errors.Is(err, ErrBadSignature) {
+			t.Fatalf("tampered ban: %v", err)
+		}
+	}
+	for _, body := range []any{EventBanV1{SubjectKey: []byte{1}}, EventUnbanV1{SubjectKey: make([]byte, 33)}, (*EventBanV1)(nil), (*EventUnbanV1)(nil)} {
+		if err := ValidateBody(body); !errors.Is(err, ErrMalformedKey) {
+			t.Fatalf("invalid %T accepted: %v", body, err)
+		}
+	}
+}

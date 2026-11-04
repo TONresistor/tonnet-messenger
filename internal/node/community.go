@@ -550,7 +550,8 @@ func stateChangingBody(body any) bool {
 		community.EventAdminRevoke, *community.EventAdminRevoke,
 		community.EventModeratorGrant, *community.EventModeratorGrant,
 		community.EventModeratorRevoke, *community.EventModeratorRevoke,
-		community.EventWritePolicy, *community.EventWritePolicy:
+		community.EventWritePolicy, *community.EventWritePolicy,
+		community.EventBanV1, *community.EventBanV1, community.EventUnbanV1, *community.EventUnbanV1:
 		return true
 	default:
 		return false

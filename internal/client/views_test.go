@@ -46,3 +46,40 @@ func TestConnectionViewRequiresAuthenticatedPeer(t *testing.T) {
 		t.Fatalf("connectionView(nil) error = %v", err)
 	}
 }
+
+func TestBanEventAndPendingViews(t *testing.T) {
+	f := newCanonicalIngestFixture(t)
+	key := make([]byte, 32)
+	for _, test := range []struct {
+		body any
+		kind string
+	}{
+		{community.EventBanV1{SubjectKey: key}, "ban"}, {&community.EventBanV1{SubjectKey: key}, "ban"},
+		{community.EventUnbanV1{SubjectKey: key}, "unban"}, {&community.EventUnbanV1{SubjectKey: key}, "unban"},
+	} {
+		view, err := eventView(community.CommittedEvent{Proposal: community.EventProposal{RoomID: key, AuthorKey: key, Nonce: key, Body: test.body}})
+		if err != nil || view["kind"] != test.kind || view["subject_key"] != keyText(key) {
+			t.Fatalf("view=%#v err=%v", view, err)
+		}
+		proposal, err := community.SignProposal(f.room, f.genesis.NodeKey, community.EventProposal{
+			RoomID: f.genesis.RoomKey, Nonce: make([]byte, 32), Timestamp: f.now.Unix(), Body: test.body,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		saved, err := f.store.savePending(f.ctx, f.genesis, proposal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pending, err := f.client.GetPending(f.ctx, keyText(f.genesis.RoomKey))
+		if err != nil || pending == nil || pending.Event["kind"] != test.kind || pending.Event["subject_key"] != keyText(key) {
+			t.Fatalf("pending=%#v err=%v", pending, err)
+		}
+		if _, ok := pending.Event["seqno"]; ok {
+			t.Fatal("pending preview claims a sequence number")
+		}
+		if err := f.store.clearPending(f.ctx, f.genesis.RoomKey, saved.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+}

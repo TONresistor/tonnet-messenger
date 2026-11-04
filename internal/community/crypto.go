@@ -415,7 +415,8 @@ func ValidateBody(body any) error {
 		}
 		return ValidateMetadata(v.Name, v.Description)
 	case EventAdminGrant, *EventAdminGrant, EventAdminRevoke, *EventAdminRevoke,
-		EventModeratorGrant, *EventModeratorGrant, EventModeratorRevoke, *EventModeratorRevoke:
+		EventModeratorGrant, *EventModeratorGrant, EventModeratorRevoke, *EventModeratorRevoke,
+		EventBanV1, *EventBanV1, EventUnbanV1, *EventUnbanV1:
 		key, ok := subjectKey(body)
 		if !ok || len(key) != ed25519.PublicKeySize {
 			return ErrMalformedKey
@@ -545,6 +546,18 @@ func targetMessageID(body any) (int64, bool) {
 
 func subjectKey(body any) ([]byte, bool) {
 	switch v := body.(type) {
+	case EventBanV1:
+		return v.SubjectKey, true
+	case *EventBanV1:
+		if v != nil {
+			return v.SubjectKey, true
+		}
+	case EventUnbanV1:
+		return v.SubjectKey, true
+	case *EventUnbanV1:
+		if v != nil {
+			return v.SubjectKey, true
+		}
 	case EventAdminGrant:
 		return v.SubjectKey, true
 	case *EventAdminGrant:

@@ -160,6 +160,27 @@ func (s *Store) auditStateProjection(ctx context.Context, state community.RoomSt
 		pins = append(pins, id)
 	}
 	rows.Close()
+	bannedRows, err := s.db.QueryContext(ctx, "SELECT subject_key FROM bans ORDER BY subject_key")
+	if err != nil {
+		return err
+	}
+	var banned [][]byte
+	for bannedRows.Next() {
+		var key []byte
+		if err := bannedRows.Scan(&key); err != nil {
+			bannedRows.Close()
+			return err
+		}
+		banned = append(banned, key)
+	}
+	if err := bannedRows.Err(); err != nil {
+		bannedRows.Close()
+		return err
+	}
+	bannedRows.Close()
+	if !equalKeys(banned, state.Banned) {
+		return fmt.Errorf("store: ban projection mismatch")
+	}
 	if !equalKeys(admins, state.Admins) || !equalKeys(moderators, state.Moderators) || !equalLongs(pins, state.PinnedMessages) {
 		return fmt.Errorf("store: role or pin projection mismatch")
 	}

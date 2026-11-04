@@ -452,7 +452,7 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 			return mutation(ctx, s.Client, p.Room, community.EventPin{MessageID: id})
 		}
 		return mutation(ctx, s.Client, p.Room, community.EventUnpin{MessageID: id})
-	case "room.grantModerator", "room.revokeModerator":
+	case "room.grantModerator", "room.revokeModerator", "room.ban", "room.unban":
 		var p struct {
 			Room        string `json:"room"`
 			IdentityKey string `json:"identity_key"`
@@ -463,6 +463,12 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		key, err := client.ParseKeyText(p.IdentityKey)
 		if err != nil {
 			return fail(err)
+		}
+		if method == "room.ban" {
+			return mutation(ctx, s.Client, p.Room, community.EventBanV1{SubjectKey: key})
+		}
+		if method == "room.unban" {
+			return mutation(ctx, s.Client, p.Room, community.EventUnbanV1{SubjectKey: key})
 		}
 		if method == "room.grantModerator" {
 			return mutation(ctx, s.Client, p.Room, community.EventModeratorGrant{SubjectKey: key})
