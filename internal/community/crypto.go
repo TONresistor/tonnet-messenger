@@ -571,3 +571,247 @@ func subjectKey(body any) ([]byte, bool) {
 	}
 	return nil, false
 }
+
+const (
+	RelayServiceReserved  int32 = 1
+	RelayServiceDM        int32 = 2
+	RelayServicePaidTiers int32 = 4
+	MaxRelayAddressBytes        = 128
+	MaxRelayObjectBytes         = 64 << 10
+	MaxInboxAckIDs              = 256
+)
+
+func (o RelayOfferV1) Validate(cardServices int32) error {
+	if o.MaxObjectBytes > MaxRelayObjectBytes {
+		return fmt.Errorf("community: relay object limit exceeds %d bytes", MaxRelayObjectBytes)
+	}
+	if o.Services != RelayServiceDM || o.Services&cardServices != o.Services {
+		return fmt.Errorf("community: invalid relay offer services")
+	}
+	if o.Tier != 0 && (o.PriceNanoton <= 0 || o.UnitBytes <= 0) {
+		return fmt.Errorf("community: paid offer needs positive price and unit size")
+	}
+	return nil
+}
+
+func (c RelayCardV1) Validate() error {
+	if len(c.RelayKey) != ed25519.PublicKeySize || len(c.PaymentKey) != ed25519.PublicKeySize {
+		return ErrMalformedKey
+	}
+	if c.Services&RelayServiceReserved != 0 || len(c.Offers) == 0 {
+		return fmt.Errorf("community: invalid relay card services or missing offers")
+	}
+	// TON's AdnlAddressList::serialized_size counts a 24-byte base, including
+	// the list constructor. The card carries the list bare, but the size bound
+	// still applies to the boxed list (20 bare bytes plus 4 constructor bytes).
+	addrs, err := tl.Serialize(c.Addrs, true)
+	if err != nil {
+		return err
+	}
+	if len(addrs) > MaxRelayAddressBytes {
+		return fmt.Errorf("community: relay address list exceeds %d bytes", MaxRelayAddressBytes)
+	}
+	paid := c.Services&RelayServicePaidTiers != 0
+	if paid == bytes.Equal(c.PaymentKey, Zero256()) {
+		return fmt.Errorf("community: payment key does not match paid service flag")
+	}
+	seen := make(map[int32]bool, len(c.Offers))
+	hasPaidOffer := false
+	for _, offer := range c.Offers {
+		if err := offer.Validate(c.Services); err != nil {
+			return err
+		}
+		if seen[offer.Tier] {
+			return fmt.Errorf("community: duplicate relay offer tier")
+		}
+		seen[offer.Tier] = true
+		if offer.Tier != 0 {
+			hasPaidOffer = true
+		}
+	}
+	if paid != hasPaidOffer {
+		return fmt.Errorf("community: offers do not match paid service flag")
+	}
+	return nil
+}
+
+func (q GetRoomCardsV1) PageLimit() (int32, error) {
+	if q.Limit == 0 {
+		return DefaultPageLimit, nil
+	}
+	if q.Limit < 1 || q.Limit > MaxPageLimit {
+		return 0, fmt.Errorf("community: page limit must be in 1..%d", MaxPageLimit)
+	}
+	return q.Limit, nil
+}
+
+func (q InboxAckV1) Validate() error {
+	if len(q.IDs) > MaxInboxAckIDs {
+		return fmt.Errorf("community: inbox ack exceeds %d IDs", MaxInboxAckIDs)
+	}
+	return nil
+}
+
+func (q OverlayQueryV1) Validate() error {
+	if q.Tier != 0 {
+		return fmt.Errorf("community: overlay query tier must be zero")
+	}
+	return nil
+}
+
+// These helpers only check wire fields and signatures. Freshness, permissions,
+// canonical state transitions and transport binding belong to their callers.
+func signWire(privateKey ed25519.PrivateKey, signer []byte, toSign any) ([]byte, error) {
+	if len(privateKey) != ed25519.PrivateKeySize || len(signer) != ed25519.PublicKeySize {
+		return nil, ErrMalformedKey
+	}
+	if !bytes.Equal(privateKey.Public().(ed25519.PublicKey), signer) {
+		return nil, ErrMalformedKey
+	}
+	digest, err := HashBoxed(toSign)
+	if err != nil {
+		return nil, err
+	}
+	return ed25519.Sign(privateKey, digest), nil
+}
+
+func verifyWire(signer, signature []byte, toSign any) error {
+	if len(signer) != ed25519.PublicKeySize {
+		return ErrMalformedKey
+	}
+	if len(signature) != ed25519.SignatureSize {
+		return ErrBadSignature
+	}
+	digest, err := HashBoxed(toSign)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(signer), digest, signature) {
+		return ErrBadSignature
+	}
+	return nil
+}
+
+func (c RelayCardV1) toSign() RelayCardV1ToSign {
+	return RelayCardV1ToSign{
+		RelayKey: c.RelayKey, Addrs: c.Addrs, Services: c.Services,
+		PaymentKey: c.PaymentKey, Offers: c.Offers, Version: c.Version,
+	}
+}
+
+func SignRelayCardV1(privateKey ed25519.PrivateKey, card RelayCardV1) (RelayCardV1, error) {
+	if err := card.Validate(); err != nil {
+		return RelayCardV1{}, err
+	}
+	signature, err := signWire(privateKey, card.RelayKey, card.toSign())
+	if err != nil {
+		return RelayCardV1{}, err
+	}
+	card.Signature = signature
+	return card, nil
+}
+
+func (c RelayCardV1) Verify() error {
+	if err := c.Validate(); err != nil {
+		return err
+	}
+	return verifyWire(c.RelayKey, c.Signature, c.toSign())
+}
+
+func (c RoomCardV1) toSign() RoomCardV1ToSign {
+	return RoomCardV1ToSign{
+		RoomKey: c.RoomKey, NodeKey: c.NodeKey, Alias: c.Alias,
+		Name: c.Name, Description: c.Description, Version: c.Version,
+	}
+}
+
+func SignRoomCardV1(privateKey ed25519.PrivateKey, card RoomCardV1) (RoomCardV1, error) {
+	signature, err := signWire(privateKey, card.RoomKey, card.toSign())
+	if err != nil {
+		return RoomCardV1{}, err
+	}
+	card.Signature = signature
+	return card, nil
+}
+
+func (c RoomCardV1) Verify() error {
+	return verifyWire(c.RoomKey, c.Signature, c.toSign())
+}
+
+func (s RoomStateV3) toSign() RoomStateV3ToSign {
+	return RoomStateV3ToSign{
+		RoomID: s.RoomID, RevisionSeqno: s.RevisionSeqno, RevisionHash: s.RevisionHash,
+		Name: s.Name, Description: s.Description, WritePolicy: s.WritePolicy,
+		Admins: s.Admins, Moderators: s.Moderators, PinnedMessages: s.PinnedMessages,
+		Banned: s.Banned,
+	}
+}
+
+func SignRoomStateV3(privateKey ed25519.PrivateKey, state RoomStateV3) (RoomStateV3, error) {
+	signature, err := signWire(privateKey, state.RoomID, state.toSign())
+	if err != nil {
+		return RoomStateV3{}, err
+	}
+	state.Signature = signature
+	return state, nil
+}
+
+func (s RoomStateV3) Verify() error {
+	return verifyWire(s.RoomID, s.Signature, s.toSign())
+}
+
+func (r InboxReceiptV1) toSign() InboxReceiptV1ToSign {
+	return InboxReceiptV1ToSign{
+		RelayKey: r.RelayKey, DMID: r.DMID, InboxID: r.InboxID, ExpireAt: r.ExpireAt,
+	}
+}
+
+func SignInboxReceiptV1(privateKey ed25519.PrivateKey, receipt InboxReceiptV1) (InboxReceiptV1, error) {
+	signature, err := signWire(privateKey, receipt.RelayKey, receipt.toSign())
+	if err != nil {
+		return InboxReceiptV1{}, err
+	}
+	receipt.Signature = signature
+	return receipt, nil
+}
+
+func (r InboxReceiptV1) Verify() error {
+	return verifyWire(r.RelayKey, r.Signature, r.toSign())
+}
+
+func SignInboxAuthV1(privateKey ed25519.PrivateKey, context InboxAuthV1ToSign) (InboxAuthV1, error) {
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return InboxAuthV1{}, ErrMalformedKey
+	}
+	auth := InboxAuthV1{
+		RecipientKey: copyBytes(privateKey.Public().(ed25519.PublicKey)),
+		Nonce:        copyBytes(context.Nonce),
+	}
+	if err := auth.validateContext(context); err != nil {
+		return InboxAuthV1{}, err
+	}
+	signature, err := signWire(privateKey, auth.RecipientKey, context)
+	if err != nil {
+		return InboxAuthV1{}, err
+	}
+	auth.Signature = signature
+	return auth, nil
+}
+
+func (a InboxAuthV1) validateContext(context InboxAuthV1ToSign) error {
+	inboxID, err := KeyID(a.RecipientKey)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(a.Nonce, context.Nonce) || !bytes.Equal(inboxID, context.InboxID) {
+		return fmt.Errorf("community: inbox auth does not match challenge context")
+	}
+	return nil
+}
+
+func (a InboxAuthV1) Verify(context InboxAuthV1ToSign) error {
+	if err := a.validateContext(context); err != nil {
+		return err
+	}
+	return verifyWire(a.RecipientKey, a.Signature, context)
+}

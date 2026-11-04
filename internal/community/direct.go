@@ -80,3 +80,28 @@ func (m DirectMessage) validateFields() error {
 	}
 	return nil
 }
+
+func (m DirectMessageV3) toSign() DirectMessageV3ToSign {
+	return DirectMessageV3ToSign{
+		FromKey: m.FromKey, ToKey: m.ToKey, AuthorName: m.AuthorName,
+		AuthorDomain: m.AuthorDomain, CreatedAt: m.CreatedAt,
+		ExpireAt: m.ExpireAt, Ciphertext: m.Ciphertext,
+	}
+}
+
+func SignDirectMessageV3(privateKey ed25519.PrivateKey, message DirectMessageV3) (DirectMessageV3, error) {
+	if len(privateKey) != ed25519.PrivateKeySize {
+		return DirectMessageV3{}, ErrMalformedKey
+	}
+	message.FromKey = copyBytes(privateKey.Public().(ed25519.PublicKey))
+	signature, err := signWire(privateKey, message.FromKey, message.toSign())
+	if err != nil {
+		return DirectMessageV3{}, err
+	}
+	message.Signature = signature
+	return message, nil
+}
+
+func (m DirectMessageV3) Verify() error {
+	return verifyWire(m.FromKey, m.Signature, m.toSign())
+}
