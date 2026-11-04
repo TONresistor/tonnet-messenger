@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,7 +111,43 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !schemaMigrated {
-				if _, err := db.Exec("DROP TABLE bans; DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (2, 0)"); err != nil {
+				// Build the singleton layout, preserving these local signed bytes.
+				tx, err := db.Begin()
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, table := range []string{"room_genesis", "room_state", "replica_head", "events", "messages", "pins", "roles", "request_nonces"} {
+					rows, err := tx.Query("SELECT * FROM " + table + " LIMIT 0")
+					if err != nil {
+						t.Fatal(err)
+					}
+					columns, err := rows.Columns()
+					rows.Close()
+					if err != nil {
+						t.Fatal(err)
+					}
+					selection := strings.Join(columns[1:], ",")
+					if table == "room_genesis" || table == "room_state" || table == "replica_head" {
+						selection = "1 AS singleton_id," + selection
+					}
+					if _, err := tx.Exec("CREATE TABLE fixture_" + table + " AS SELECT " + selection + " FROM " + table); err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, table := range []string{"pins", "request_nonces", "bans", "roles", "messages", "events", "replica_head", "room_state", "room_genesis"} {
+					if _, err := tx.Exec("DROP TABLE " + table); err != nil {
+						t.Fatal(err)
+					}
+					if table != "bans" {
+						if _, err := tx.Exec("ALTER TABLE fixture_" + table + " RENAME TO " + table); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+				if _, err := tx.Exec("DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (2,0)"); err != nil {
+					t.Fatal(err)
+				}
+				if err := tx.Commit(); err != nil {
 					t.Fatal(err)
 				}
 			}

@@ -18,7 +18,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
-const schemaVersion = 3
+const schemaVersion = 4
 
 var (
 	ErrAlreadyInitialized = errors.New("store: room is already initialized")
@@ -56,9 +56,11 @@ type CommitResult struct {
 }
 
 type Store struct {
-	db   *sql.DB
-	path string
-	mu   sync.Mutex
+	db     *sql.DB
+	path   string
+	mu     *sync.Mutex
+	roomID []byte
+	view   bool
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -97,7 +99,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	return &Store{db: db, path: path}, nil
+	return &Store{db: db, path: path, mu: &sync.Mutex{}}, nil
 }
 
 func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
@@ -121,109 +123,27 @@ func OpenReadOnly(ctx context.Context, path string) (*Store, error) {
 			return nil, fmt.Errorf("store: %s: %w", pragma, err)
 		}
 	}
-	return &Store{db: db, path: abs}, nil
+	var version int
+	if err := db.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0) FROM schema_migrations").Scan(&version); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if version > schemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("store: database schema %d is newer than supported version %d", version, schemaVersion)
+	}
+	if version != schemaVersion {
+		db.Close()
+		return nil, fmt.Errorf("%w: schema %d", ErrMigrationRequired, version)
+	}
+	return &Store{db: db, path: abs, mu: &sync.Mutex{}}, nil
 }
 
-func (s *Store) Close() error { return s.db.Close() }
-
-func migrate(ctx context.Context, db *sql.DB) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+func (s *Store) Close() error {
+	if s.view {
+		return nil
 	}
-	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS room_genesis (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-    raw_tl BLOB NOT NULL,
-    genesis_hash BLOB NOT NULL UNIQUE CHECK (length(genesis_hash) = 32),
-    room_key BLOB NOT NULL CHECK (length(room_key) = 32),
-    node_key BLOB NOT NULL CHECK (length(node_key) = 32),
-    created_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS room_state (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-    revision_seqno INTEGER NOT NULL,
-    revision_hash BLOB NOT NULL CHECK (length(revision_hash) = 32),
-    raw_signed_state BLOB NOT NULL,
-    name TEXT NOT NULL,
-    description TEXT NOT NULL,
-    anyone_can_write INTEGER NOT NULL CHECK (anyone_can_write IN (0, 1))
-);
-CREATE TABLE IF NOT EXISTS replica_head (
-    singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
-    latest_seqno INTEGER NOT NULL,
-    latest_hash BLOB NOT NULL CHECK (length(latest_hash) = 32)
-);
-CREATE TABLE IF NOT EXISTS events (
-    seqno INTEGER PRIMARY KEY,
-    event_id BLOB NOT NULL UNIQUE CHECK (length(event_id) = 32),
-    commit_hash BLOB NOT NULL UNIQUE CHECK (length(commit_hash) = 32),
-    previous_hash BLOB NOT NULL CHECK (length(previous_hash) = 32),
-    author_key BLOB NOT NULL CHECK (length(author_key) = 32),
-    body_type TEXT NOT NULL,
-    raw_proposal BLOB NOT NULL,
-    raw_commit BLOB NOT NULL,
-    committed_at INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS messages (
-    message_id INTEGER PRIMARY KEY,
-    creation_seqno INTEGER NOT NULL UNIQUE,
-    author_key BLOB NOT NULL CHECK (length(author_key) = 32),
-    nick TEXT NOT NULL,
-    text TEXT NOT NULL,
-    client_ts INTEGER NOT NULL,
-    committed_at INTEGER NOT NULL,
-    raw_commit BLOB NOT NULL
-);
-CREATE TABLE IF NOT EXISTS pins (
-    message_id INTEGER PRIMARY KEY REFERENCES messages(message_id),
-    pinned_seqno INTEGER NOT NULL,
-    pinned_by BLOB NOT NULL CHECK (length(pinned_by) = 32)
-);
-CREATE TABLE IF NOT EXISTS roles (
-    subject_key BLOB NOT NULL CHECK (length(subject_key) = 32),
-    role TEXT NOT NULL CHECK (role IN ('admin', 'moderator')),
-    granted_seqno INTEGER NOT NULL,
-    granted_by BLOB NOT NULL CHECK (length(granted_by) = 32),
-    PRIMARY KEY(subject_key, role)
-);
-CREATE TABLE IF NOT EXISTS bans (
-    subject_key BLOB PRIMARY KEY CHECK(length(subject_key)=32),
-    banned_seqno INTEGER NOT NULL,
-    banned_by BLOB NOT NULL CHECK(length(banned_by)=32)
-);
-CREATE TABLE IF NOT EXISTS request_nonces (
-    author_key BLOB NOT NULL CHECK (length(author_key) = 32),
-    nonce BLOB NOT NULL CHECK (length(nonce) = 32),
-    accepted_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    PRIMARY KEY(author_key, nonce)
-);
-CREATE INDEX IF NOT EXISTS idx_events_event_id ON events(event_id);
-CREATE INDEX IF NOT EXISTS idx_messages_creation ON messages(creation_seqno);
-CREATE INDEX IF NOT EXISTS idx_nonces_expiry ON request_nonces(expires_at);
-CREATE INDEX IF NOT EXISTS idx_events_state_change ON events(seqno DESC) WHERE body_type <> 'message';
-`); err != nil {
-		return fmt.Errorf("store: migrate schema: %w", err)
-	}
-	var currentVersion int
-	if err := tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM schema_migrations").Scan(&currentVersion); err != nil {
-		return err
-	}
-	if currentVersion > schemaVersion {
-		return fmt.Errorf("store: database schema %d is newer than supported version %d", currentVersion, schemaVersion)
-	}
-	if _, err := tx.ExecContext(ctx,
-		"INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-		schemaVersion, time.Now().Unix()); err != nil {
-		return err
-	}
-	return tx.Commit()
+	return s.db.Close()
 }
 
 func (s *Store) Initialize(ctx context.Context, genesis community.Genesis, roomPrivate ed25519.PrivateKey) error {
@@ -256,34 +176,34 @@ func (s *Store) Initialize(ctx context.Context, genesis community.Genesis, roomP
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginRoom(ctx, genesis.RoomKey)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var exists int
-	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM room_genesis").Scan(&exists); err != nil {
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM room_genesis WHERE room_id=?", tx.roomID).Scan(&exists); err != nil {
 		return err
 	}
 	if exists != 0 {
 		return ErrAlreadyInitialized
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO room_genesis
-(singleton_id, raw_tl, genesis_hash, room_key, node_key, created_at)
-VALUES (1, ?, ?, ?, ?, ?)`, rawGenesis, genesisHash, genesis.RoomKey, genesis.NodeKey, genesis.CreatedAt); err != nil {
+(room_id, raw_tl, genesis_hash, room_key, node_key, created_at)
+VALUES (?, ?, ?, ?, ?, ?)`, tx.roomID, rawGenesis, genesisHash, genesis.RoomKey, genesis.NodeKey, genesis.CreatedAt); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO room_state
-(singleton_id, revision_seqno, revision_hash, raw_signed_state, name, description, anyone_can_write)
-VALUES (1, 0, ?, ?, ?, ?, ?)`, genesisHash, rawState, genesis.Name, genesis.Description, boolInt(genesis.WritePolicy.AnyoneCanWrite)); err != nil {
+(room_id, revision_seqno, revision_hash, raw_signed_state, name, description, anyone_can_write)
+VALUES (?, 0, ?, ?, ?, ?, ?)`, tx.roomID, genesisHash, rawState, genesis.Name, genesis.Description, boolInt(genesis.WritePolicy.AnyoneCanWrite)); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO replica_head(singleton_id, latest_seqno, latest_hash) VALUES (1, 0, ?)", community.Zero256()); err != nil {
+	if _, err := tx.ExecContext(ctx, "INSERT INTO replica_head(room_id, latest_seqno, latest_hash) VALUES (?, 0, ?)", tx.roomID, community.Zero256()); err != nil {
 		return err
 	}
 	for _, admin := range genesis.InitialAdmins {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO roles(subject_key, role, granted_seqno, granted_by)
-VALUES (?, 'admin', 0, ?)`, admin, genesis.RoomKey); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO roles(room_id, subject_key, role, granted_seqno, granted_by)
+VALUES (?, ?, 'admin', 0, ?)`, tx.roomID, admin, genesis.RoomKey); err != nil {
 			return err
 		}
 	}
@@ -291,18 +211,12 @@ VALUES (?, 'admin', 0, ?)`, admin, genesis.RoomKey); err != nil {
 }
 
 func (s *Store) Genesis(ctx context.Context) (community.Genesis, []byte, error) {
-	var raw, hash []byte
-	if err := s.db.QueryRowContext(ctx, "SELECT raw_tl, genesis_hash FROM room_genesis WHERE singleton_id=1").Scan(&raw, &hash); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return community.Genesis{}, nil, ErrNotInitialized
-		}
-		return community.Genesis{}, nil, err
-	}
-	g, err := community.DecodeGenesis(raw)
+	tx, err := s.beginRoom(ctx, nil)
 	if err != nil {
 		return community.Genesis{}, nil, err
 	}
-	return g, hash, nil
+	defer tx.Rollback()
+	return genesisTx(ctx, tx)
 }
 
 func (s *Store) ValidateGenesis(ctx context.Context, genesis community.Genesis) error {
@@ -325,19 +239,22 @@ func (s *Store) ValidateGenesis(ctx context.Context, genesis community.Genesis) 
 }
 
 func (s *Store) State(ctx context.Context) (community.RoomStateV3, error) {
-	var raw []byte
-	if err := s.db.QueryRowContext(ctx, "SELECT raw_signed_state FROM room_state WHERE singleton_id=1").Scan(&raw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return community.RoomStateV3{}, ErrNotInitialized
-		}
+	tx, err := s.beginRoom(ctx, nil)
+	if err != nil {
 		return community.RoomStateV3{}, err
 	}
-	return community.DecodeRoomStateV3(raw)
+	defer tx.Rollback()
+	return stateTx(ctx, tx)
 }
 
 func (s *Store) Head(ctx context.Context) (Head, error) {
 	var head Head
-	if err := s.db.QueryRowContext(ctx, "SELECT latest_seqno, latest_hash FROM replica_head WHERE singleton_id=1").Scan(&head.Seqno, &head.Hash); err != nil {
+	tx, err := s.beginRoom(ctx, nil)
+	if err != nil {
+		return head, err
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRowContext(ctx, "SELECT latest_seqno, latest_hash FROM replica_head WHERE room_id=?", tx.roomID).Scan(&head.Seqno, &head.Hash); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Head{}, ErrNotInitialized
 		}

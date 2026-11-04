@@ -23,7 +23,12 @@ func (s *Store) Events(ctx context.Context, afterSeqno int64, limit int) (commun
 	if err != nil {
 		return community.EventList{}, err
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT raw_commit FROM events WHERE seqno>? ORDER BY seqno ASC LIMIT ?", afterSeqno, limit+1)
+	tx, err := s.beginRoom(ctx, nil)
+	if err != nil {
+		return community.EventList{}, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, "SELECT raw_commit FROM events WHERE seqno>? AND room_id=? ORDER BY seqno ASC LIMIT ?", afterSeqno, tx.roomID, limit+1)
 	if err != nil {
 		return community.EventList{}, err
 	}
@@ -54,17 +59,22 @@ func (s *Store) messagesBefore(ctx context.Context, messageID int64, limit int, 
 	if err != nil {
 		return community.MessageList{}, err
 	}
+	tx, err := s.beginRoom(ctx, nil)
+	if err != nil {
+		return community.MessageList{}, err
+	}
+	defer tx.Rollback()
 	query := `SELECT raw_commit FROM (
-SELECT message_id, raw_commit FROM messages ORDER BY message_id DESC LIMIT ?
+SELECT message_id, raw_commit FROM messages WHERE room_id=? ORDER BY message_id DESC LIMIT ?
 ) ORDER BY message_id ASC`
-	args := []any{limit + 1}
+	args := []any{tx.roomID, limit + 1}
 	if !recent {
 		query = `SELECT raw_commit FROM (
-SELECT message_id, raw_commit FROM messages WHERE message_id<? ORDER BY message_id DESC LIMIT ?
+SELECT message_id, raw_commit FROM messages WHERE message_id<? AND room_id=? ORDER BY message_id DESC LIMIT ?
 ) ORDER BY message_id ASC`
-		args = []any{messageID, limit + 1}
+		args = []any{messageID, tx.roomID, limit + 1}
 	}
-	rows, err := s.db.QueryContext(ctx, query, args...)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return community.MessageList{}, err
 	}

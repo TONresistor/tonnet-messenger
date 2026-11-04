@@ -565,7 +565,7 @@ func legacySnapshot(t *testing.T, f *fixture) (community.RoomStateV3, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.store.db.ExecContext(f.ctx, "UPDATE room_state SET raw_signed_state=?", raw); err != nil {
+	if _, err := f.store.db.ExecContext(f.ctx, "UPDATE room_state SET raw_signed_state=? WHERE room_id=?", raw, f.genesis.RoomKey); err != nil {
 		t.Fatal(err)
 	}
 	return state, raw
@@ -631,9 +631,7 @@ func TestUpgradeRoomStatePreservesHistoryAndRecovers(t *testing.T) {
 			want, rawLegacy := legacySnapshot(t, f)
 			before := preservedRoomRows(t, f.store)
 			if !schemaMigrated {
-				if _, err := f.store.db.Exec("DROP TABLE bans; DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (2, 0)"); err != nil {
-					t.Fatal(err)
-				}
+				legacyLayout(t, f.store.db, 2)
 			}
 			if err := f.store.Close(); err != nil {
 				t.Fatal(err)
@@ -778,13 +776,13 @@ func TestUpgradeRoomStateRejectsInvalidLegacyDataAtomically(t *testing.T) {
 			case "metadata":
 				query = "UPDATE room_state SET name='Forged'"
 			case "roles":
-				query, args = "INSERT INTO roles VALUES (?, 'admin', 0, ?)", []any{f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
+				query, args = "INSERT INTO roles VALUES (?, ?, 'admin', 0, ?)", []any{f.genesis.RoomKey, f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
 			case "pins":
-				query, args = "INSERT INTO pins VALUES (1, 1, ?)", []any{f.genesis.RoomKey}
+				query, args = "INSERT INTO pins VALUES (?, 1, 1, ?)", []any{f.genesis.RoomKey, f.genesis.RoomKey}
 			case "messages":
 				query = "UPDATE messages SET raw_commit=x'010203'"
 			case "bans":
-				query, args = "INSERT INTO bans VALUES (?, 1, ?)", []any{f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
+				query, args = "INSERT INTO bans VALUES (?, ?, 1, ?)", []any{f.genesis.RoomKey, f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
 			case "revision_columns":
 				query = "UPDATE room_state SET revision_seqno=1"
 			case "wrong_key":
