@@ -64,7 +64,7 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 	for {
 		var page community.EventList
 		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := client.peer.Query(queryCtx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		err := client.peer.QueryRoom(queryCtx, cfg.RoomID, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return Result{}, fmt.Errorf("replica: get events after %d: %w", head.Seqno, err)
@@ -87,7 +87,7 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 	}
 	var stateResult community.RoomStateResult
 	stateCtx, stateCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = client.peer.Query(stateCtx, community.GetRoomState{}, &stateResult)
+	err = client.peer.QueryRoom(stateCtx, cfg.RoomID, community.GetRoomState{}, &stateResult)
 	stateCancel()
 	if err != nil {
 		return Result{}, fmt.Errorf("replica: get room state: %w", err)
@@ -177,11 +177,16 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 			return nil, nil, err
 		}
 	}
+	return connectTargets(ctx, cfg, database, requireSequencer, targets)
+}
+
+func connectTargets(ctx context.Context, cfg Config, database *store.Store, requireSequencer bool, targets []target) (*connected, func(), error) {
 	gateway, err := roomnet.NewGateway(cfg.NodeKey)
 	if err != nil {
 		return nil, nil, err
 	}
 	closeClient := func() { gateway.Close() }
+	var lastQueryError error
 	for _, candidate := range targets {
 		peer, err := gateway.DialDefault(ctx, candidate.public, candidate.address)
 		if err != nil {
@@ -190,10 +195,13 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 		wrapper := roomnet.Wrap(peer)
 		var genesis community.Genesis
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
-		queryErr := wrapper.Query(queryCtx, community.GetRoomGenesis{}, &genesis)
+		queryErr := wrapper.QueryRoom(queryCtx, cfg.RoomID, community.GetRoomGenesis{}, &genesis)
 		queryCancel()
 		if queryErr != nil || genesis.Verify(time.Now()) != nil || !bytes.Equal(genesis.RoomKey, cfg.RoomID) ||
 			(requireSequencer && !bytes.Equal(genesis.NodeKey, candidate.public)) {
+			if queryErr != nil {
+				lastQueryError = queryErr
+			}
 			peer.Close()
 			continue
 		}
@@ -206,6 +214,9 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 		return &connected{genesis: genesis, peer: wrapper, done: wrapper.Done()}, closeClient, nil
 	}
 	closeClient()
+	if lastQueryError != nil {
+		return nil, nil, fmt.Errorf("replica: no live room endpoint: %w", lastQueryError)
+	}
 	if !requireSequencer {
 		return nil, nil, fmt.Errorf("replica: no live room endpoint")
 	}

@@ -14,6 +14,7 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 const maxLineBytes = 64 * 1024
@@ -537,14 +538,23 @@ func classify(err error) *rpcError {
 	numeric := -32000
 	message := err.Error()
 	var rejected *client.RejectedError
-	if errors.As(err, &rejected) {
-		if rejected.Code < community.RejectMalformedRequest || rejected.Code > community.RejectInvalidIdentityDomain {
+	var overlay *roomnet.OverlayRejection
+	if errors.As(err, &overlay) {
+		if errors.Is(err, roomnet.ErrMalformedAnswer) {
+			return &rpcError{Code: -32034, Message: message, Data: map[string]any{"code": "PROTOCOL_ERROR"}}
+		}
+		rejected = &client.RejectedError{Code: overlay.Code, Message: overlay.Message}
+	}
+	if rejected != nil || errors.As(err, &rejected) {
+		if rejected.Code < community.RejectMalformedRequest || rejected.Code > community.RejectOverlayNotServed {
 			return &rpcError{Code: -32034, Message: message, Data: map[string]any{"code": "PROTOCOL_ERROR"}}
 		}
 		numeric = -32010 - int(rejected.Code)
 		switch rejected.Code {
-		case community.RejectPermissionDenied:
+		case community.RejectPermissionDenied, community.RejectInboxAuthenticationFailed:
 			code = "PERMISSION_DENIED"
+		case community.RejectOverlayNotServed:
+			code = "ROOM_UNAVAILABLE"
 		case community.RejectSequencerUnavailable:
 			code = "SEQUENCER_UNAVAILABLE"
 		case community.RejectInvalidIdentityDomain:
@@ -553,7 +563,7 @@ func classify(err error) *rpcError {
 			code = "UNKNOWN_MESSAGE"
 		case community.RejectRoleConflict:
 			code = "ROLE_CONFLICT"
-		case community.RejectLimitExceeded:
+		case community.RejectLimitExceeded, community.RejectRelayFullOrQuotaExceeded, community.RejectInsufficientPrepaidBalance:
 			code = "LIMIT_EXCEEDED"
 		default:
 			code = "ROOM_REJECTED"

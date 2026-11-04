@@ -53,6 +53,9 @@ func TestSubmitRejectsUnrelatedCommit(t *testing.T) {
 	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
+			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {
+				return err
+			}
 			switch query.Data.(type) {
 			case community.GetRoomGenesis:
 				return query.Answer(genesis)
@@ -186,4 +189,12 @@ func TestClientRejectsNonemptyBroadcastCertificate(t *testing.T) {
 		default:
 		}
 	}
+}
+
+func selectTestRoomQuery(query *roomnet.Query, roomKey []byte) (bool, error) {
+	id, err := community.OverlayID(roomKey)
+	if err != nil {
+		return false, err
+	}
+	return query.SelectOverlay(id)
 }

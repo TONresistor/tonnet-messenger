@@ -160,7 +160,7 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 	}
 	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
-	nodes, err := p.conn.GetRandomPeers(gctx)
+	nodes, err := p.conn.GetRandomPeers(gctx, n.cfg.OverlayID)
 	if err != nil {
 		n.peerFailure(p, time.Now(), "peer probe failed")
 		return nil, false
@@ -207,6 +207,10 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 	if !n.queries.allow() {
 		n.stats.queryRateDrops.Add(1)
 		return nil
+	}
+	selected, err := q.SelectOverlay(n.cfg.OverlayID)
+	if err != nil || !selected {
+		return err
 	}
 	var advertised tonoverlay.NodesList
 	switch req := q.Data.(type) {

@@ -231,6 +231,9 @@ func TestReconnectRecoversStateWithoutRewindingHistory(t *testing.T) {
 	server.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
+			if selected, err := selectTestRoomQuery(query, f.genesis.RoomKey); err != nil || !selected {
+				return err
+			}
 			switch request := query.Data.(type) {
 			case community.GetEvents:
 				cursors <- request.AfterSeqno
@@ -383,6 +386,9 @@ func TestClientReplacesCachedV2WithVerifiedV3AtSameRevision(t *testing.T) {
 	server.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
+			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {
+				return err
+			}
 			switch request := query.Data.(type) {
 			case community.GetEvents:
 				cursors <- request.AfterSeqno

@@ -938,7 +938,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	for {
 		var page community.EventList
 		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		err := session.Peer.Query(queryCtx, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: community.MaxPageLimit}, &page)
+		err := session.Peer.QueryRoom(queryCtx, r.key, community.GetEvents{AfterSeqno: record.HeadSeqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
@@ -980,7 +980,7 @@ func (r *roomHandle) syncSessionLocked(ctx context.Context, session *replica.Ses
 	}
 	var state community.RoomStateResult
 	stateCtx, stateCancel := context.WithTimeout(ctx, 10*time.Second)
-	err = session.Peer.Query(stateCtx, community.GetRoomState{}, &state)
+	err = session.Peer.QueryRoom(stateCtx, r.key, community.GetRoomState{}, &state)
 	stateCancel()
 	if err != nil {
 		if errors.Is(err, roomnet.ErrMalformedAnswer) {
@@ -1246,7 +1246,7 @@ func (r *roomHandle) refreshStateLocked(ctx context.Context, session *replica.Se
 	}
 	var state community.RoomStateResult
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err := session.Peer.Query(queryCtx, community.GetRoomState{}, &state)
+	err := session.Peer.QueryRoom(queryCtx, r.key, community.GetRoomState{}, &state)
 	cancel()
 	if err != nil {
 		if errors.Is(err, roomnet.ErrMalformedAnswer) {

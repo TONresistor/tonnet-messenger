@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
 	"net"
 	"path/filepath"
 	"sync/atomic"
@@ -20,16 +21,22 @@ import (
 )
 
 type pendingFixture struct {
-	room     ed25519.PrivateKey
-	genesis  community.Genesis
-	database *store.Store
-	address  string
-	mode     atomic.Int32
-	submits  atomic.Int32
-	proposal chan community.EventProposal
+	room        ed25519.PrivateKey
+	endpoint    ed25519.PublicKey
+	overlayCode atomic.Int32
+	genesis     community.Genesis
+	database    *store.Store
+	address     string
+	mode        atomic.Int32
+	submits     atomic.Int32
+	proposal    chan community.EventProposal
 }
 
 func newPendingFixture(t *testing.T) *pendingFixture {
+	return newPendingEndpoint(t, false)
+}
+
+func newPendingEndpoint(t *testing.T, relayed bool) *pendingFixture {
 	t.Helper()
 	roomKey, nodeKey := clientTestPrivateKey(t), clientTestPrivateKey(t)
 	genesis, err := community.NewGenesis(roomKey, nodeKey, time.Now(), "Pending", "", true, nil)
@@ -45,13 +52,21 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 		t.Fatal(err)
 	}
 	fixture := &pendingFixture{room: roomKey, genesis: genesis, database: database, proposal: make(chan community.EventProposal, 8)}
-	gateway, err := roomnet.NewGateway(nodeKey)
+	endpointKey := nodeKey
+	if relayed {
+		endpointKey = clientTestPrivateKey(t)
+	}
+	fixture.endpoint = endpointKey.Public().(ed25519.PublicKey)
+	gateway, err := roomnet.NewGateway(endpointKey)
 	if err != nil {
 		t.Fatal(err)
 	}
 	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
+			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {
+				return err
+			}
 			ctx := context.Background()
 			switch request := query.Data.(type) {
 			case community.GetRoomGenesis:
@@ -88,6 +103,9 @@ func newPendingFixture(t *testing.T) *pendingFixture {
 			case community.SubmitEvent:
 				fixture.submits.Add(1)
 				fixture.proposal <- request.Proposal
+				if code := fixture.overlayCode.Load(); code != 0 {
+					return query.Answer(community.OverlayRejectedV1{Code: code, Message: "wrapper rejected"})
+				}
 				if fixture.mode.Load() == 2 {
 					return query.Answer(community.SubmitRejected{Code: community.RejectPermissionDenied, Message: "denied"})
 				}
@@ -142,7 +160,7 @@ func (fixture *pendingFixture) connect(t *testing.T, stateDir string) (*Client, 
 	if err := instance.store.addRoom(ctx, fixture.genesis.RoomKey, keyText(fixture.genesis.RoomKey), nil); err != nil {
 		t.Fatal(err)
 	}
-	session, err := replica.DialRoom(ctx, replica.Config{RoomID: fixture.genesis.RoomKey, NodeKey: instance.key, DirectAddress: fixture.address, DirectPublic: ed25519.PublicKey(fixture.genesis.NodeKey)})
+	session, err := replica.DialRoom(ctx, replica.Config{RoomID: fixture.genesis.RoomKey, NodeKey: instance.key, DirectAddress: fixture.address, DirectPublic: fixture.endpoint})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,5 +318,95 @@ func TestV2StateDuringMutationIsProtocolErrorAndKeepsCommit(t *testing.T) {
 	pending, err := instance.GetPending(context.Background(), keyText(fixture.genesis.RoomKey))
 	if err != nil || pending == nil || pending.Status != "committed" {
 		t.Fatalf("pending=%#v err=%v", pending, err)
+	}
+}
+
+func TestWrapperRejectionsPreserveSubmissionJournal(t *testing.T) {
+	for _, code := range []int32{community.RejectMalformedRequest, community.RejectOverlayNotServed} {
+		for _, relayed := range []bool{false, true} {
+			for _, retried := range []bool{false, true} {
+				t.Run(fmt.Sprintf("code%d_relay%v_retry%v", code, relayed, retried), func(t *testing.T) {
+					f := newPendingEndpoint(t, relayed)
+					instance, handle := f.connect(t, t.TempDir())
+					ctx := context.Background()
+					room := keyText(f.genesis.RoomKey)
+					// Calibrate this session using the existing clock cache. These
+					// tests exercise submission outcomes, independently of discovery.
+					handle.clockMu.Lock()
+					handle.clockSession = handle.session
+					handle.clockEpoch = handle.sessionEpoch
+					handle.clockRemote = time.Now().Unix()
+					handle.clockCalibrated = time.Now()
+					handle.clockMu.Unlock()
+					var original community.EventProposal
+					if retried {
+						f.mode.Store(1)
+						_, err := instance.SendMessage(ctx, room, "exact proposal")
+						var uncertain *OperationError
+						if !errors.As(err, &uncertain) || uncertain.Code != "SEND_UNCERTAIN" {
+							t.Fatalf("first attempt: %v", err)
+						}
+						original = <-f.proposal
+						f.mode.Store(0)
+					}
+					f.overlayCode.Store(code)
+					var err error
+					if retried {
+						pending, e := instance.GetPending(ctx, room)
+						if e != nil || pending == nil {
+							t.Fatalf("missing pending: %v", e)
+						}
+						_, err = instance.RetryPending(ctx, room, pending.EventID)
+					} else {
+						_, err = instance.SendMessage(ctx, room, "exact proposal")
+					}
+					got := <-f.proposal
+					if retried {
+						before, _ := community.Encode(original)
+						after, _ := community.Encode(got)
+						if !bytes.Equal(before, after) {
+							t.Fatal("wrapper retry changed proposal bytes")
+						}
+					}
+					pending, e := instance.GetPending(ctx, room)
+					if e != nil {
+						t.Fatal(e)
+					}
+					var rejected *RejectedError
+					if !errors.As(err, &rejected) || rejected.Code != code {
+						t.Fatalf("wire code lost: %v", err)
+					}
+					var uncertain *OperationError
+					if !relayed && !retried {
+						if errors.As(err, &uncertain) || pending != nil {
+							t.Fatalf("definitive wrapper rejection retained journal: %+v %v", pending, err)
+						}
+					} else {
+						if !errors.As(err, &uncertain) || uncertain.Code != "SEND_UNCERTAIN" || uncertain.Room != room || pending == nil || uncertain.EventID != pending.EventID {
+							t.Fatalf("uncertain rejection lost journal metadata: %+v %v", pending, err)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestInvalidWrapperRejectionsAreProtocolErrorsAndKeepJournal(t *testing.T) {
+	for _, code := range []int32{2, 20} {
+		t.Run(fmt.Sprint(code), func(t *testing.T) {
+			f := newPendingFixture(t)
+			instance, _ := f.connect(t, t.TempDir())
+			f.overlayCode.Store(code)
+			room := keyText(f.genesis.RoomKey)
+			_, err := instance.SendMessage(context.Background(), room, "unknown wrapper code")
+			var failure *OperationError
+			if !errors.As(err, &failure) || failure.Code != "PROTOCOL_ERROR" {
+				t.Fatalf("invalid wrapper code: %v", err)
+			}
+			if pending, e := instance.GetPending(context.Background(), room); e != nil || pending == nil {
+				t.Fatalf("protocol error lost journal: %+v %v", pending, e)
+			}
+		})
 	}
 }

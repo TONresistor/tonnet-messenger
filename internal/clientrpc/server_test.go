@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"path/filepath"
@@ -272,6 +273,13 @@ func TestRoomJoinRejectsV2StateAsProtocolError(t *testing.T) {
 			gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 				peer := roomnet.Wrap(raw)
 				peer.SetQueryHandler(func(query *roomnet.Query) error {
+					id, err := community.OverlayID(genesis.RoomKey)
+					if err != nil {
+						return err
+					}
+					if selected, err := query.SelectOverlay(id); err != nil || !selected {
+						return err
+					}
 					switch query.Data.(type) {
 					case community.GetRoomGenesis:
 						return query.Answer(genesis)
@@ -524,6 +532,29 @@ func TestBanRejectionCodesReachClientAPI(t *testing.T) {
 		got := classify(&client.RejectedError{Code: test.wire, Message: "rejected"})
 		if got.Code != test.numeric || got.Data["code"] != test.code {
 			t.Fatalf("wire %d=%#v", test.wire, got)
+		}
+	}
+}
+
+func TestV050WireAndWrapperErrorMapping(t *testing.T) {
+	for _, test := range []struct {
+		wire   int32
+		symbol string
+	}{{16, "LIMIT_EXCEEDED"}, {17, "LIMIT_EXCEEDED"}, {18, "PERMISSION_DENIED"}, {19, "ROOM_UNAVAILABLE"}} {
+		got := classify(&client.RejectedError{Code: test.wire, Message: "wire rejected"})
+		if got.Code != -32010-int(test.wire) || got.Data["code"] != test.symbol {
+			t.Fatalf("code %d: %+v", test.wire, got)
+		}
+	}
+	for _, code := range []int32{1, 19} {
+		got := classify(&roomnet.OverlayRejection{OverlayRejectedV1: community.OverlayRejectedV1{Code: code, Message: "wrapper rejected"}})
+		if got.Code != -32010-int(code) {
+			t.Fatalf("wrapper code %d: %+v", code, got)
+		}
+	}
+	for _, err := range []error{&client.RejectedError{Code: 20, Message: "future code"}, fmt.Errorf("%w: %w", roomnet.ErrMalformedAnswer, &roomnet.OverlayRejection{OverlayRejectedV1: community.OverlayRejectedV1{Code: 2}})} {
+		if got := classify(err); got.Code != -32034 || got.Data["code"] != "PROTOCOL_ERROR" {
+			t.Fatalf("invalid rejection: %+v", got)
 		}
 	}
 }

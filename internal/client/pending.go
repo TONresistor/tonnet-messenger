@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 type OperationError struct {
@@ -237,8 +238,17 @@ func (instance *Client) sendPending(ctx context.Context, handle *roomHandle, sna
 	}
 	var response any
 	queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	err = snapshot.session.Peer.Query(queryCtx, community.SubmitEvent{Proposal: pending.Proposal}, &response)
+	err = snapshot.session.Peer.QueryRoom(queryCtx, handle.key, community.SubmitEvent{Proposal: pending.Proposal}, &response)
 	cancel()
+	var overlay *roomnet.OverlayRejection
+	if errors.As(err, &overlay) {
+		if errors.Is(err, roomnet.ErrMalformedAnswer) {
+			handle.closeSessionIf(snapshot.session)
+			return nil, failure("PROTOCOL_ERROR", err)
+		}
+		response = community.SubmitRejected{Code: overlay.Code, Message: overlay.Message}
+		err = nil
+	}
 	if err != nil {
 		if current, lookupErr := instance.store.pendingOperation(ctx, handle.key); lookupErr == nil && current != nil && current.Commit != nil {
 			return finish(*current.Commit)
@@ -252,7 +262,7 @@ func (instance *Client) sendPending(ctx context.Context, handle *roomHandle, sna
 		return finish(result.Event)
 	case community.SubmitRejected:
 		rejection := &RejectedError{Code: result.Code, Message: result.Message}
-		if result.Code < community.RejectMalformedRequest || result.Code > community.RejectInvalidIdentityDomain {
+		if result.Code < community.RejectMalformedRequest || result.Code > community.RejectOverlayNotServed {
 			handle.closeSessionIf(snapshot.session)
 			return nil, failure("PROTOCOL_ERROR", rejection)
 		}

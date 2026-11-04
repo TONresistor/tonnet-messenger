@@ -78,20 +78,28 @@ func Wrap(raw *quic.Peer) *Peer {
 }
 
 func (p *Peer) Query(ctx context.Context, request, result any) error {
+	answer, err := p.query(ctx, request)
+	if err != nil {
+		return err
+	}
+	return decodeAnswer(answer, result)
+}
+
+func (p *Peer) query(ctx context.Context, request any) ([]byte, error) {
 	if p == nil || p.raw == nil {
-		return quic.ErrPeerClosed
+		return nil, quic.ErrPeerClosed
 	}
 	payload, err := tl.Serialize(request, true)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if len(payload) > MaxWireObjectSize {
-		return fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
+		return nil, fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
 	}
-	answer, err := p.raw.Query(ctx, payload, quic.DefaultMaxObjectSize)
-	if err != nil {
-		return err
-	}
+	return p.raw.Query(ctx, payload, quic.DefaultMaxObjectSize)
+}
+
+func decodeAnswer(answer []byte, result any) error {
 	if err := decodeInto(answer, result); err != nil {
 		return fmt.Errorf("%w: %w", ErrMalformedAnswer, err)
 	}
@@ -112,9 +120,9 @@ func (p *Peer) SendMessage(ctx context.Context, message any) error {
 	return p.raw.SendMessage(ctx, payload)
 }
 
-func (p *Peer) GetRandomPeers(ctx context.Context) ([]overlay.Node, error) {
+func (p *Peer) GetRandomPeers(ctx context.Context, overlayID []byte) ([]overlay.Node, error) {
 	var result overlay.NodesList
-	if err := p.Query(ctx, overlay.GetRandomPeers{}, &result); err != nil {
+	if err := p.QueryOverlay(ctx, overlayID, overlay.GetRandomPeers{}, &result); err != nil {
 		return nil, err
 	}
 	return result.List, nil

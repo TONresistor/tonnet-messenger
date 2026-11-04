@@ -151,9 +151,13 @@ func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community
 	}
 	var response any
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := sequencer.conn.Query(ctx, request, &response)
+	err := sequencer.conn.QueryRoom(ctx, n.genesis.RoomKey, request, &response)
 	cancel()
 	if err != nil {
+		var rejected *roomnet.OverlayRejection
+		if errors.As(err, &rejected) && !errors.Is(err, roomnet.ErrMalformedAnswer) {
+			return n.answer(leaf, query, rejected.OverlayRejectedV1)
+		}
 		return err
 	}
 	var committed *community.CommittedEvent
@@ -258,7 +262,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 	for {
 		var page community.EventList
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := source.conn.Query(ctx, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		err := source.conn.QueryRoom(ctx, n.genesis.RoomKey, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
@@ -289,7 +293,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 func (n *Node) installStateFromPeer(source *peer) error {
 	var result community.RoomStateResult
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := source.conn.Query(ctx, community.GetRoomState{}, &result)
+	err := source.conn.QueryRoom(ctx, n.genesis.RoomKey, community.GetRoomState{}, &result)
 	cancel()
 	if err != nil {
 		return err

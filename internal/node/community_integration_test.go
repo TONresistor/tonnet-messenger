@@ -164,7 +164,7 @@ func TestTONQUICClientReadsFromVerifiedRelay(t *testing.T) {
 	}
 	defer session.Close()
 	var result community.RoomStateResult
-	if err := session.Peer.Query(ctx, community.GetRoomState{}, &result); err != nil {
+	if err := session.Peer.QueryRoom(ctx, genesis.RoomKey, community.GetRoomState{}, &result); err != nil {
 		t.Fatal(err)
 	}
 	if result.Stats.NodeRole != community.NodeRoleRelay || !result.Stats.Ready {
@@ -255,7 +255,7 @@ func TestRelayInstallsStateReceivedFromAnotherVerifiedRelay(t *testing.T) {
 	sourcePeer := newPeer("source", kindNode, session.Peer, nil)
 	sourcePeer.state = peerHealthy
 	destinationPeers.m[sourcePeer.id] = sourcePeer
-	destination := &Node{store: destinationStore, peers: destinationPeers}
+	destination := &Node{genesis: genesis, store: destinationStore, peers: destinationPeers}
 	if err := destination.persistReplicaEvent(sourcePeer, committed.Event); err != nil {
 		t.Fatal(err)
 	}
@@ -414,7 +414,7 @@ func TestIdentityQUICAuthorsProposalWithoutBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	var response any
-	if err := session.Peer.Query(ctx, community.SubmitEvent{Proposal: proposal}, &response); err != nil {
+	if err := session.Peer.QueryRoom(ctx, genesis.RoomKey, community.SubmitEvent{Proposal: proposal}, &response); err != nil {
 		t.Fatal(err)
 	}
 	accepted, ok := response.(community.SubmitAccepted)
@@ -433,7 +433,7 @@ func TestIdentityQUICAuthorsProposalWithoutBinding(t *testing.T) {
 		t.Fatal(err)
 	}
 	response = nil
-	if err := session.Peer.Query(ctx, community.SubmitEvent{Proposal: forged}, &response); err != nil {
+	if err := session.Peer.QueryRoom(ctx, genesis.RoomKey, community.SubmitEvent{Proposal: forged}, &response); err != nil {
 		t.Fatal(err)
 	}
 	rejected, ok := response.(community.SubmitRejected)
@@ -524,7 +524,7 @@ func TestRoomBansRefreshReplicaStateAndRejectAuthors(t *testing.T) {
 			t.Fatal(err)
 		}
 		var answer any
-		if err := session.Peer.Query(ctx, community.SubmitEvent{Proposal: proposal}, &answer); err != nil {
+		if err := session.Peer.QueryRoom(ctx, genesis.RoomKey, community.SubmitEvent{Proposal: proposal}, &answer); err != nil {
 			t.Fatal(err)
 		}
 		return answer
