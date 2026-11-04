@@ -304,3 +304,139 @@ func TestReconnectRecoversStateWithoutRewindingHistory(t *testing.T) {
 		t.Fatalf("signed state was not recovered: %v", err)
 	}
 }
+
+func TestClientReplacesCachedV2WithVerifiedV3AtSameRevision(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	dir := t.TempDir()
+	instance, err := Open(ctx, Config{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { instance.Close() }()
+	room, node := clientTestPrivateKey(t), clientTestPrivateKey(t)
+	now := time.Now().UTC().Truncate(time.Second)
+	genesis, err := community.NewGenesis(room, node, now, "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.store.addRoom(ctx, genesis.RoomKey, "room", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := instance.store.pinGenesis(ctx, genesis.RoomKey, genesis); err != nil {
+		t.Fatal(err)
+	}
+	proposal, err := community.SignProposal(room, genesis.NodeKey, community.EventProposal{
+		RoomID: genesis.RoomKey, Nonce: make([]byte, 32), Timestamp: now.Unix(), Body: community.EventMetadata{Name: "Updated"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, err := community.SignCommit(room, proposal, 1, community.Zero256(), now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.store.appendEvent(ctx, genesis.RoomKey, event); err != nil {
+		t.Fatal(err)
+	}
+	projection, err := instance.store.projectRoom(ctx, genesis.RoomKey, genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := community.SignRoomStateV3(room, projection.State())
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := community.SignRoomState(room, community.RoomState{
+		RoomID: state.RoomID, RevisionSeqno: state.RevisionSeqno, RevisionHash: state.RevisionHash,
+		Name: state.Name, Description: state.Description, WritePolicy: state.WritePolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawLegacy, err := community.Encode(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := instance.store.db.ExecContext(ctx, "UPDATE joined_rooms SET raw_state=? WHERE room_key=?", rawLegacy, genesis.RoomKey); err != nil {
+		t.Fatal(err)
+	}
+	identity := instance.Identity()
+	if err := instance.Close(); err != nil {
+		t.Fatal(err)
+	}
+	instance, err = Open(ctx, Config{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := instance.store.room(ctx, genesis.RoomKey)
+	if err != nil || len(record.State.RoomID) != 0 || record.HeadSeqno != 1 || instance.Identity() != identity {
+		t.Fatalf("cache repair changed history/identity or kept V2: %+v %v", record, err)
+	}
+	var valid atomic.Bool
+	cursors := make(chan int64, 2)
+	server, err := roomnet.NewGateway(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	server.SetConnectionHandler(func(raw *quic.Peer) error {
+		peer := roomnet.Wrap(raw)
+		peer.SetQueryHandler(func(query *roomnet.Query) error {
+			switch request := query.Data.(type) {
+			case community.GetEvents:
+				cursors <- request.AfterSeqno
+				return query.Answer(community.EventList{})
+			case community.GetRoomState:
+				answer := state
+				if !valid.Load() {
+					answer.Signature = append([]byte(nil), state.Signature...)
+					answer.Signature[0] ^= 1
+				}
+				return query.Answer(community.RoomStateResult{State: answer, Stats: community.RoomStats{NodeRole: community.NodeRoleSequencer, Ready: true, ReplicaSeqno: 1}})
+			default:
+				return roomnet.ErrNoAnswer
+			}
+		})
+		return nil
+	})
+	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packet.Close()
+	go func() { _ = server.Serve(packet) }()
+	gateway, err := roomnet.NewGateway(instance.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gateway.Close()
+	raw, err := gateway.DialDefault(ctx, node.Public().(ed25519.PublicKey), packet.LocalAddr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := roomnet.Wrap(raw)
+	session := &replica.Session{Genesis: genesis, Peer: peer, Done: peer.Done()}
+	handle := &roomHandle{client: instance, key: genesis.RoomKey, ctx: ctx, session: session, sessionEpoch: 1}
+	if err := handle.syncSessionLocked(ctx, session, 1); err == nil {
+		t.Fatal("client accepted an unverified V3 replacement")
+	}
+	valid.Store(true)
+	if err := handle.syncSessionLocked(ctx, session, 1); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if cursor := <-cursors; cursor != 1 {
+			t.Fatalf("client rewound preserved history to %d", cursor)
+		}
+	}
+	record, err = instance.store.room(ctx, genesis.RoomKey)
+	gotRaw, _ := community.Encode(record.State)
+	wantRaw, _ := community.Encode(state)
+	if err != nil || !bytes.Equal(gotRaw, wantRaw) || record.State.RevisionSeqno != legacy.RevisionSeqno || !bytes.Equal(record.State.RevisionHash, legacy.RevisionHash) || record.HeadSeqno != 1 {
+		t.Fatalf("same-revision V3 replacement failed: %v", err)
+	}
+	if exists, err := instance.store.hasEvent(ctx, genesis.RoomKey, event); err != nil || !exists {
+		t.Fatalf("replacement lost cached history: %v", err)
+	}
+}

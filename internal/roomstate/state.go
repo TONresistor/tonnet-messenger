@@ -176,6 +176,12 @@ func loadAuthority(ctx context.Context, dir string, now time.Time, readOnly bool
 		database.Close()
 		return nil, err
 	}
+	if !readOnly {
+		if err := database.UpgradeRoomState(ctx, roomPrivate); err != nil {
+			database.Close()
+			return nil, fmt.Errorf("room state: upgrade signed state: %w", err)
+		}
+	}
 	if err := database.Audit(ctx); err != nil {
 		database.Close()
 		return nil, fmt.Errorf("room state: database audit: %w", err)

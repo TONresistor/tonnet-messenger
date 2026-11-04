@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"reflect"
 	"testing"
@@ -542,6 +543,292 @@ func TestCommitTimeClampKeepsHistoricalTolerance(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := replica.Audit(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func legacySnapshot(t *testing.T, f *fixture) (community.RoomStateV3, []byte) {
+	t.Helper()
+	state, err := f.store.State(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := community.SignRoomState(f.room, community.RoomState{
+		RoomID: state.RoomID, RevisionSeqno: state.RevisionSeqno, RevisionHash: state.RevisionHash,
+		Name: state.Name, Description: state.Description, WritePolicy: state.WritePolicy,
+		Admins: state.Admins, Moderators: state.Moderators, PinnedMessages: state.PinnedMessages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := community.Encode(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.db.ExecContext(f.ctx, "UPDATE room_state SET raw_signed_state=?", raw); err != nil {
+		t.Fatal(err)
+	}
+	return state, raw
+}
+
+func preservedRoomRows(t *testing.T, s *Store) [][][]any {
+	t.Helper()
+	var result [][][]any
+	for _, query := range []string{
+		"SELECT * FROM room_genesis", "SELECT * FROM replica_head", "SELECT * FROM events ORDER BY seqno",
+		"SELECT * FROM messages ORDER BY message_id", "SELECT * FROM pins ORDER BY message_id",
+		"SELECT * FROM roles ORDER BY subject_key,role", "SELECT * FROM request_nonces ORDER BY author_key,nonce",
+		"SELECT revision_seqno,revision_hash,name,description,anyone_can_write FROM room_state",
+	} {
+		rows, err := s.db.Query(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var table [][]any
+		for rows.Next() {
+			row := make([]any, len(columns))
+			pointers := make([]any, len(columns))
+			for i := range row {
+				pointers[i] = &row[i]
+			}
+			if err := rows.Scan(pointers...); err != nil {
+				t.Fatal(err)
+			}
+			table = append(table, row)
+		}
+		if err := rows.Err(); err != nil {
+			t.Fatal(err)
+		}
+		rows.Close()
+		result = append(result, table)
+	}
+	return result
+}
+
+func TestUpgradeRoomStatePreservesHistoryAndRecovers(t *testing.T) {
+	for _, schemaMigrated := range []bool{false, true} {
+		t.Run(fmt.Sprint("schema_already_migrated=", schemaMigrated), func(t *testing.T) {
+			f := newFixture(t)
+			first := f.proposal(t, f.user, community.EventMessage{Text: "preserved"}, randomNonce(t), f.now)
+			if _, err := f.store.Commit(f.ctx, first, f.room, f.now); err != nil {
+				t.Fatal(err)
+			}
+			for _, body := range []any{
+				community.EventAdminGrant{SubjectKey: f.admin.Public().(ed25519.PublicKey)},
+				community.EventModeratorGrant{SubjectKey: f.admin.Public().(ed25519.PublicKey)},
+				community.EventPin{MessageID: 1}, community.EventMetadata{Name: "Renamed", Description: "Keep"},
+				community.EventMessage{Text: "head beyond state revision"},
+			} {
+				proposal := f.proposal(t, f.room, body, randomNonce(t), f.now)
+				if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want, rawLegacy := legacySnapshot(t, f)
+			before := preservedRoomRows(t, f.store)
+			if !schemaMigrated {
+				if _, err := f.store.db.Exec("DROP TABLE bans; DELETE FROM schema_migrations; INSERT INTO schema_migrations VALUES (2, 0)"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := f.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			var err error
+			f.store, err = Open(f.ctx, f.storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var raw []byte
+			if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&raw); err != nil || !bytes.Equal(raw, rawLegacy) {
+				t.Fatalf("schema migration changed signed state: %v", err)
+			}
+			var version int
+			if err := f.store.db.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil || version != schemaVersion {
+				t.Fatalf("schema version=%d err=%v", version, err)
+			}
+			// Simulate failure after replacement starts, then restart with schema
+			// migration already complete. Neither attempt may alter history.
+			if _, err := f.store.db.Exec(`CREATE TRIGGER interrupt_upgrade AFTER UPDATE OF raw_signed_state ON room_state
+BEGIN SELECT RAISE(ABORT, 'interrupted upgrade'); END`); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.UpgradeRoomState(f.ctx, f.room); err == nil {
+				t.Fatal("interrupted conversion succeeded")
+			}
+			if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&raw); err != nil || !bytes.Equal(raw, rawLegacy) {
+				t.Fatalf("failed conversion changed signed state: %v", err)
+			}
+			if _, err := f.store.db.Exec("DROP TRIGGER interrupt_upgrade"); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			f.store, err = Open(f.ctx, f.storePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 2; attempt++ {
+				if err := f.store.UpgradeRoomState(f.ctx, f.room); err != nil {
+					t.Fatal(err)
+				}
+				got, err := f.store.State(f.ctx)
+				gotRaw, encodeErr := community.Encode(got)
+				wantRaw, _ := community.Encode(want)
+				if err != nil || encodeErr != nil || !bytes.Equal(gotRaw, wantRaw) || got.Verify() != nil || len(got.Banned) != 0 {
+					t.Fatalf("converted state changed revision or fields: %v %v", err, encodeErr)
+				}
+				if !reflect.DeepEqual(before, preservedRoomRows(t, f.store)) {
+					t.Fatal("conversion changed existing history or projections")
+				}
+				if err := f.store.Audit(f.ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.store.Close(); err != nil {
+					t.Fatal(err)
+				}
+				f.store, err = Open(f.ctx, f.storePath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			duplicate, err := f.store.Commit(f.ctx, first, f.room, f.now)
+			if err != nil || !duplicate.Duplicate || duplicate.Event.Seqno != 1 {
+				t.Fatalf("preserved request stopped deduplicating: %+v %v", duplicate, err)
+			}
+			reused := f.proposal(t, f.user, community.EventMessage{Text: "new"}, first.Nonce, f.now)
+			if _, err := f.store.Commit(f.ctx, reused, f.room, f.now); rejectionCode(err) != community.RejectReusedNonce {
+				t.Fatalf("preserved nonce stopped rejecting reuse: %v", err)
+			}
+		})
+	}
+}
+
+func TestUpgradeRoomStateRejectsInvalidLegacyDataAtomically(t *testing.T) {
+	for _, corruption := range []string{"signature", "trailing_bytes", "unknown_type", "wrong_room", "signed_state_content", "signed_state_revision", "genesis", "event_signature", "authorization", "chain", "head", "metadata", "roles", "pins", "messages", "bans", "revision_columns", "wrong_key"} {
+		t.Run(corruption, func(t *testing.T) {
+			f := newFixture(t)
+			proposal := f.proposal(t, f.user, community.EventMessage{Text: "keep"}, randomNonce(t), f.now)
+			if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); err != nil {
+				t.Fatal(err)
+			}
+			_, raw := legacySnapshot(t, f)
+			key := f.room
+			query := ""
+			var args []any
+			switch corruption {
+			case "signature", "trailing_bytes", "unknown_type", "wrong_room", "signed_state_content", "signed_state_revision":
+				legacy, err := community.DecodeRoomState(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				switch corruption {
+				case "signature":
+					legacy.Signature[0] ^= 1
+				case "signed_state_content":
+					legacy.Name = "Forged"
+				case "signed_state_revision":
+					legacy.RevisionSeqno = 1
+				case "wrong_room":
+					key = privateKey(t)
+					legacy.RoomID = key.Public().(ed25519.PublicKey)
+				}
+				if corruption == "wrong_room" || corruption == "signed_state_content" || corruption == "signed_state_revision" {
+					legacy, err = community.SignRoomState(key, legacy)
+					if err != nil {
+						t.Fatal(err)
+					}
+					key = f.room
+				}
+				raw, err = community.Encode(legacy)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if corruption == "trailing_bytes" {
+					raw = append(raw, 0)
+				} else if corruption == "unknown_type" {
+					raw = []byte{1, 2, 3, 4}
+				}
+				query, args = "UPDATE room_state SET raw_signed_state=?", []any{raw}
+			case "genesis":
+				query = "UPDATE room_genesis SET genesis_hash=zeroblob(32)"
+			case "event_signature":
+				query = "UPDATE events SET raw_commit=x'010203'"
+			case "authorization":
+				// A room signature cannot authorize an ordinary member's role grant.
+				p := f.proposal(t, f.user, community.EventAdminGrant{SubjectKey: f.admin.Public().(ed25519.PublicKey)}, randomNonce(t), f.now)
+				event, err := community.SignCommit(f.room, p, 1, community.Zero256(), f.now)
+				if err != nil {
+					t.Fatal(err)
+				}
+				rawEvent, err := community.Encode(event)
+				if err != nil {
+					t.Fatal(err)
+				}
+				query, args = "UPDATE events SET raw_commit=?", []any{rawEvent}
+			case "chain":
+				query = "UPDATE events SET commit_hash=zeroblob(32)"
+			case "head":
+				query = "UPDATE replica_head SET latest_seqno=2"
+			case "metadata":
+				query = "UPDATE room_state SET name='Forged'"
+			case "roles":
+				query, args = "INSERT INTO roles VALUES (?, 'admin', 0, ?)", []any{f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
+			case "pins":
+				query, args = "INSERT INTO pins VALUES (1, 1, ?)", []any{f.genesis.RoomKey}
+			case "messages":
+				query = "UPDATE messages SET raw_commit=x'010203'"
+			case "bans":
+				query, args = "INSERT INTO bans VALUES (?, 1, ?)", []any{f.admin.Public().(ed25519.PublicKey), f.genesis.RoomKey}
+			case "revision_columns":
+				query = "UPDATE room_state SET revision_seqno=1"
+			case "wrong_key":
+				key = f.user
+			}
+			if query != "" {
+				if _, err := f.store.db.Exec(query, args...); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := preservedRoomRows(t, f.store)
+			var beforeRaw, afterRaw []byte
+			if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&beforeRaw); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.store.UpgradeRoomState(f.ctx, key); err == nil {
+				t.Fatal("invalid legacy store was re-signed")
+			}
+			if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&afterRaw); err != nil || !bytes.Equal(beforeRaw, afterRaw) || !reflect.DeepEqual(before, preservedRoomRows(t, f.store)) {
+				t.Fatalf("failed conversion changed durable data: %v", err)
+			}
+		})
+	}
+}
+
+func TestUpgradeLeavesExistingV3BansUnchanged(t *testing.T) {
+	f := newFixture(t)
+	proposal := f.proposal(t, f.room, community.EventBanV1{SubjectKey: f.user.Public().(ed25519.PublicKey)}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); err != nil {
+		t.Fatal(err)
+	}
+	var before, after []byte
+	if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if err := f.store.UpgradeRoomState(f.ctx, f.room); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&after); err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("V3 snapshot changed: %v", err)
+	}
+	if err := f.store.Audit(f.ctx); err != nil {
 		t.Fatal(err)
 	}
 }

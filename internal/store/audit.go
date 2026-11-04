@@ -3,16 +3,35 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"database/sql"
 	"fmt"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
+type auditQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
 func (s *Store) Audit(ctx context.Context) error {
-	if err := s.IntegrityCheck(ctx); err != nil {
+	return audit(ctx, s.db)
+}
+
+func audit(ctx context.Context, query auditQueryer) error {
+	var integrity string
+	if err := query.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&integrity); err != nil {
 		return err
 	}
-	genesis, storedGenesisHash, err := s.Genesis(ctx)
+	if integrity != "ok" {
+		return fmt.Errorf("store: integrity check: %s", integrity)
+	}
+	var rawGenesis, storedGenesisHash []byte
+	if err := query.QueryRowContext(ctx, "SELECT raw_tl,genesis_hash FROM room_genesis WHERE singleton_id=1").Scan(&rawGenesis, &storedGenesisHash); err != nil {
+		return err
+	}
+	genesis, err := community.DecodeGenesis(rawGenesis)
 	if err != nil {
 		return err
 	}
@@ -27,7 +46,7 @@ func (s *Store) Audit(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("store: initialize canonical projection: %w", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT seqno,event_id,commit_hash,previous_hash,raw_commit
+	rows, err := query.QueryContext(ctx, `SELECT seqno,event_id,commit_hash,previous_hash,raw_commit
 FROM events ORDER BY seqno ASC`)
 	if err != nil {
 		return err
@@ -73,29 +92,41 @@ FROM events ORDER BY seqno ASC`)
 		expectedPrevious = computedCommitHash
 		expectedSeqno++
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	if err := rows.Close(); err != nil {
 		return err
 	}
 	for _, message := range messages {
 		var projectedRaw []byte
-		if err := s.db.QueryRowContext(ctx, "SELECT raw_commit FROM messages WHERE message_id=?", message.id).Scan(&projectedRaw); err != nil || !bytes.Equal(projectedRaw, message.raw) {
+		if err := query.QueryRowContext(ctx, "SELECT raw_commit FROM messages WHERE message_id=?", message.id).Scan(&projectedRaw); err != nil || !bytes.Equal(projectedRaw, message.raw) {
 			return fmt.Errorf("store: message projection mismatch at message %d", message.id)
 		}
 	}
 	var projectedMessages int
-	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages").Scan(&projectedMessages); err != nil || projectedMessages != messageCount {
+	if err := query.QueryRowContext(ctx, "SELECT COUNT(*) FROM messages").Scan(&projectedMessages); err != nil || projectedMessages != messageCount {
 		return fmt.Errorf("store: message projection count mismatch")
 	}
-	head, err := s.Head(ctx)
-	if err != nil {
+	var head Head
+	if err := query.QueryRowContext(ctx, "SELECT latest_seqno,latest_hash FROM replica_head WHERE singleton_id=1").Scan(&head.Seqno, &head.Hash); err != nil {
 		return err
 	}
 	if head.Seqno != expectedSeqno-1 || !bytes.Equal(head.Hash, expectedPrevious) {
 		return fmt.Errorf("store: replica head mismatch")
 	}
-	state, err := s.State(ctx)
+	var rawState, revisionHash []byte
+	var revisionSeqno int64
+	if err := query.QueryRowContext(ctx, "SELECT raw_signed_state,revision_seqno,revision_hash FROM room_state WHERE singleton_id=1").Scan(&rawState, &revisionSeqno, &revisionHash); err != nil {
+		return err
+	}
+	state, err := community.DecodeRoomStateV3(rawState)
 	if err != nil {
 		return err
+	}
+	if state.RevisionSeqno != revisionSeqno || !bytes.Equal(state.RevisionHash, revisionHash) {
+		return fmt.Errorf("store: state revision projection mismatch")
 	}
 	if err := state.Verify(); err != nil {
 		return fmt.Errorf("store: signed state audit: %w", err)
@@ -107,23 +138,23 @@ FROM events ORDER BY seqno ASC`)
 		!bytes.Equal(state.RevisionHash, hashes[state.RevisionSeqno]) {
 		return fmt.Errorf("store: signed state revision mismatch")
 	}
-	if err := s.auditStateProjection(ctx, state); err != nil {
+	if err := auditStateProjection(ctx, query, state); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (s *Store) auditStateProjection(ctx context.Context, state community.RoomStateV3) error {
+func auditStateProjection(ctx context.Context, query auditQueryer, state community.RoomStateV3) error {
 	var name, description string
 	var policy int
-	if err := s.db.QueryRowContext(ctx, "SELECT name,description,anyone_can_write FROM room_state WHERE singleton_id=1").Scan(&name, &description, &policy); err != nil {
+	if err := query.QueryRowContext(ctx, "SELECT name,description,anyone_can_write FROM room_state WHERE singleton_id=1").Scan(&name, &description, &policy); err != nil {
 		return err
 	}
 	if name != state.Name || description != state.Description || (policy != 0) != state.WritePolicy.AnyoneCanWrite {
 		return fmt.Errorf("store: metadata projection mismatch")
 	}
 	roles := func(role string) ([][]byte, error) {
-		rows, err := s.db.QueryContext(ctx, "SELECT subject_key FROM roles WHERE role=? ORDER BY subject_key", role)
+		rows, err := query.QueryContext(ctx, "SELECT subject_key FROM roles WHERE role=? ORDER BY subject_key", role)
 		if err != nil {
 			return nil, err
 		}
@@ -146,7 +177,7 @@ func (s *Store) auditStateProjection(ctx context.Context, state community.RoomSt
 	if err != nil {
 		return err
 	}
-	rows, err := s.db.QueryContext(ctx, "SELECT message_id FROM pins ORDER BY message_id")
+	rows, err := query.QueryContext(ctx, "SELECT message_id FROM pins ORDER BY message_id")
 	if err != nil {
 		return err
 	}
@@ -159,8 +190,12 @@ func (s *Store) auditStateProjection(ctx context.Context, state community.RoomSt
 		}
 		pins = append(pins, id)
 	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
 	rows.Close()
-	bannedRows, err := s.db.QueryContext(ctx, "SELECT subject_key FROM bans ORDER BY subject_key")
+	bannedRows, err := query.QueryContext(ctx, "SELECT subject_key FROM bans ORDER BY subject_key")
 	if err != nil {
 		return err
 	}
@@ -185,4 +220,64 @@ func (s *Store) auditStateProjection(ctx context.Context, state community.RoomSt
 		return fmt.Errorf("store: role or pin projection mismatch")
 	}
 	return nil
+}
+
+// UpgradeRoomState converts only a locally stored V2 snapshot. Authority startup
+// calls it independently of schema migration so interrupted upgrades are retried.
+func (s *Store) UpgradeRoomState(ctx context.Context, roomPrivate ed25519.PrivateKey) error {
+	if len(roomPrivate) != ed25519.PrivateKeySize {
+		return community.ErrWrongRoom
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	genesis, _, err := genesisTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(roomPrivate.Public().(ed25519.PublicKey), genesis.RoomKey) {
+		return community.ErrWrongRoom
+	}
+	var raw []byte
+	if err := tx.QueryRowContext(ctx, "SELECT raw_signed_state FROM room_state WHERE singleton_id=1").Scan(&raw); err != nil {
+		return err
+	}
+	if _, err := community.DecodeRoomStateV3(raw); err == nil {
+		return nil
+	}
+	legacy, err := community.DecodeRoomState(raw)
+	if err != nil {
+		return fmt.Errorf("store: decode legacy room state: %w", err)
+	}
+	if err := legacy.Verify(); err != nil {
+		return fmt.Errorf("store: invalid legacy room state: %w", err)
+	}
+	if !bytes.Equal(legacy.RoomID, genesis.RoomKey) {
+		return community.ErrWrongRoom
+	}
+	state, err := community.SignRoomStateV3(roomPrivate, community.RoomStateV3{
+		RoomID: legacy.RoomID, RevisionSeqno: legacy.RevisionSeqno, RevisionHash: legacy.RevisionHash,
+		Name: legacy.Name, Description: legacy.Description, WritePolicy: legacy.WritePolicy,
+		Admins: legacy.Admins, Moderators: legacy.Moderators, PinnedMessages: legacy.PinnedMessages,
+	})
+	if err != nil {
+		return err
+	}
+	raw, err = community.Encode(state)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "UPDATE room_state SET raw_signed_state=? WHERE singleton_id=1", raw); err != nil {
+		return err
+	}
+	// Audit the tentative replacement in the same transaction. Invalid history,
+	// signatures or projections roll back without publishing a new signed state.
+	if err := audit(ctx, tx); err != nil {
+		return fmt.Errorf("store: legacy room state audit: %w", err)
+	}
+	return tx.Commit()
 }

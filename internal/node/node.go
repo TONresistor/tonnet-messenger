@@ -151,6 +151,12 @@ func New(cfg Config) (*Node, error) {
 		if !bytes.Equal(cfg.Key.Public().(ed25519.PublicKey), cfg.Genesis.NodeKey) {
 			return nil, fmt.Errorf("sequencer node key does not match genesis")
 		}
+		if err := cfg.Store.ValidateGenesis(context.Background(), *cfg.Genesis); err != nil {
+			return nil, err
+		}
+		if err := cfg.Store.UpgradeRoomState(context.Background(), cfg.RoomKey); err != nil {
+			return nil, fmt.Errorf("sequencer signed state upgrade: %w", err)
+		}
 	} else if len(cfg.RoomKey) != 0 {
 		return nil, fmt.Errorf("relay must not receive room authority key")
 	}

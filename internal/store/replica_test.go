@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -162,5 +163,51 @@ func TestReplicaVerifiesBanProjectionAndBannedAuthors(t *testing.T) {
 	}
 	if _, err := replica.AppendReplica(f.ctx, event); rejectionCode(err) != 6 {
 		t.Fatalf("ban lost after replica reopen: %v", err)
+	}
+}
+
+func TestLegacyReplicaRequiresVerifiedV3WithoutSigning(t *testing.T) {
+	f := newFixture(t)
+	proposal := f.proposal(t, f.user, community.EventMessage{Text: "retained"}, randomNonce(t), f.now)
+	if _, err := f.store.Commit(f.ctx, proposal, f.room, f.now); err != nil {
+		t.Fatal(err)
+	}
+	state, legacyRaw := legacySnapshot(t, f)
+	before := preservedRoomRows(t, f.store)
+	if err := f.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var err error
+	f.store, err = Open(f.ctx, f.storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ReplicaReady(f.ctx); err == nil {
+		t.Fatal("legacy replica reported ready without V3")
+	}
+	var raw []byte
+	if err := f.store.db.QueryRow("SELECT raw_signed_state FROM room_state").Scan(&raw); err != nil || !bytes.Equal(raw, legacyRaw) {
+		t.Fatalf("opening replica re-signed state: %v", err)
+	}
+	invalid := state
+	invalid.Signature = append([]byte(nil), state.Signature...)
+	invalid.Signature[0] ^= 1
+	if err := f.store.InstallReplicaState(f.ctx, invalid); err == nil {
+		t.Fatal("replica accepted an unverified replacement")
+	}
+	if err := f.store.ReplicaReady(f.ctx); err == nil {
+		t.Fatal("failed replacement made replica ready")
+	}
+	if err := f.store.InstallReplicaState(f.ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.ReplicaReady(f.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, preservedRoomRows(t, f.store)) {
+		t.Fatal("replica state replacement changed history")
+	}
+	if err := f.store.Audit(f.ctx); err != nil {
+		t.Fatal(err)
 	}
 }
