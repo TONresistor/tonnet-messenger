@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const maxRelayPeers = 16 // Within the shared Connector's 256-endpoint budget.
+const maxRelayPeers = 256 // The Connector's bound; holders plus top-five must fit.
 const maxRelayBans = 4096
 
 type relayObservation uint8

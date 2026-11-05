@@ -44,7 +44,7 @@ type Event struct {
 }
 
 type Direct struct {
-	Room      string `json:"room"`
+	Room      string `json:"room,omitempty"`
 	ID        string `json:"id"`
 	Peer      string `json:"peer_key"`
 	Text      string `json:"text"`
@@ -93,7 +93,7 @@ type Backend interface {
 	GetPending(context.Context, string) (*client.PendingOperation, error)
 	RetryPending(context.Context, string, string) (map[string]any, error)
 	DiscardPending(context.Context, string, string) error
-	SendDirect(context.Context, string, string, string) (Direct, error)
+	SendDirect(context.Context, string, string) (Direct, error)
 	SetName(context.Context, string) (client.Identity, error)
 	PrepareDomainLink(context.Context, string) (tondns.PreparedLink, error)
 	ConfirmDomain(context.Context, string) (client.Identity, error)
@@ -157,8 +157,8 @@ func (backend clientBackend) Send(ctx context.Context, room, text string) (Event
 	return decode[Event](value)
 }
 
-func (backend clientBackend) SendDirect(ctx context.Context, room, peer, text string) (Direct, error) {
-	value, err := backend.Client.SendDM(ctx, room, peer, text)
+func (backend clientBackend) SendDirect(ctx context.Context, peer, text string) (Direct, error) {
+	value, err := backend.Client.SendDM(ctx, peer, text)
 	if err != nil {
 		return Direct{}, err
 	}

@@ -187,7 +187,7 @@ func (model *Model) choices() []choice {
 		sort.Strings(keys)
 		for _, key := range keys {
 			conversation := model.directs[key]
-			label := line(conversation.Name) + " · " + model.roomLabel(conversation.Room)
+			label := line(conversation.Name)
 			if conversation.Unread > 0 {
 				label += fmt.Sprintf(" · %d new", conversation.Unread)
 			}

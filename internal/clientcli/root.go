@@ -230,14 +230,10 @@ func newRoom(opts *options) *cobra.Command {
 }
 
 func newDM(opts *options) *cobra.Command {
-	parent := &cobra.Command{Use: "dm", Short: "Send live encrypted direct messages"}
-	parent.AddCommand(&cobra.Command{Use: "send ROOM RECIPIENT TEXT", Args: cobra.ExactArgs(3), RunE: func(cmd *cobra.Command, args []string) error {
+	parent := &cobra.Command{Use: "dm", Short: "Send encrypted direct messages through relays"}
+	parent.AddCommand(&cobra.Command{Use: "send RECIPIENT TEXT", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
 		return withClient(cmd, opts, func(c *client.Client) error {
-			joined, err := c.Join(cmd.Context(), args[0], nil)
-			if err != nil {
-				return err
-			}
-			value, err := c.SendDM(cmd.Context(), joined.Room, args[1], args[2])
+			value, err := c.SendDM(cmd.Context(), args[0], args[1])
 			if err != nil {
 				return err
 			}

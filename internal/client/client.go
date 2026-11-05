@@ -15,12 +15,10 @@ import (
 	"sync"
 	"time"
 
-	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
-	"github.com/TONresistor/tonnet-messenger/internal/dm"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
@@ -78,6 +76,7 @@ type Client struct {
 	key           ed25519.PrivateKey
 	connector     *replica.Connector
 	relays        *relayPool
+	dmRuntime     *dmRuntime
 	store         *clientStore
 	lock          *stateLock
 
@@ -221,6 +220,10 @@ func (c *Client) Start() error {
 	if err := c.notify(c.ctx, "client.ready", map[string]any{"identity": c.Identity()}); err != nil {
 		return err
 	}
+	c.identityOps.Lock()
+	_,dmErr:=c.ensureDM()
+	c.identityOps.Unlock()
+	if dmErr!=nil{return dmErr}
 	for _, record := range records {
 		c.startRoom(record, nil)
 	}
@@ -228,6 +231,7 @@ func (c *Client) Start() error {
 }
 
 func (c *Client) Close() error {
+	c.cancel()
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -248,7 +252,10 @@ func (c *Client) Close() error {
 	c.rooms = map[string]*roomHandle{}
 	connector := c.connector
 	relays := c.relays
+	directs:=c.dmRuntime
+	c.dmRuntime=nil
 	c.mu.Unlock()
+	if directs!=nil{directs.stop()}
 	if relays != nil {
 		relays.Close()
 	}
@@ -373,6 +380,11 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	}
 	c.identityOps.Lock()
 	defer c.identityOps.Unlock()
+	c.mu.RLock();previousDM:=c.dmRuntime;c.mu.RUnlock()
+	if previousDM!=nil{
+		previousDM.cancel()
+		defer func(){previousDM.stop();c.mu.Lock();if c.dmRuntime==previousDM{c.dmRuntime=nil};c.mu.Unlock();c.ensureDM()}()
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -383,6 +395,7 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 		c.mu.Unlock()
 		return Identity{}, fmt.Errorf("expected identity does not match current identity")
 	}
+	c.dmRuntime=nil
 	key, stagedPath, err := stageIdentity(c.keyPath)
 	if err != nil {
 		c.mu.Unlock()
@@ -559,65 +572,6 @@ func (c *Client) SubmitMutation(ctx context.Context, roomText string, body any) 
 	return c.submit(ctx, roomText, body)
 }
 
-func (c *Client) SendDM(ctx context.Context, roomText, recipient, text string) (map[string]any, error) {
-	handle, err := c.connectedRoom(roomText)
-	if err != nil {
-		return nil, err
-	}
-	to, err := c.resolveIdentity(ctx, recipient)
-	if err != nil {
-		return nil, err
-	}
-	c.identityOps.Lock()
-	defer c.identityOps.Unlock()
-	snapshot, err := c.snapshotRoomIdentity(handle)
-	if err != nil {
-		return nil, err
-	}
-	key, name := snapshot.key, snapshot.name
-	from := key.Public().(ed25519.PublicKey)
-	if bytes.Equal(from, to) {
-		return nil, fmt.Errorf("cannot send a direct message to this identity")
-	}
-	if err := community.ValidateDMPlaintext(text); err != nil {
-		return nil, err
-	}
-	session := snapshot.session
-	box, err := dm.SealForRoom(handle.key, key, ed25519.PublicKey(to), []byte(text))
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now().Unix()
-	direct, err := community.SignDirectMessage(key, community.DirectMessage{
-		RoomID: handle.key, ToKey: to, AuthorName: name, Timestamp: now, Ciphertext: box,
-	})
-	if err != nil {
-		return nil, err
-	}
-	raw, err := community.Encode(direct)
-	if err != nil {
-		return nil, err
-	}
-	wrapper, err := broadcast.Sign(key, tonoverlay.CertificateEmpty{}, raw, now)
-	if err != nil {
-		return nil, err
-	}
-	sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	err = session.Peer.SendMessage(sendCtx, wrapper)
-	cancel()
-	if err != nil {
-		return nil, err
-	}
-	id, _ := community.HashBoxed(direct)
-	view := map[string]any{"room": keyText(handle.key), "id": keyText(id), "peer_key": keyText(to), "text": text, "timestamp": now, "direction": "sent", "author_name": name}
-	if community.IsDomainName(strings.ToLower(strings.TrimSpace(recipient))) {
-		view["domain"] = strings.ToLower(strings.TrimSpace(recipient))
-	}
-	if err := c.notify(c.ctx, "dm.message", view); err != nil {
-		return nil, err
-	}
-	return view, nil
-}
 
 func (c *Client) submit(ctx context.Context, roomText string, body any) (map[string]any, error) {
 	c.submissionMu.RLock()
@@ -1109,42 +1063,7 @@ func (r *roomHandle) ingestSerializable(session *replica.Session, epoch uint64, 
 		_ = r.enqueueCanonical(session, epoch, event, nil)
 		return
 	}
-	direct, err := community.DecodeDirectMessage(wrapper.Data)
-	if err != nil || !bytes.Equal(source, direct.FromKey) || direct.Verify(r.key, time.Now()) != nil {
-		return
-	}
-	r.client.mu.RLock()
-	identity := append(ed25519.PrivateKey(nil), r.client.key...)
-	r.client.mu.RUnlock()
-	if !bytes.Equal(direct.ToKey, identity.Public().(ed25519.PublicKey)) {
-		return
-	}
-	plain, err := dm.OpenForRoom(r.key, identity, ed25519.PublicKey(direct.FromKey), direct.Ciphertext)
-	if err != nil {
-		return
-	}
-	if community.ValidateDMPlaintext(string(plain)) != nil {
-		return
-	}
-	if !r.isCurrentSession(session, epoch) {
-		return
-	}
-	id, err := community.HashBoxed(direct)
-	if err != nil {
-		return
-	}
-	view := map[string]any{
-		"room": keyText(r.key), "id": keyText(id), "peer_key": keyText(direct.FromKey),
-		"text": string(plain), "timestamp": direct.Timestamp, "direction": "received", "author_name": direct.AuthorName,
-	}
-	r.client.mu.RLock()
-	domain := r.client.profiles[keyText(direct.FromKey)]
-	r.client.mu.RUnlock()
-	if domain != "" {
-		view["domain"] = domain
-	}
-	expires := time.Unix(direct.Timestamp, 0).Add(community.MutationClockSkew)
-	_ = r.notifyDirectForSession(r.ctx, session, epoch, [32]byte(id), expires, view)
+	// V3 DMs arrive only through the independent inbox runtime.
 }
 
 func (r *roomHandle) enqueueCanonical(session *replica.Session, epoch uint64, event community.CommittedEvent, result chan error) error {

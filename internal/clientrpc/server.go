@@ -477,14 +477,13 @@ func (s *Server) dispatch(ctx context.Context, method string, raw json.RawMessag
 		return mutation(ctx, s.Client, p.Room, community.EventModeratorRevoke{SubjectKey: key})
 	case "dm.send":
 		var p struct {
-			Room      string `json:"room"`
 			Recipient string `json:"recipient"`
 			Text      string `json:"text"`
 		}
 		if e := params(&p); e != nil {
 			return nil, e
 		}
-		value, err := s.Client.SendDM(ctx, p.Room, p.Recipient, p.Text)
+		value, err := s.Client.SendDM(ctx, p.Recipient, p.Text)
 		if err != nil {
 			return fail(err)
 		}
@@ -568,6 +567,8 @@ func classify(err error) *rpcError {
 		default:
 			code = "ROOM_REJECTED"
 		}
+	} else if errors.Is(err, client.ErrDMUnavailable) {
+		code, numeric = "ROOM_UNAVAILABLE", -32003
 	} else if errors.Is(err, client.ErrProtocol) {
 		code, numeric = "PROTOCOL_ERROR", -32034
 	} else if errors.Is(err, client.ErrSequencerUnavailable) {

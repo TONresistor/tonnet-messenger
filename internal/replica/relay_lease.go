@@ -48,6 +48,11 @@ func (l *RelayLease) Query(ctx context.Context, request, result any) error {
 	return l.lease.entry.peer.Query(ctx, request, result)
 }
 
+func(l *RelayLease)QueryOverlay(ctx context.Context,id []byte,request,result any)error{
+	select{case <-l.Done():return quic.ErrPeerClosed;default:}
+	return l.lease.entry.peer.QueryOverlay(ctx,id,request,result)
+}
+
 // SubscribeInboxPush registers only this lease. Eligibility and envelope
 // validation belong to its client consumer, not transport authorization.
 func (l *RelayLease) SubscribeInboxPush(handler func(community.InboxPushV1) error) {

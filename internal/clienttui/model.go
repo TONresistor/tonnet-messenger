@@ -233,7 +233,7 @@ func (model *Model) isInput() bool {
 	}
 }
 
-func directKey(room, peer string) string { return room + "/" + peer }
+func directKey(_ string, peer string) string { return "dm/" + peer }
 
 func (model *Model) draftKey() string {
 	if model.screen == directScreen {
@@ -362,7 +362,7 @@ func (model *Model) back() tea.Cmd {
 	case directScreen, directRoomScreen:
 		return model.move(directsScreen)
 	case recipientScreen:
-		return model.move(directRoomScreen)
+		return model.move(directsScreen)
 	case nameScreen, domainScreen, domainRecordScreen, clearDomainScreen:
 		return model.move(identityScreen)
 	default:
@@ -451,7 +451,7 @@ func (model *Model) selectAction() tea.Cmd {
 		return model.command("leave", func(ctx context.Context) (any, error) { return room, model.backend.Leave(ctx, room) })
 	case directsScreen:
 		if choice == "new" {
-			return model.move(directRoomScreen)
+			return model.move(recipientScreen)
 		}
 		if choice == "back" {
 			return model.back()
@@ -512,7 +512,7 @@ func (model *Model) submitInput() tea.Cmd {
 		})
 	case roomScreen, directScreen:
 		room := model.rooms[model.room]
-		if room == nil || !room.Connected {
+		if model.screen == roomScreen && (room == nil || !room.Connected) {
 			model.err = "Room is not connected. Open it from My rooms to retry."
 			return nil
 		}
@@ -545,7 +545,7 @@ func (model *Model) submitInput() tea.Cmd {
 			if peer == "" {
 				result.Value, result.Err = model.backend.Send(ctx, roomID, text)
 			} else {
-				result.Value, result.Err = model.backend.SendDirect(ctx, roomID, peer, text)
+				result.Value, result.Err = model.backend.SendDirect(ctx, peer, text)
 			}
 			return result
 		}
@@ -844,7 +844,7 @@ func (model *Model) receiveDirect(message Direct) {
 	if len(current.Messages) > 500 {
 		current.Messages = current.Messages[len(current.Messages)-500:]
 	}
-	if model.screen == directScreen && model.room == message.Room && model.peer == message.Peer {
+	if model.screen == directScreen && model.peer == message.Peer {
 		model.refreshViewport(model.viewport.AtBottom())
 	} else if message.Direction == "received" {
 		current.Unread++
