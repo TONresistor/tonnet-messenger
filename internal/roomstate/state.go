@@ -63,6 +63,7 @@ type Authority struct {
 	RoomPrivate ed25519.PrivateKey
 	NodePrivate ed25519.PrivateKey
 	Store       *store.Store
+	owner       *NodeState
 }
 
 func Create(ctx context.Context, dir, name, description string, now time.Time) (artifacts Artifacts, err error) {
@@ -140,88 +141,23 @@ func LoadAuthorityReadOnly(ctx context.Context, dir string, now time.Time) (*Aut
 	return loadAuthority(ctx, dir, now, true)
 }
 
+func (a *Authority) Close() error { return a.owner.Close() }
+
 func loadAuthority(ctx context.Context, dir string, now time.Time, readOnly bool) (*Authority, error) {
 	paths, err := Resolve(dir)
 	if err != nil {
 		return nil, err
 	}
-	roomPrivate, err := keys.Load(paths.RoomKey)
-	if err != nil {
-		return nil, fmt.Errorf("room state: load room key: %w", err)
-	}
-	nodePrivate, err := keys.Load(paths.NodeKey)
-	if err != nil {
-		return nil, fmt.Errorf("room state: load node key: %w", err)
-	}
 	genesis, err := LoadGenesis(paths.Genesis, now)
 	if err != nil {
 		return nil, err
 	}
-	if !bytes.Equal(roomPrivate.Public().(ed25519.PublicKey), genesis.RoomKey) {
-		return nil, fmt.Errorf("room state: room key does not match genesis")
-	}
-	if !bytes.Equal(nodePrivate.Public().(ed25519.PublicKey), genesis.NodeKey) {
-		return nil, fmt.Errorf("room state: node key does not match genesis")
-	}
-	var database *store.Store
-	if readOnly {
-		database, err = store.OpenReadOnly(ctx, paths.Database)
-	} else {
-		database, err = store.Open(ctx, paths.Database)
-	}
+	n, err := loadRooms(ctx, dir, []Selection{{RoomID: genesis.RoomKey, Role: community.NodeRoleSequencer}}, now, readOnly)
 	if err != nil {
 		return nil, err
 	}
-	if err := database.ValidateGenesis(ctx, genesis); err != nil {
-		database.Close()
-		return nil, err
-	}
-	if !readOnly {
-		if err := database.UpgradeRoomState(ctx, roomPrivate); err != nil {
-			database.Close()
-			return nil, fmt.Errorf("room state: upgrade signed state: %w", err)
-		}
-	}
-	if err := database.Audit(ctx); err != nil {
-		database.Close()
-		return nil, fmt.Errorf("room state: database audit: %w", err)
-	}
-	state, err := database.State(ctx)
-	if err != nil {
-		database.Close()
-		return nil, err
-	}
-	if err := state.Verify(); err != nil {
-		database.Close()
-		return nil, fmt.Errorf("room state: invalid signed state: %w", err)
-	}
-	if !bytes.Equal(state.RoomID, genesis.RoomKey) {
-		database.Close()
-		return nil, fmt.Errorf("room state: signed state belongs to another room")
-	}
-	head, err := database.Head(ctx)
-	if err != nil {
-		database.Close()
-		return nil, err
-	}
-	if state.RevisionSeqno > head.Seqno {
-		database.Close()
-		return nil, fmt.Errorf("room state: signed state revision is ahead of event head")
-	}
-	genesisHash, err := genesis.Hash()
-	if err != nil {
-		database.Close()
-		return nil, err
-	}
-	overlayID, err := community.OverlayID(genesis.RoomKey)
-	if err != nil {
-		database.Close()
-		return nil, err
-	}
-	return &Authority{
-		Artifacts:   Artifacts{Paths: paths, Genesis: genesis, GenesisHash: genesisHash, OverlayID: overlayID},
-		RoomPrivate: roomPrivate, NodePrivate: nodePrivate, Store: database,
-	}, nil
+	r := n.Rooms[0]
+	return &Authority{Artifacts: r.Artifacts, RoomPrivate: r.RoomPrivate, NodePrivate: n.NodePrivate, Store: r.Store, owner: n}, nil
 }
 
 func LoadGenesis(path string, now time.Time) (community.Genesis, error) {

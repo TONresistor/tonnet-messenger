@@ -47,7 +47,7 @@ func TestCreateAndLoadAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer loaded.Store.Close()
+	defer loaded.Close()
 	if !bytes.Equal(loaded.Genesis.RoomKey, created.Genesis.RoomKey) || !bytes.Equal(loaded.OverlayID, created.OverlayID) {
 		t.Fatal("loaded identity changed")
 	}
@@ -99,7 +99,7 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := authority.Store.Close(); err != nil {
+			if err := authority.Close(); err != nil {
 				t.Fatal(err)
 			}
 			db, err := sql.Open("sqlite", created.Paths.Database)
@@ -160,7 +160,7 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 				}
 			}
 			if loaded, err := LoadAuthorityReadOnly(ctx, created.Paths.Dir, now); err == nil {
-				loaded.Store.Close()
+				loaded.Close()
 				t.Fatal("read-only startup converted V2")
 			}
 			var raw []byte
@@ -182,7 +182,7 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 				if err != nil || got.Verify() != nil || !bytes.Equal(gotRaw, wantRaw) {
 					t.Fatalf("startup state changed: %v", err)
 				}
-				if err := loaded.Store.Close(); err != nil {
+				if err := loaded.Close(); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -196,7 +196,7 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			loaded.Store.Close()
+			loaded.Close()
 		})
 	}
 }
@@ -232,7 +232,7 @@ func TestLoadAuthorityRejectsInvalidLegacySignature(t *testing.T) {
 		t.Fatal(err)
 	}
 	if loaded, err := LoadAuthority(ctx, created.Paths.Dir, now); err == nil {
-		loaded.Store.Close()
+		loaded.Close()
 		t.Fatal("invalid legacy signature was accepted at startup")
 	}
 	var got []byte
@@ -253,7 +253,7 @@ func TestNodeStartupConvertsAuthorityAndReplicaFetchesV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer authority.Store.Close()
+	defer authority.Close()
 	for i, body := range []any{community.EventMessage{Text: "retained history"}, community.EventMetadata{Name: "Updated"}} {
 		nonce := make([]byte, 32)
 		nonce[0] = byte(i)
@@ -314,7 +314,7 @@ func TestNodeStartupConvertsAuthorityAndReplicaFetchesV3(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { destination.Store.Close() }()
+	defer func() { destination.Close() }()
 	page, err := authority.Store.Events(ctx, 0, 100)
 	if err != nil {
 		t.Fatal(err)
@@ -332,7 +332,7 @@ func TestNodeStartupConvertsAuthorityAndReplicaFetchesV3(t *testing.T) {
 	if _, err := db.Exec("UPDATE room_state SET raw_signed_state=?,revision_seqno=?,revision_hash=?", rawLegacy, legacy.RevisionSeqno, legacy.RevisionHash); err != nil {
 		t.Fatal(err)
 	}
-	if err := destination.Store.Close(); err != nil {
+	if err := destination.Close(); err != nil {
 		t.Fatal(err)
 	}
 	destination, err = OpenRelay(ctx, destination.Paths.Dir, created.Genesis, now)

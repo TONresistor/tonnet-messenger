@@ -31,7 +31,7 @@ func newServeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer authority.Store.Close()
+			defer authority.Close()
 			advertised := ""
 			if !localOnly {
 				var advertiseErr error

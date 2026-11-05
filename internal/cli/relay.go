@@ -47,7 +47,7 @@ func newRelayCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer relayState.Store.Close()
+			defer relayState.Close()
 			synced, err := replica.Sync(cmd.Context(), syncConfig, relayState.Store)
 			if err != nil {
 				return err

@@ -78,7 +78,7 @@ func newRoomMetadataCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer authority.Store.Close()
+			defer authority.Close()
 			state, err := authority.Store.State(cmd.Context())
 			if err != nil {
 				return err
@@ -118,7 +118,7 @@ func newRoomRoleCmd(role string) *cobra.Command {
 				if err != nil {
 					return err
 				}
-				defer authority.Store.Close()
+				defer authority.Close()
 				var body any
 				switch {
 				case role == "admin" && action == "grant":
@@ -162,7 +162,7 @@ func newRoomWritePolicyCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer authority.Store.Close()
+			defer authority.Close()
 			return submitOwnerBody(authority, community.EventWritePolicy{AnyoneCanWrite: args[0] == "everyone"})
 		},
 	}
@@ -306,11 +306,16 @@ func inspectRoom(ctx context.Context, dir string, now time.Time) (roomShowOutput
 	if err != nil {
 		return roomShowOutput{}, err
 	}
-	database, err := store.OpenReadOnly(ctx, paths.Database)
+	owner, err := store.OpenReadOnly(ctx, paths.Database)
 	if err != nil {
 		return roomShowOutput{}, err
 	}
-	defer database.Close()
+	defer owner.Close()
+	database, err := owner.ForRoom(genesis.RoomKey)
+	if err != nil {
+		return roomShowOutput{}, err
+	}
+
 	if err := database.ValidateGenesis(ctx, genesis); err != nil {
 		return roomShowOutput{}, err
 	}
