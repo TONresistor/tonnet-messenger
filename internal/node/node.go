@@ -24,6 +24,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/control"
 	"github.com/TONresistor/tonnet-messenger/internal/dht"
 	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
+	"github.com/TONresistor/tonnet-messenger/internal/payments"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
@@ -113,6 +114,7 @@ type Node struct {
 	relays           *relayDirectory
 	holders          *inboxHolders
 	inbox            *inboxService
+	payments         *payments.Relay
 }
 
 type readyPacketConn struct {
@@ -247,6 +249,13 @@ func New(cfg Config) (*Node, error) {
 	}
 	n.quicPacket = packet
 	if n.inbox != nil {
+		if cfg.DM.Payments != nil {
+			pctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
+			n.payments, err = payments.New(pctx, n.database, cfg.Key.Public().(ed25519.PublicKey), *cfg.DM.Payments)
+			cancel()
+			if err != nil { n.Close(); return nil, err }
+			n.cfg.DM.Limits.PaidOffers = n.payments.Offers()
+		}
 		n.relays, err = newRelayDirectory(n)
 		if err != nil {
 			n.Close()
@@ -262,16 +271,10 @@ func New(cfg Config) (*Node, error) {
 	select {
 	case <-packet.ready:
 	case err := <-n.quicErr:
-		n.cancel()
-		packet.Close()
-		qgw.Close()
-		gw.Close()
+		n.Close()
 		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
 	case <-time.After(5 * time.Second):
-		n.cancel()
-		qgw.Close()
-		packet.Close()
-		gw.Close()
+		n.Close()
 		return nil, fmt.Errorf("start TON QUIC server on %s: timed out", cfg.Listen)
 	}
 	return n, nil
@@ -368,6 +371,7 @@ func (n *Node) Close() error {
 			<-done
 		}
 		quicErr := n.qgw.Close()
+		if n.payments != nil { n.payments.Close() }
 		if n.inbox != nil {
 			n.inbox.close()
 		}
@@ -522,6 +526,7 @@ func (n *Node) Run(ctx context.Context) error {
 		start(func() { n.holders.run(ctx) })
 	}
 	start(func() { n.databaseMaintenanceLoop(ctx) })
+	if n.payments != nil { start(func() { n.paymentMaintenanceLoop(ctx) }) }
 	start(func() { n.peerMaintenanceLoop(ctx) })
 	for _, room := range n.roomList() {
 		if room.role == community.NodeRoleRelay {

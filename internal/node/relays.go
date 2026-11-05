@@ -73,7 +73,14 @@ func (r *relayDirectory) refreshOwn(ctx context.Context, now time.Time) error {
 		}
 		list.Addresses = []address.Address{&address.QUIC{IP: bytes.Clone(bound.IP.To4()), Port: int32(bound.Port)}}
 	}
-	card, err := community.SignRelayCardV1(r.node.cfg.Key, community.RelayCardV1{RelayKey: r.node.cfg.Key.Public().(ed25519.PublicKey), Addrs: list, Services: community.RelayServiceDM, PaymentKey: community.Zero256(), Offers: []community.RelayOfferV1{*r.node.cfg.DM.Limits.Offer}, Version: int32(now.Unix())})
+	services, paymentKey := int32(community.RelayServiceDM), community.Zero256()
+	offers := []community.RelayOfferV1{*r.node.cfg.DM.Limits.Offer}
+	if r.node.payments != nil && r.node.payments.HasOffers() {
+		services |= community.RelayServicePaidTiers
+		paymentKey = r.node.payments.PaymentKey()
+		offers = append(offers, r.node.payments.Offers()...)
+	}
+	card, err := community.SignRelayCardV1(r.node.cfg.Key, community.RelayCardV1{RelayKey: r.node.cfg.Key.Public().(ed25519.PublicKey), Addrs: list, Services: services, PaymentKey: paymentKey, Offers: offers, Version: int32(now.Unix())})
 	if err != nil {
 		return err
 	}

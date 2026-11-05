@@ -182,5 +182,13 @@ version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
 		}
 	}
 
+	if version < 6 {
+		if _, err := tx.ExecContext(ctx, paymentSchema); err != nil {
+			return fmt.Errorf("store: create payment schema: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)", 6, time.Now().Unix()); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }

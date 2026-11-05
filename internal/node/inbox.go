@@ -10,15 +10,17 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/payments"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
-// DMConfig enables the free inbox service and its relay advertisement.
+// DMConfig enables inbox service and its relay advertisement.
 type DMConfig struct {
 	Limits       store.InboxLimits
 	ChallengeTTL time.Duration
+	Payments     *payments.Config
 }
 
 func (c DMConfig) validate() error {
@@ -29,6 +31,10 @@ func (c DMConfig) validate() error {
 	if c.ChallengeTTL < time.Second || c.ChallengeTTL > time.Minute || c.ChallengeTTL%time.Second != 0 {
 		return errors.New("inbox challenge TTL must be an integer 1..60 seconds")
 	}
+	if len(c.Limits.PaidOffers) != 0 {
+		return errors.New("paid offers must be configured through the receiving payment backend")
+	}
+	if c.Payments != nil { return c.Payments.Validate() }
 	return nil
 }
 

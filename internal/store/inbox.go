@@ -49,6 +49,7 @@ CREATE INDEX idx_inbox_rate_time ON inbox_rate(accepted_at);
 // offered. Message/byte capacity and offer limits must be finite and positive.
 type InboxLimits struct {
 	Offer       *community.RelayOfferV1
+	PaidOffers  []community.RelayOfferV1
 	MaxMessages int64
 	MaxBytes    int64
 }
@@ -137,10 +138,17 @@ func (s *Store) DepositInbox(ctx context.Context, request community.InboxDeposit
 	if !errors.Is(err, sql.ErrNoRows) {
 		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot look up receipt", err)
 	}
-	if request.Tier != 0 || limits.Offer == nil || limits.Offer.Tier != 0 || limits.Offer.Services != community.RelayServiceDM {
+	selected := limits.Offer
+	if request.Tier != 0 {
+		selected = nil
+		for i := range limits.PaidOffers {
+			if limits.PaidOffers[i].Tier == request.Tier { selected = &limits.PaidOffers[i]; break }
+		}
+	}
+	if selected == nil || selected.Tier != request.Tier || selected.Services != community.RelayServiceDM {
 		return InboxDepositResult{}, reject(community.RejectInsufficientPrepaidBalance, "tier is not offered", nil)
 	}
-	offer := *limits.Offer
+	offer := *selected
 	if offer.Validate(community.RelayServiceDM) != nil || offer.MaxObjectBytes <= 0 || offer.RetentionSeconds <= 0 || offer.RequestsPerMinute <= 0 || offer.InboxQuotaBytes <= 0 || limits.MaxMessages <= 0 || limits.MaxBytes <= 0 {
 		return InboxDepositResult{}, fmt.Errorf("store: finite positive inbox limits are required")
 	}
@@ -181,6 +189,35 @@ FROM inbox_messages m JOIN inbox_receipts r ON r.dm_id=m.dm_id WHERE r.expire_at
 	if len(relay) != ed25519.PrivateKeySize {
 		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "invalid receipt authority", nil)
 	}
+	receipt, err := community.SignInboxReceiptV1(relay, community.InboxReceiptV1{RelayKey: relay.Public().(ed25519.PublicKey), DMID: id, InboxID: inbox, ExpireAt: m.ExpireAt})
+	if err != nil {
+		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot sign receipt", err)
+	}
+	receiptRaw, err = community.Encode(receipt)
+	if err != nil {
+		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot encode receipt", err)
+	}
+	if request.Tier != 0 {
+		// The shared writer mutex is also an admission permit: across all room
+		// views and physical connections only one paid deposit can be admitted
+		// but not stored/rejected here. This is stricter than four per key, and
+		// serializes the balance check with every credit and debit.
+		cost := int64(len(rawRequest)) + int64(len(receiptRaw))
+		var balance int64
+		err := tx.QueryRowContext(ctx, "SELECT balance_bytes FROM prepaid_balances WHERE client_key=? AND tier=?", authenticated, request.Tier).Scan(&balance)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return InboxDepositResult{}, reject(community.RejectRelayFullOrQuotaExceeded, "balance unavailable", err)
+		}
+		if balance < cost {
+			return InboxDepositResult{}, reject(community.RejectInsufficientPrepaidBalance, "insufficient prepaid bytes", nil)
+		}
+		if balance-cost < -4*(roomnet.MaxWireObjectSize+176) {
+			return InboxDepositResult{}, reject(community.RejectRelayFullOrQuotaExceeded, "paid admission bound exceeded", nil)
+		}
+		if _, err := tx.ExecContext(ctx, "UPDATE prepaid_balances SET balance_bytes=balance_bytes-? WHERE client_key=? AND tier=?", cost, authenticated, request.Tier); err != nil {
+			return InboxDepositResult{}, reject(community.RejectRelayFullOrQuotaExceeded, "cannot debit prepaid bytes", err)
+		}
+	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO inbox_counters(inbox_id,last_seqno) VALUES (?,0) ON CONFLICT(inbox_id) DO NOTHING", inbox); err != nil {
 		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot initialize inbox sequence", err)
 	}
@@ -189,14 +226,6 @@ FROM inbox_messages m JOIN inbox_receipts r ON r.dm_id=m.dm_id WHERE r.expire_at
 			return InboxDepositResult{}, reject(community.RejectRelayFullOrQuotaExceeded, "inbox sequence exhausted", nil)
 		}
 		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot allocate inbox sequence", err)
-	}
-	receipt, err := community.SignInboxReceiptV1(relay, community.InboxReceiptV1{RelayKey: relay.Public().(ed25519.PublicKey), DMID: id, InboxID: inbox, ExpireAt: m.ExpireAt})
-	if err != nil {
-		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot sign receipt", err)
-	}
-	receiptRaw, err = community.Encode(receipt)
-	if err != nil {
-		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot encode receipt", err)
 	}
 	if _, err := tx.ExecContext(ctx, "INSERT INTO inbox_receipts(dm_id,inbox_id,seqno,created_at,expire_at,keep_until,raw_receipt) VALUES (?,?,?,?,?,?,?)", id, inbox, seqno, m.CreatedAt, m.ExpireAt, m.CreatedAt+300, receiptRaw); err != nil {
 		return InboxDepositResult{}, reject(community.RejectPersistenceFailure, "cannot persist receipt", err)
