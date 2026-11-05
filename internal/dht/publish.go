@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
@@ -44,6 +45,8 @@ type Publisher struct {
 	key       ed25519.PrivateKey
 	room      []byte
 	overlayID []byte
+	close     func()
+	closeOnce sync.Once
 }
 
 func NewPublisher(ctx context.Context, gw *adnl.Gateway, cfgURL string, key ed25519.PrivateKey, room, overlayID []byte) (*Publisher, error) {
@@ -51,7 +54,22 @@ func NewPublisher(ctx context.Context, gw *adnl.Gateway, cfgURL string, key ed25
 	if err != nil {
 		return nil, err
 	}
-	return &Publisher{d: d, gw: gw, key: key, room: room, overlayID: overlayID}, nil
+	p := &Publisher{d: d, gw: gw, key: bytes.Clone(key), room: bytes.Clone(room), overlayID: bytes.Clone(overlayID), close: d.Close}
+	return p, nil
+}
+
+// ForRoom borrows the same DHT client and gateway. Only the original publisher
+// owns their lifetime: upstream Client.Close also closes the gateway.
+func (p *Publisher) ForRoom(room, overlayID []byte) *Publisher {
+	return &Publisher{d: p.d, gw: p.gw, key: p.key, room: bytes.Clone(room), overlayID: bytes.Clone(overlayID)}
+}
+
+func (p *Publisher) Close() {
+	p.closeOnce.Do(func() {
+		if p.close != nil {
+			p.close()
+		}
+	})
 }
 
 func nextPublishDelay(addrOK, overlayOK bool) time.Duration {
@@ -153,7 +171,7 @@ func (p *Publisher) publishOverlay(ctx context.Context) bool {
 	}
 	cctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	if _, _, err := p.d.StoreOverlayNodes(cctx, p.room, &overlay.NodesList{List: []overlay.Node{node}}, RecordTTL); err != nil {
+	if copies, _, err := p.d.StoreOverlayNodes(cctx, p.room, &overlay.NodesList{List: []overlay.Node{node}}, RecordTTL); err != nil || copies < 1 {
 		log.Printf("dht storeOverlayNodes: %v", err)
 		return false
 	}

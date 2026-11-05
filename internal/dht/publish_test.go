@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"net"
 	"testing"
 	"time"
@@ -197,5 +198,92 @@ func TestPublicADNLIP(t *testing.T) {
 		if got := PublicADNLIP(net.ParseIP(raw)); got != want {
 			t.Errorf("PublicADNLIP(%q) = %v, want %v", raw, got, want)
 		}
+	}
+}
+
+type publicationDHT struct {
+	fakeDHT
+	rooms [][]byte
+	nodes []overlay.Node
+	order []string
+}
+
+func (f *publicationDHT) StoreAddress(ctx context.Context, list address.List, ttl time.Duration, key ed25519.PrivateKey) (int, []byte, error) {
+	f.order = append(f.order, "address")
+	return f.fakeDHT.StoreAddress(ctx, list, ttl, key)
+}
+
+func (f *publicationDHT) StoreOverlayNodes(ctx context.Context, room []byte, nodes *overlay.NodesList, ttl time.Duration) (int, []byte, error) {
+	f.order = append(f.order, "overlay")
+	f.rooms = append(f.rooms, append([]byte(nil), room...))
+	f.nodes = append(f.nodes, nodes.List...)
+	return f.fakeDHT.StoreOverlayNodes(ctx, room, nodes, ttl)
+}
+
+func TestSharedDHTPublishesDistinctRoomsAfterAddressVerification(t *testing.T) {
+	for _, failure := range []string{"none", "address error", "zero addresses", "find error", "wrong endpoint", "overlay error", "zero overlays"} {
+		t.Run(failure, func(t *testing.T) {
+			list := address.List{Addresses: []address.Address{quicAddr("1.1.1.1", 17400)}}
+			f := &publicationDHT{fakeDHT: fakeDHT{storeAddrN: 1, findAddr: &list, storeOverN: 1}}
+			switch failure {
+			case "address error":
+				f.storeAddrErr = errors.New("store failed")
+			case "zero addresses":
+				f.storeAddrN = 0
+			case "find error":
+				f.findAddrErr = errors.New("find failed")
+			case "wrong endpoint":
+				f.findAddr = &address.List{Addresses: []address.Address{quicAddr("1.0.0.1", 17400)}}
+			case "overlay error":
+				f.storeOverErr = errors.New("overlay failed")
+			case "zero overlays":
+				f.storeOverN = 0
+			}
+			owner := testPublisher(t, f)
+			owner.gw.SetAddressList(list.Addresses)
+			closes := 0
+			owner.close = func() { closes++ }
+			var roomKeys [][]byte
+			for range 2 {
+				public, _, err := ed25519.GenerateKey(rand.Reader)
+				if err != nil {
+					t.Fatal(err)
+				}
+				roomKeys = append(roomKeys, public)
+				id, _ := tl.Hash(keys.PublicKeyOverlay{Key: public})
+				p := owner.ForRoom(public, id)
+				if p.d != owner.d || p.gw != owner.gw {
+					t.Fatal("room created another discovery owner")
+				}
+				addrOK, overlayOK := p.publish(context.Background())
+				wantAddress := failure == "none" || failure == "overlay error" || failure == "zero overlays"
+				if addrOK != wantAddress || overlayOK != (failure == "none") {
+					t.Fatalf("publish %s: address=%v overlay=%v", failure, addrOK, overlayOK)
+				}
+				p.Close()
+			}
+			if closes != 0 {
+				t.Fatal("borrower closed the shared client/gateway")
+			}
+			owner.Close()
+			owner.Close()
+			if closes != 1 {
+				t.Fatal("DHT owner was not closed exactly once")
+			}
+			if failure == "none" {
+				if len(f.nodes) != 2 || len(f.order) != 4 || f.order[0] != "address" || f.order[1] != "overlay" || f.order[2] != "address" || f.order[3] != "overlay" {
+					t.Fatal("overlay published before its findable address")
+				}
+				for i, nd := range f.nodes {
+					id, _ := tl.Hash(keys.PublicKeyOverlay{Key: roomKeys[i]})
+					public := nd.ID.(keys.PublicKeyED25519).Key
+					if !public.Equal(owner.key.Public()) || string(f.rooms[i]) != string(roomKeys[i]) || string(nd.Overlay) != string(id) || nd.CheckSignature() != nil {
+						t.Fatal("room publication has wrong identity, overlay or signature")
+					}
+				}
+			} else if failure != "overlay error" && failure != "zero overlays" && f.storeOver != 0 {
+				t.Fatal("failed address verification published an overlay")
+			}
+		})
 	}
 }

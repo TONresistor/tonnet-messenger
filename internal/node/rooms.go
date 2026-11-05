@@ -63,9 +63,6 @@ func configuredRooms(ctx context.Context, cfg Config) ([]*roomContext, error) {
 		}
 		return []*roomContext{r}, nil
 	}
-	if len(cfg.Rooms) > 1 && !cfg.LocalOnly {
-		return nil, errors.New("public multi-room runtime is not supported yet")
-	}
 	if cfg.Genesis != nil || len(cfg.RoomKey) != 0 || cfg.NodeRole != 0 || len(cfg.OverlayID) != 0 {
 		return nil, errors.New("room list cannot be mixed with single-room configuration")
 	}

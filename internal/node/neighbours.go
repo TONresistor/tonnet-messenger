@@ -31,7 +31,7 @@ const (
 	dialTimeout = 15 * time.Second
 )
 
-func (n *Node) discoveryLoop(ctx context.Context) {
+func (n *roomRuntime) discoveryLoop(ctx context.Context) {
 	timer := time.NewTimer(discoverWarmup)
 	defer timer.Stop()
 	for {
@@ -39,18 +39,20 @@ func (n *Node) discoveryLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+			n.discoverOnce(ctx)
+			timer.Reset(DiscoverEach)
+		case nd := <-n.room.advertised:
+			n.considerNode(ctx, &nd)
 		}
-		n.discoverOnce(ctx)
-		timer.Reset(DiscoverEach)
 	}
 }
 
-func (n *Node) discoverOnce(ctx context.Context) {
+func (n *roomRuntime) discoverOnce(ctx context.Context) {
 	pub := n.publisher()
 	if pub == nil {
 		return
 	}
-	if list, err := pub.FindOverlayNodes(ctx, n.overlayKey()); err != nil {
+	if list, err := pub.FindOverlayNodes(ctx, n.room.genesis.RoomKey); err != nil {
 		log.Printf("discover: dht find: %v", err)
 	} else if list != nil {
 		for i := range capNodes(list.List) {
@@ -58,7 +60,7 @@ func (n *Node) discoverOnce(ctx context.Context) {
 		}
 	}
 
-	for _, p := range n.peers.nodePeers() {
+	for _, p := range n.Node.peers.nodePeers() {
 		nodes, ok := n.probeNode(ctx, p)
 		if !ok {
 			continue
@@ -77,7 +79,7 @@ func capNodes(nodes []tonoverlay.Node) []tonoverlay.Node {
 	return nodes
 }
 
-func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
+func (n *roomRuntime) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 	pub := n.publisher()
 	if pub == nil {
 		return
@@ -93,6 +95,14 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 
 	signed := *nd
 	if n.alreadyMeshed(idHex, &signed) {
+		return
+	}
+	// An authenticated compatible connection can be shared, but the scoped
+	// response must independently prove that this endpoint serves this room.
+	if p, ok := n.Node.peers.get(idHex); ok && n.outboundReady(p) {
+		if nodes, ok := n.probeNode(ctx, p); ok {
+			n.queueNodes(nodes)
+		}
 		return
 	}
 
@@ -125,18 +135,14 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 		return
 	}
 
-	n.peers.markKnown(idHex)
+	n.Node.peers.markKnown(idHex)
 	for _, dialAddress := range dialAddresses {
 		p, err := n.dialNode(dctx, pubKey, dialAddress)
 		if err != nil {
 			continue
 		}
-		n.forRoom(n.room).peers.setNode(p, &signed)
 		if nodes, ok := n.probeNode(ctx, p); ok {
-			for i := range capNodes(nodes) {
-				nd := nodes[i]
-				go n.considerNode(context.Background(), &nd)
-			}
+			n.queueNodes(nodes)
 		}
 		log.Printf("meshed with node %s… at %s (%s)", short(idHex), dialAddress, n.countsString())
 		return
@@ -144,10 +150,12 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 	log.Printf("discover: no live QUIC address for %s…", short(idHex))
 }
 
-func (n *Node) alreadyMeshed(idHex string, signed *tonoverlay.Node) bool {
+func (n *roomRuntime) alreadyMeshed(idHex string, signed *tonoverlay.Node) bool {
 	if p, ok := n.peers.get(idHex); ok {
-		n.forRoom(n.room).peers.setNode(p, signed)
-		return n.outboundReady(p)
+		if n.outboundReady(p) && n.peers.isHealthyNode(p) {
+			n.peers.setNode(p, signed)
+			return true
+		}
 	}
 	return false
 }
@@ -163,16 +171,50 @@ func (n *roomRuntime) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node
 	if err != nil {
 		return nil, false
 	}
-	err = p.queryNodeRoom(gctx, n.room.genesis.RoomKey, tonoverlay.GetRandomPeers{List: tonoverlay.NodesList{List: []tonoverlay.Node{self}}}, &result)
+	err = p.withOutbound(func(conn *roomnet.Peer) error {
+		if err := conn.QueryRoomOutbound(gctx, n.room.genesis.RoomKey, tonoverlay.GetRandomPeers{List: tonoverlay.NodesList{List: []tonoverlay.Node{self}}}, &result); err != nil {
+			var rejected *roomnet.OverlayRejection
+			if errors.As(err, &rejected) && rejected.Code == community.RejectOverlayNotServed {
+				n.peers.forgetNode(p)
+			}
+			return err
+		}
+		result.List = capNodes(result.List)
+		// Keep the strict-outbound lease until the scoped proof is installed;
+		// a reconnect cannot make an old reply authorize its replacement.
+		n.observeRoomNode(p, result.List)
+		return nil
+	})
 	if err != nil {
-		if !errors.Is(err, errOutboundUnprobed) {
+		var rejected *roomnet.OverlayRejection
+		if errors.As(err, &rejected) && rejected.Code == community.RejectOverlayNotServed {
+			return nil, false
+		}
+		if !errors.Is(err, errOutboundUnprobed) && ctx.Err() == nil {
 			n.peerFailure(p, time.Now(), "peer probe failed")
 		}
 		return nil, false
 	}
 	n.Node.peers.markNodeGood(p.id, time.Now())
-	n.observeRoomNode(p, result.List)
 	return result.List, true
+}
+
+// Incoming advertisements are bounded, verified hints, processed by the owned
+// room loop rather than detached goroutines that survive Run cancellation.
+func (n *roomRuntime) queueNodes(nodes []tonoverlay.Node) {
+	if n.publisher() == nil {
+		return
+	}
+	for _, nd := range capNodes(nodes) {
+		id, _, err := n.verifyNode(&nd)
+		if err != nil || hex.EncodeToString(id) == n.myID {
+			continue
+		}
+		select {
+		case n.room.advertised <- nd:
+		default:
+		}
+	}
 }
 
 func (n *roomRuntime) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
@@ -262,12 +304,7 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		return err
 	}
 	n.peers.markNodeGood(p.id, now)
-	for i := range capNodes(advertised.List) {
-		nd := advertised.List[i]
-		if len(n.roomList()) == 1 {
-			go n.considerNode(context.Background(), &nd)
-		}
-	}
+	r.queueNodes(advertised.List)
 	return nil
 }
 

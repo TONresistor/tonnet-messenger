@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
@@ -16,6 +17,8 @@ const (
 )
 
 func (n *Node) peerMaintenanceLoop(ctx context.Context) {
+	var workers sync.WaitGroup
+	defer workers.Wait()
 	ticker := time.NewTicker(peerMaintenanceEach)
 	defer ticker.Stop()
 	for {
@@ -28,7 +31,8 @@ func (n *Node) peerMaintenanceLoop(ctx context.Context) {
 				n.closePeer(p, "leaf activity expired")
 			}
 			for _, p := range n.peers.nodePeersIdleSince(now, peerKeepaliveIdle) {
-				go n.keepalivePeer(ctx, p)
+				workers.Add(1)
+				go func() { defer workers.Done(); n.keepalivePeer(ctx, p) }()
 			}
 		}
 	}

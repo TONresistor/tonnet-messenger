@@ -96,6 +96,15 @@ type Node struct {
 	nodeDialsMu     sync.Mutex
 	nodeDials       map[string]*nodeDialLock
 	resolveIdentity IdentityResolver
+	ctx             context.Context
+	cancel          context.CancelFunc
+	runMu           sync.Mutex
+	runCancel       context.CancelFunc
+	runDone         chan struct{}
+	closed          bool
+	closeOnce       sync.Once
+	closeErr        error
+	newPublishers   func(context.Context) ([]roomPublisher, func(), error)
 }
 
 type readyPacketConn struct {
@@ -127,8 +136,7 @@ func New(cfg Config) (*Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Config remains the single-room public input. The running node keeps its
-	// transport configuration separately from the context's owned authority.
+	// Transport configuration is shared; each context owns its room authority.
 	database := cfg.Store
 	cfg.Key = bytes.Clone(cfg.Key)
 	cfg.Genesis, cfg.Store, cfg.RoomKey, cfg.OverlayID = nil, nil, nil, nil
@@ -172,6 +180,7 @@ func New(cfg Config) (*Node, error) {
 		n.byOverlay[string(room.overlayID)] = room
 		n.byRoom[string(room.genesis.RoomKey)] = room
 	}
+	n.ctx, n.cancel = context.WithCancel(context.Background())
 	if cfg.ResolveIdentity != nil {
 		n.resolveIdentity = cfg.ResolveIdentity
 	} else {
@@ -184,6 +193,7 @@ func New(cfg Config) (*Node, error) {
 	if cfg.Advertise != "" {
 		addr, err := parseAddress(cfg.Advertise)
 		if err != nil {
+			n.cancel()
 			qgw.Close()
 			gw.Close()
 			return nil, err
@@ -193,6 +203,7 @@ func New(cfg Config) (*Node, error) {
 
 	packet, err := listenQUIC(cfg.Listen)
 	if err != nil {
+		n.cancel()
 		qgw.Close()
 		gw.Close()
 		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
@@ -202,11 +213,13 @@ func New(cfg Config) (*Node, error) {
 	select {
 	case <-packet.ready:
 	case err := <-n.quicErr:
+		n.cancel()
 		packet.Close()
 		qgw.Close()
 		gw.Close()
 		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
 	case <-time.After(5 * time.Second):
+		n.cancel()
 		qgw.Close()
 		packet.Close()
 		gw.Close()
@@ -275,7 +288,7 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 	return nil
 }
 
-func (n *Node) publisher() *dht.Publisher { return n.room.pub.Load() }
+func (n *Node) publisher() roomPublisher { return n.forRoom(n.room).publisher() }
 
 func (n *Node) acquireDial() bool {
 	select {
@@ -291,12 +304,26 @@ func (n *Node) releaseDial() { <-n.dialSem }
 func (n *Node) ADNLID() []byte { return n.qgw.ID() }
 
 func (n *Node) Close() error {
-	quicErr := n.qgw.Close()
-	packetErr := n.quicPacket.Close()
-	if errors.Is(packetErr, net.ErrClosed) {
-		packetErr = nil
-	}
-	return errors.Join(quicErr, packetErr, n.gw.Close())
+	n.closeOnce.Do(func() {
+		n.runMu.Lock()
+		n.closed = true
+		n.cancel()
+		if n.runCancel != nil {
+			n.runCancel()
+		}
+		done := n.runDone
+		n.runMu.Unlock()
+		if done != nil {
+			<-done
+		}
+		quicErr := n.qgw.Close()
+		packetErr := n.quicPacket.Close()
+		if errors.Is(packetErr, net.ErrClosed) {
+			packetErr = nil
+		}
+		n.closeErr = errors.Join(quicErr, packetErr, n.gw.Close())
+	})
+	return n.closeErr
 }
 
 func (n *Node) countsString() string {
@@ -336,18 +363,34 @@ func (n *Node) Status() control.Status {
 }
 
 func (n *Node) Run(ctx context.Context) error {
-	if len(n.roomList()) > 1 && !n.cfg.LocalOnly {
-		return errors.New("public multi-room runtime is not supported yet")
-	}
 	if !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
+	n.runMu.Lock()
+	if n.closed || n.runDone != nil {
+		n.runMu.Unlock()
+		return errors.New("node is closed or already running")
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	n.runCancel, n.runDone = cancel, done
+	n.runMu.Unlock()
+	var workers sync.WaitGroup
+	start := func(work func()) { workers.Add(1); go func() { defer workers.Done(); work() }() }
+	defer func() {
+		cancel()
+		workers.Wait()
+		n.runMu.Lock()
+		n.runCancel = nil
+		close(done)
+		n.runMu.Unlock()
+	}()
 	if n.hasSequencerRoom() {
 		ready := make(chan struct{})
 		serveErr := make(chan error, 1)
-		go func() {
+		start(func() {
 			serveErr <- control.ServeWithMutationsReady(ctx, n.cfg.Socket, n.Status, n.submitLocal, ready)
-		}()
+		})
 		select {
 		case <-ready:
 		case err := <-serveErr:
@@ -355,42 +398,56 @@ func (n *Node) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		go func() {
+		start(func() {
 			if err := <-serveErr; err != nil && ctx.Err() == nil {
 				log.Printf("control socket: %v", err)
 			}
-		}()
+		})
 	} else if n.cfg.Socket != "" {
-		go func() {
+		start(func() {
 			if err := control.Serve(ctx, n.cfg.Socket, n.Status); err != nil {
 				log.Printf("control socket: %v", err)
 			}
-		}()
+		})
 	}
-	if n.cfg.LocalOnly {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case err := <-n.quicErr:
-			if err == nil {
-				return errors.New("TON QUIC server stopped")
+	if !n.cfg.LocalOnly {
+		create := n.newPublishers
+		if create == nil {
+			create = n.createPublishers
+		}
+		pubs, closePublishers, err := create(ctx)
+		if err != nil {
+			return fmt.Errorf("dht publisher: %w", err)
+		}
+		// Stop and join all borrowers before closing the shared DHT owner.
+		defer func() {
+			cancel()
+			workers.Wait()
+			if closePublishers != nil {
+				closePublishers()
 			}
-			return fmt.Errorf("TON QUIC server: %w", err)
+			for _, r := range n.roomList() {
+				r.pub.Store(nil)
+			}
+		}()
+		if len(pubs) != len(n.roomList()) {
+			return errors.New("missing room publisher")
+		}
+		for i, room := range n.roomList() {
+			pub := pubs[i]
+			room.pub.Store(&roomPublication{pub})
+			r := n.forRoom(room)
+			start(func() { pub.Run(ctx) })
+			start(func() { r.discoveryLoop(ctx) })
 		}
 	}
-
-	pub, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, n.overlayKey(), n.room.overlayID)
-	if err != nil {
-		return fmt.Errorf("dht publisher: %w", err)
-	}
-	n.room.pub.Store(pub)
-
-	go pub.Run(ctx)
-	go n.discoveryLoop(ctx)
-	go n.databaseMaintenanceLoop(ctx)
-	go n.peerMaintenanceLoop(ctx)
-	if n.room.role == community.NodeRoleRelay {
-		go n.replicaReconcileLoop(ctx)
+	start(func() { n.databaseMaintenanceLoop(ctx) })
+	start(func() { n.peerMaintenanceLoop(ctx) })
+	for _, room := range n.roomList() {
+		if room.role == community.NodeRoleRelay {
+			r := n.forRoom(room)
+			start(func() { r.replicaReconcileLoop(ctx) })
+		}
 	}
 
 	select {
@@ -404,18 +461,30 @@ func (n *Node) Run(ctx context.Context) error {
 	}
 }
 
-func (n *Node) replicaReconcileLoop(ctx context.Context) {
+func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, func(), error) {
+	rooms := n.roomList()
+	owner, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, rooms[0].genesis.RoomKey, rooms[0].overlayID)
+	if err != nil {
+		return nil, nil, err
+	}
+	pubs := make([]roomPublisher, len(rooms))
+	for i, room := range rooms {
+		pubs[i] = owner.ForRoom(room.genesis.RoomKey, room.overlayID)
+	}
+	return pubs, owner.Close, nil
+}
+
+func (n *roomRuntime) replicaReconcileLoop(ctx context.Context) {
 	ticker := time.NewTicker(replicaReconcileEach)
 	defer ticker.Stop()
 	for {
+		if err := n.reconcileReplicaOnce(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("replica reconcile: %v", err)
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-		}
-		err := n.reconcileReplicaOnce()
-		if err != nil && ctx.Err() == nil {
-			log.Printf("replica reconcile: %v", err)
 		}
 	}
 }
@@ -427,18 +496,29 @@ func (n *Node) reconcileReplicaOnce() error {
 		if room.role != community.NodeRoleRelay {
 			continue
 		}
-		sequencer, ok := r.sequencerPeer()
-		if !ok {
-			continue
-		}
-		room.replicaMu.Lock()
-		err := r.syncReplicaLocked(sequencer)
-		room.replicaMu.Unlock()
+		err := r.reconcileReplicaOnce(n.backgroundContext())
 		if err != nil {
 			failures = append(failures, err)
 		}
 	}
 	return errors.Join(failures...)
+}
+
+func (n *roomRuntime) reconcileReplicaOnce(ctx context.Context) error {
+	sequencer, ok := n.sequencerPeer()
+	if !ok {
+		return nil
+	}
+	n.room.replicaMu.Lock()
+	defer n.room.replicaMu.Unlock()
+	return n.syncReplicaContext(ctx, sequencer)
+}
+
+func (n *Node) backgroundContext() context.Context {
+	if n.ctx != nil {
+		return n.ctx
+	}
+	return context.Background()
 }
 
 func (n *Node) databaseMaintenanceLoop(ctx context.Context) {

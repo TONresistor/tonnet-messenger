@@ -240,8 +240,8 @@ func TestLocalMultiRoomRoutingMembershipAndManagedReconnect(t *testing.T) {
 	waitMultiCounts(t, ctx, n, 1, 1) // stale cleanup is pointer-scoped.
 }
 
-func TestMultiRoomRegistrationRejectsUnsupportedOrInvalidAuthority(t *testing.T) {
-	for _, mode := range []string{"public", "duplicate", "bad room key", "bad node key", "replica authority", "mixed config"} {
+func TestMultiRoomRegistrationRejectsInvalidAuthority(t *testing.T) {
+	for _, mode := range []string{"duplicate", "bad room key", "bad node key", "replica authority", "mixed config"} {
 		t.Run(mode, func(t *testing.T) {
 			f := sharedRoomBinding(t)
 			bindingLegacyState(t, f, 0)
@@ -249,8 +249,6 @@ func TestMultiRoomRegistrationRejectsUnsupportedOrInvalidAuthority(t *testing.T)
 			beforeA, beforeB := bindingRawState(t, f, 0), bindingRawState(t, f, 1)
 			cfg := multiConfig(t, f)
 			switch mode {
-			case "public":
-				cfg.LocalOnly = false
 			case "duplicate":
 				cfg.Rooms[1] = cfg.Rooms[0]
 			case "bad room key":
@@ -435,9 +433,16 @@ func TestMultiRoomReplicaRefreshUsesItsSelectedContext(t *testing.T) {
 	}
 }
 
-func TestPublicMultiRoomRunFailsExplicitly(t *testing.T) {
-	n := &Node{rooms: []*roomContext{{}, {}}}
-	if err := n.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "public multi-room") {
-		t.Fatalf("unsupported public Run was accepted: %v", err)
+func TestPublicMultiRoomRegistrationStillRequiresAdvertise(t *testing.T) {
+	f := sharedRoomBinding(t)
+	cfg := multiConfig(t, f)
+	cfg.LocalOnly = false
+	n, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer n.Close()
+	if err := n.Run(context.Background()); err == nil || !strings.Contains(err.Error(), "advertise address is required") {
+		t.Fatalf("public Run without an endpoint was accepted: %v", err)
 	}
 }

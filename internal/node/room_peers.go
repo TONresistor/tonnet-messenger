@@ -58,6 +58,16 @@ func (v roomPeerView) setNode(p *peer, signed *tonoverlay.Node) {
 	v.room.associations[p] = a
 }
 
+// A scoped "not served" answer withdraws only this room's node association.
+// The shared authenticated peer and its other room relationships stay intact.
+func (v roomPeerView) forgetNode(p *peer) {
+	v.room.peersMu.Lock()
+	defer v.room.peersMu.Unlock()
+	if v.room.associations[p].node {
+		delete(v.room.associations, p)
+	}
+}
+
 func (v roomPeerView) relation(p *peer) (roomAssociation, bool) {
 	if p == nil {
 		return roomAssociation{}, false

@@ -255,27 +255,31 @@ func (n *roomRuntime) syncReplicaFromPeers(source *peer) error {
 }
 
 func (n *roomRuntime) syncReplicaLocked(source *peer) error {
-	head, err := n.room.store.Head(context.Background())
+	return n.syncReplicaContext(n.backgroundContext(), source)
+}
+
+func (n *roomRuntime) syncReplicaContext(ctx context.Context, source *peer) error {
+	head, err := n.room.store.Head(ctx)
 	if err != nil {
 		return err
 	}
 	for {
 		var page community.EventList
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := source.queryNodeRoom(ctx, n.room.genesis.RoomKey, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		queryCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		err := source.queryNodeRoom(queryCtx, n.room.genesis.RoomKey, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
 		}
 		for _, event := range page.Events {
-			appended, err := n.room.store.AppendReplica(context.Background(), event)
+			appended, err := n.room.store.AppendReplica(ctx, event)
 			if err != nil {
 				return err
 			}
 			if appended {
 				n.stats.replayedItems.Add(1)
 			}
-			head, err = n.room.store.Head(context.Background())
+			head, err = n.room.store.Head(ctx)
 			if err != nil {
 				return err
 			}
@@ -287,18 +291,22 @@ func (n *roomRuntime) syncReplicaLocked(source *peer) error {
 			return errors.New("empty replica page with has_more")
 		}
 	}
-	return n.installStateFromPeer(source)
+	return n.installStateContext(ctx, source)
 }
 
 func (n *roomRuntime) installStateFromPeer(source *peer) error {
+	return n.installStateContext(n.backgroundContext(), source)
+}
+
+func (n *roomRuntime) installStateContext(parent context.Context, source *peer) error {
 	var result community.RoomStateResult
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
 	err := source.queryNodeRoom(ctx, n.room.genesis.RoomKey, community.GetRoomState{}, &result)
 	cancel()
 	if err != nil {
 		return err
 	}
-	return n.room.store.InstallReplicaState(context.Background(), result.State)
+	return n.room.store.InstallReplicaState(parent, result.State)
 }
 
 func (n *roomRuntime) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, error) {

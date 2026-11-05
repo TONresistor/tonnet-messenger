@@ -10,10 +10,17 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
-	"github.com/TONresistor/tonnet-messenger/internal/dht"
 	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
+	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 )
+
+type roomPublisher interface {
+	Run(context.Context)
+	FindOverlayNodes(context.Context, []byte) (*tonoverlay.NodesList, error)
+	ResolveAll(context.Context, []byte) ([]string, ed25519.PublicKey, error)
+}
+type roomPublication struct{ roomPublisher }
 
 // roomContext owns one room's authority and verified data. The selected store
 // is a borrowed ForRoom view; the caller still owns the shared database.
@@ -30,7 +37,8 @@ type roomContext struct {
 	dedup        *ov.Dedup
 	domainMu     sync.Mutex
 	domainCache  map[string]identityDomainCache
-	pub          atomic.Pointer[dht.Publisher]
+	pub          atomic.Pointer[roomPublication]
+	advertised   chan tonoverlay.Node
 	peersMu      sync.RWMutex
 	associations map[*peer]roomAssociation
 }
@@ -99,7 +107,14 @@ func bindRoomContext(ctx context.Context, cfg Config) (*roomContext, error) {
 		return nil, err
 	}
 
-	return &roomContext{genesis: genesis, overlayID: overlayID, store: selected, roomKey: key, role: role, dedup: ov.NewDedup(deliveredCap), domainCache: make(map[string]identityDomainCache), associations: make(map[*peer]roomAssociation)}, nil
+	return &roomContext{genesis: genesis, overlayID: overlayID, store: selected, roomKey: key, role: role, dedup: ov.NewDedup(deliveredCap), domainCache: make(map[string]identityDomainCache), associations: make(map[*peer]roomAssociation), advertised: make(chan tonoverlay.Node, maxGossipNodes)}, nil
+}
+
+func (n *roomRuntime) publisher() roomPublisher {
+	if pub := n.room.pub.Load(); pub != nil {
+		return pub.roomPublisher
+	}
+	return nil
 }
 
 func cloneRoomGenesis(g community.Genesis) community.Genesis {
