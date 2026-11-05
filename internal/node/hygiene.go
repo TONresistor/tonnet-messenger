@@ -2,6 +2,7 @@ package node
 
 import (
 	"context"
+	"errors"
 	"log"
 	"time"
 
@@ -40,7 +41,10 @@ func (n *Node) keepalivePeer(ctx context.Context, p *peer) {
 	kctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
 	var remote broadcast.Time
-	if err := p.conn.Query(kctx, broadcast.GetTime{}, &remote); err != nil {
+	if err := p.queryNode(kctx, broadcast.GetTime{}, &remote); err != nil {
+		if errors.Is(err, errOutboundUnprobed) {
+			return
+		}
 		log.Printf("keepalive to %s… failed: %v", short(p.id), err)
 		n.peerFailure(p, time.Now(), "keepalive failed")
 		return

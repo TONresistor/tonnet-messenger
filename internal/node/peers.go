@@ -5,10 +5,12 @@ import (
 	"crypto/ed25519"
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
@@ -66,6 +68,11 @@ type peer struct {
 	out       chan outboundJob
 	stop      chan struct{}
 	stopOnce  sync.Once
+
+	outboundMu     sync.RWMutex
+	outboundCaps   atomic.Pointer[community.Capabilities]
+	outboundProbed bool
+	outboundError  error
 }
 
 type peerTable struct {
@@ -416,7 +423,7 @@ func (t *peerTable) nodeTargets(exclude string, max int) []*peer {
 		if id == exclude {
 			continue
 		}
-		if p.kind == kindNode && p.state == peerHealthy {
+		if p.kind == kindNode && p.state == peerHealthy && p.outboundCaps.Load() != nil {
 			out = append(out, p)
 		}
 	}
@@ -571,4 +578,13 @@ func (b *tokenBucket) take(n float64) bool {
 		return true
 	}
 	return false
+}
+
+func (t *peerTable) isNode(candidate *peer) bool {
+	if candidate == nil {
+		return false
+	}
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return candidate.kind == kindNode
 }

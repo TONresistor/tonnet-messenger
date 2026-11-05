@@ -29,11 +29,27 @@ func (p *Peer) QueryRoom(ctx context.Context, roomKey []byte, request, result an
 }
 
 func (p *Peer) QueryOverlay(ctx context.Context, id []byte, request, result any) error {
+	return p.queryOverlay(ctx, id, request, result, false)
+}
+
+func (p *Peer) QueryOverlayOutbound(ctx context.Context, id []byte, request, result any) error {
+	return p.queryOverlay(ctx, id, request, result, true)
+}
+
+func (p *Peer) QueryRoomOutbound(ctx context.Context, roomKey []byte, request, result any) error {
+	id, err := community.OverlayID(roomKey)
+	if err != nil {
+		return err
+	}
+	return p.QueryOverlayOutbound(ctx, id, request, result)
+}
+
+func (p *Peer) queryOverlay(ctx context.Context, id []byte, request, result any, outbound bool) error {
 	raw, err := tl.Serialize(request, true)
 	if err != nil {
 		return err
 	}
-	answer, err := p.query(ctx, community.OverlayQueryV1{Overlay: id, Query: raw})
+	answer, err := p.queryUsing(ctx, community.OverlayQueryV1{Overlay: id, Query: raw}, outbound)
 	if err != nil {
 		return err
 	}

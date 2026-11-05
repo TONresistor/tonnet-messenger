@@ -254,6 +254,7 @@ func TestRelayInstallsStateReceivedFromAnotherVerifiedRelay(t *testing.T) {
 	destinationPeers := newPeerTable(DefaultMaxLeaves)
 	sourcePeer := newPeer("source", kindNode, session.Peer, nil)
 	sourcePeer.state = peerHealthy
+	sourcePeer.outboundCaps.Store(&session.Capabilities)
 	destinationPeers.m[sourcePeer.id] = sourcePeer
 	destination := &Node{genesis: genesis, store: destinationStore, peers: destinationPeers}
 	if err := destination.persistReplicaEvent(sourcePeer, committed.Event); err != nil {
@@ -342,6 +343,7 @@ func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
 	peerID := hex.EncodeToString(sequencerID)
 	sequencerPeer := newPeer(peerID, kindNode, session.Peer, nil)
 	sequencerPeer.state = peerHealthy
+	sequencerPeer.outboundCaps.Store(&session.Capabilities)
 	peers.m[peerID] = sequencerPeer
 	destination := &Node{store: relayStore, peers: peers, genesis: genesis}
 	if err := destination.reconcileReplicaOnce(); err != nil {
@@ -511,6 +513,7 @@ func TestRoomBansRefreshReplicaStateAndRejectAuthors(t *testing.T) {
 	peers := newPeerTable(DefaultMaxLeaves)
 	source := newPeer("sequencer", kindNode, sourceSession.Peer, nil)
 	source.state = peerHealthy
+	source.outboundCaps.Store(&sourceSession.Capabilities)
 	peers.m[source.id] = source
 	destination := &Node{store: destinationStore, peers: peers, genesis: genesis}
 	submit := func(session *replica.Session, author ed25519.PrivateKey, body any) any {

@@ -199,6 +199,9 @@ func TestForwardedOverlayRejectionsAndSuccessfulSubmission(t *testing.T) {
 	server.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(q *roomnet.Query) error {
+			if _, ok := q.Data.(community.GetCapabilities); ok {
+				return q.Answer(roomnet.LocalCapabilities())
+			}
 			if selected, err := q.SelectOverlay(id); err != nil || !selected {
 				return err
 			}
@@ -236,7 +239,7 @@ func TestForwardedOverlayRejectionsAndSuccessfulSubmission(t *testing.T) {
 	sequencerID, _ := community.KeyID(genesis.NodeKey)
 	peerID := hex.EncodeToString(sequencerID)
 	runtime.peers.markKnown(peerID)
-	if _, err := runtime.qgw.DialDefault(ctx, genesis.NodeKey, packet.LocalAddr().String()); err != nil {
+	if _, err := runtime.dialNode(ctx, genesis.NodeKey, packet.LocalAddr().String()); err != nil {
 		t.Fatal(err)
 	}
 	upstream, ok := runtime.peers.get(peerID)

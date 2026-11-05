@@ -3,6 +3,7 @@ package node
 import (
 	"context"
 	"crypto/ed25519"
+	"errors"
 	"log"
 	"time"
 
@@ -30,6 +31,7 @@ func (n *Node) wirePeer(p *peer) {
 	})
 	p.conn.SetQueryHandler(func(query *roomnet.Query) error { return n.answerQuery(p, query) })
 	p.conn.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
+		p.outboundCaps.Store(nil)
 		if n.peers.removePeer(id, p) {
 			p.stopOnce.Do(func() { close(p.stop) })
 			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
@@ -45,11 +47,20 @@ func (n *Node) outboundWriter(p *peer) {
 		case job := <-p.out:
 			for _, item := range job.items {
 				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
-				err := p.conn.SendMessage(ctx, item)
+				var err error
+				p.outboundMu.RLock()
+				if n.peers.isNode(p) {
+					err = p.useOutbound(func(conn *roomnet.Peer) error { return conn.SendOutboundMessage(ctx, item) })
+				} else {
+					err = p.conn.SendMessage(ctx, item)
+				}
+				p.outboundMu.RUnlock()
 				cancel()
 				if err != nil {
 					log.Printf("relay to %s… failed: %v", short(p.id), err)
-					n.peerFailure(p, time.Now(), "relay failed")
+					if !errors.Is(err, errOutboundUnprobed) {
+						n.peerFailure(p, time.Now(), "relay failed")
+					}
 					break
 				}
 			}

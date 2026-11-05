@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -126,11 +127,8 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 
 	n.peers.markKnown(idHex)
 	for _, dialAddress := range dialAddresses {
-		if _, err := n.qgw.DialDefault(dctx, pubKey, dialAddress); err != nil {
-			continue
-		}
-		p, ok := n.peers.get(idHex)
-		if !ok {
+		p, err := n.dialNode(dctx, pubKey, dialAddress)
+		if err != nil {
 			continue
 		}
 		n.peers.setSigned(idHex, &signed)
@@ -147,9 +145,9 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 }
 
 func (n *Node) alreadyMeshed(idHex string, signed *tonoverlay.Node) bool {
-	if _, ok := n.peers.get(idHex); ok {
+	if p, ok := n.peers.get(idHex); ok {
 		n.peers.setSigned(idHex, signed)
-		return true
+		return n.outboundReady(p)
 	}
 	return false
 }
@@ -160,13 +158,16 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 	}
 	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
-	nodes, err := p.conn.GetRandomPeers(gctx, n.cfg.OverlayID)
+	var result tonoverlay.NodesList
+	err := p.queryNodeRoom(gctx, n.genesis.RoomKey, tonoverlay.GetRandomPeers{}, &result)
 	if err != nil {
-		n.peerFailure(p, time.Now(), "peer probe failed")
+		if !errors.Is(err, errOutboundUnprobed) {
+			n.peerFailure(p, time.Now(), "peer probe failed")
+		}
 		return nil, false
 	}
 	n.peers.markNodeGood(p.id, time.Now())
-	return nodes, true
+	return result.List, true
 }
 
 func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {

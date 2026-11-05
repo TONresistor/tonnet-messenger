@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
@@ -18,9 +19,24 @@ func LocalCapabilities() community.Capabilities {
 // ProbeCapabilities does not cache on Peer: server-mode peers can replace their
 // connections. A dedicated client-only session owns the returned value.
 func (p *Peer) ProbeCapabilities(ctx context.Context) (community.Capabilities, error) {
+	return p.probeCapabilities(ctx, false)
+}
+
+func (p *Peer) ProbeCapabilitiesOutbound(ctx context.Context) (community.Capabilities, error) {
+	return p.probeCapabilities(ctx, true)
+}
+
+func (p *Peer) probeCapabilities(ctx context.Context, outbound bool) (community.Capabilities, error) {
 	for attempt := 0; ; attempt++ {
-		raw, err := p.query(ctx, community.GetCapabilities{})
+		raw, err := p.queryUsing(ctx, community.GetCapabilities{}, outbound)
 		if err != nil {
+			if ctx.Err() != nil {
+				return community.Capabilities{}, ctx.Err()
+			}
+			// QUIC's stream deadline can fire before the context timer runs.
+			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+				return community.Capabilities{}, context.DeadlineExceeded
+			}
 			if attempt == 0 && ctx.Err() == nil && isRemoteStreamReset(err) {
 				continue
 			}

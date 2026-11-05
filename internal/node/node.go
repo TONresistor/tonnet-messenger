@@ -88,6 +88,8 @@ type Node struct {
 	store           *store.Store
 	roomKey         ed25519.PrivateKey
 	nodeRole        int32
+	nodeDialsMu     sync.Mutex
+	nodeDials       map[string]*nodeDialLock
 	replicaMu       sync.Mutex
 	domainMu        sync.Mutex
 	domainCache     map[string]identityDomainCache

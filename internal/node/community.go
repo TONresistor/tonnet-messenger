@@ -151,7 +151,7 @@ func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community
 	}
 	var response any
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := sequencer.conn.QueryRoom(ctx, n.genesis.RoomKey, request, &response)
+	err := sequencer.queryNodeRoom(ctx, n.genesis.RoomKey, request, &response)
 	cancel()
 	if err != nil {
 		var rejected *roomnet.OverlayRejection
@@ -194,7 +194,7 @@ func (n *Node) sequencerPeer() (*peer, bool) {
 		return nil, false
 	}
 	peer, ok := n.peers.get(hex.EncodeToString(id))
-	if !ok || peer.conn == nil || !n.peers.isHealthyNode(peer) {
+	if !ok || peer.conn == nil || !n.peers.isHealthyNode(peer) || peer.outboundCaps.Load() == nil {
 		return nil, false
 	}
 	return peer, true
@@ -262,7 +262,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 	for {
 		var page community.EventList
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		err := source.conn.QueryRoom(ctx, n.genesis.RoomKey, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
+		err := source.queryNodeRoom(ctx, n.genesis.RoomKey, community.GetEvents{AfterSeqno: head.Seqno, Limit: community.MaxPageLimit}, &page)
 		cancel()
 		if err != nil {
 			return err
@@ -293,7 +293,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 func (n *Node) installStateFromPeer(source *peer) error {
 	var result community.RoomStateResult
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	err := source.conn.QueryRoom(ctx, n.genesis.RoomKey, community.GetRoomState{}, &result)
+	err := source.queryNodeRoom(ctx, n.genesis.RoomKey, community.GetRoomState{}, &result)
 	cancel()
 	if err != nil {
 		return err
@@ -438,7 +438,7 @@ func (n *Node) broadcastCommitted(event community.CommittedEvent, now time.Time)
 	if err != nil {
 		return err
 	}
-	targets := append(n.peers.nodeTargets("", nodeFanout), n.peers.memberLeaves("")...)
+	targets := append(n.outboundTargets("", nodeFanout), n.peers.memberLeaves("")...)
 	seen := make(map[string]struct{}, len(targets))
 	for _, target := range targets {
 		if _, ok := seen[target.id]; ok {
@@ -513,7 +513,7 @@ func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Ti
 		n.dedup.Commit(id)
 		committed = true
 		n.stats.accepted.Add(1)
-		for _, target := range append(n.peers.nodeTargets(p.id, nodeFanout), n.peers.memberLeaves("")...) {
+		for _, target := range append(n.outboundTargets(p.id, nodeFanout), n.peers.memberLeaves("")...) {
 			n.enqueue(target, wrapper)
 		}
 		return
@@ -563,7 +563,7 @@ func stateChangingBody(body any) bool {
 }
 
 func (n *Node) communityDirectTargets(fromID string, direct community.DirectMessage) []*peer {
-	targets := n.peers.nodeTargets(fromID, nodeFanout)
+	targets := n.outboundTargets(fromID, nodeFanout)
 	targets = append(targets, n.peers.identityLeaves(direct.ToKey, fromID)...)
 	seen := make(map[string]struct{}, len(targets))
 	out := targets[:0]

@@ -88,6 +88,18 @@ func (p *Peer) Query(ctx context.Context, request, result any) error {
 }
 
 func (p *Peer) query(ctx context.Context, request any) ([]byte, error) {
+	return p.queryUsing(ctx, request, false)
+}
+
+func (p *Peer) QueryOutbound(ctx context.Context, request, result any) error {
+	answer, err := p.queryUsing(ctx, request, true)
+	if err != nil {
+		return err
+	}
+	return decodeAnswer(answer, result)
+}
+
+func (p *Peer) queryUsing(ctx context.Context, request any, outbound bool) ([]byte, error) {
 	if p == nil || p.raw == nil {
 		return nil, quic.ErrPeerClosed
 	}
@@ -97,6 +109,9 @@ func (p *Peer) query(ctx context.Context, request any) ([]byte, error) {
 	}
 	if len(payload) > MaxWireObjectSize {
 		return nil, fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
+	}
+	if outbound {
+		return p.raw.QueryOutbound(ctx, payload, MaxAnswerObjectSize)
 	}
 	return p.raw.Query(ctx, payload, MaxAnswerObjectSize)
 }
@@ -109,6 +124,14 @@ func decodeAnswer(answer []byte, result any) error {
 }
 
 func (p *Peer) SendMessage(ctx context.Context, message any) error {
+	return p.sendMessage(ctx, message, false)
+}
+
+func (p *Peer) SendOutboundMessage(ctx context.Context, message any) error {
+	return p.sendMessage(ctx, message, true)
+}
+
+func (p *Peer) sendMessage(ctx context.Context, message any, outbound bool) error {
 	if p == nil || p.raw == nil {
 		return quic.ErrPeerClosed
 	}
@@ -118,6 +141,9 @@ func (p *Peer) SendMessage(ctx context.Context, message any) error {
 	}
 	if len(payload) > MaxWireObjectSize {
 		return fmt.Errorf("room transport: message exceeds %d bytes", MaxWireObjectSize)
+	}
+	if outbound {
+		return p.raw.SendOutboundMessage(ctx, payload)
 	}
 	return p.raw.SendMessage(ctx, payload)
 }
@@ -268,3 +294,6 @@ func decodeInto(raw []byte, result any) error {
 	}
 	return nil
 }
+
+// Wraps compares managed paths, not physical QUIC connection identities.
+func (p *Peer) Wraps(raw *quic.Peer) bool { return p != nil && p.raw == raw }
