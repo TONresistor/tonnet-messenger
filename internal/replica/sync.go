@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	cryptorand "crypto/rand"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -176,6 +177,8 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 		if known := cfg.Connector.knownTargets(cfg.BootstrapADNL); len(known) > 0 {
 			if connection, closeConnection, err := connectTargets(ctx, cfg, database, requireSequencer, known); err == nil {
 				return connection, closeConnection, nil
+			} else if requireSequencer && errors.Is(err, roomnet.ErrMalformedAnswer) {
+				return nil, nil, err
 			}
 		}
 	}
@@ -223,6 +226,13 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 		}
 	}
 	var lastQueryError error
+	var protocolError error
+	recordError := func(err error) {
+		lastQueryError = err
+		if errors.Is(err, roomnet.ErrMalformedAnswer) {
+			protocolError = err
+		}
+	}
 	for _, candidate := range targets {
 		var wrapper *roomnet.Peer
 		var capabilities community.Capabilities
@@ -232,7 +242,7 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 		if cfg.Connector != nil {
 			lease, err = cfg.Connector.acquire(ctx, cfg.NodeKey, candidate)
 			if err != nil {
-				lastQueryError = err
+				recordError(err)
 				continue
 			}
 			wrapper = lease.entry.peer
@@ -242,6 +252,7 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 		} else {
 			peer, dialErr := gateway.DialDefault(ctx, candidate.public, candidate.address)
 			if dialErr != nil {
+				recordError(endpointDialError(dialErr))
 				continue
 			}
 			wrapper = roomnet.Wrap(peer)
@@ -251,7 +262,7 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 			capabilities, err = wrapper.ProbeCapabilities(probeCtx)
 			probeCancel()
 			if err != nil {
-				lastQueryError = err
+				recordError(err)
 				release()
 				continue
 			}
@@ -260,16 +271,20 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
 		queryErr := wrapper.QueryRoom(queryCtx, cfg.RoomID, community.GetRoomGenesis{}, &genesis)
 		queryCancel()
-		if queryErr != nil || genesis.Verify(time.Now()) != nil || !bytes.Equal(genesis.RoomKey, cfg.RoomID) ||
+		if queryErr != nil {
+			recordError(queryErr)
+			release()
+			continue
+		}
+		if genesis.Verify(time.Now()) != nil || !bytes.Equal(genesis.RoomKey, cfg.RoomID) ||
 			(requireSequencer && !bytes.Equal(genesis.NodeKey, candidate.public)) {
-			if queryErr != nil {
-				lastQueryError = queryErr
-			}
+			recordError(fmt.Errorf("%w: invalid room genesis or sequencer identity", roomnet.ErrMalformedAnswer))
 			release()
 			continue
 		}
 		if database != nil {
 			if err := database.ValidateGenesis(ctx, genesis); err != nil {
+				recordError(fmt.Errorf("%w: %w", roomnet.ErrMalformedAnswer, err))
 				release()
 				continue
 			}
@@ -283,6 +298,9 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 		return &connected{genesis: genesis, capabilities: capabilities, peer: wrapper, done: done, subscribe: subscribe}, selectedClose, nil
 	}
 	closeClient()
+	if protocolError != nil {
+		lastQueryError = protocolError
+	}
 	if lastQueryError != nil {
 		return nil, nil, fmt.Errorf("replica: no live room endpoint: %w", lastQueryError)
 	}
@@ -316,13 +334,15 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 		}
 	}
 	var targets []target
+	var identityError error
 	for _, id := range ids {
 		addresses, public, err := dhtClient.FindAddresses(ctx, id)
-		if err != nil || addresses == nil || len(public) != ed25519.PublicKeySize {
+		if err != nil || addresses == nil {
 			continue
 		}
 		resolvedID, err := community.KeyID(public)
 		if err != nil || !bytes.Equal(resolvedID, id) {
+			identityError = fmt.Errorf("%w: resolved identity does not match ADNL id", roomnet.ErrMalformedAnswer)
 			continue
 		}
 		for _, candidate := range addresses.Addresses {
@@ -346,6 +366,9 @@ func resolveTargets(ctx context.Context, dhtClient *tondht.Client, roomID, boots
 		targets = targets[:16]
 	}
 	if len(targets) == 0 {
+		if identityError != nil {
+			return nil, identityError
+		}
 		return nil, fmt.Errorf("replica: no dialable TON QUIC room nodes")
 	}
 	return targets, nil

@@ -7,13 +7,17 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
+	"github.com/TONresistor/tonnet-messenger/internal/client"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
@@ -26,6 +30,105 @@ func integrationKey(t *testing.T) ed25519.PrivateKey {
 		t.Fatal(err)
 	}
 	return key
+}
+
+func TestClientLocalTimestampCommitsThroughVerifiedRoomReplica(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	room, sequencerKey, replicaKey := integrationKey(t), integrationKey(t), integrationKey(t)
+	genesis, err := community.NewGenesis(room, sequencerKey, time.Now(), "Replica-only write", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authority, err := store.Open(ctx, filepath.Join(t.TempDir(), "authority.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer authority.Close()
+	if err := authority.Initialize(ctx, genesis, room); err != nil {
+		t.Fatal(err)
+	}
+	sequencer, err := New(Config{Key: sequencerKey, Listen: integrationAddress(t), Socket: filepath.Join(t.TempDir(), "unused.sock"), Genesis: &genesis, RoomKey: room, Store: authority, LocalOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sequencer.Close()
+	replicated, err := store.Open(ctx, filepath.Join(t.TempDir(), "replica.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replicated.Close()
+	if err := replicated.InitializeReplica(ctx, genesis); err != nil {
+		t.Fatal(err)
+	}
+	state, err := authority.State(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := replicated.InstallReplicaState(ctx, state); err != nil {
+		t.Fatal(err)
+	}
+	relay, err := New(Config{Key: replicaKey, Listen: integrationAddress(t), Genesis: &genesis, Store: replicated, NodeRole: community.NodeRoleRelay, LocalOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relay.Close()
+	for _, pair := range [][2]*Node{{relay, sequencer}, {sequencer, relay}} {
+		p, err := pair[0].dialNode(ctx, pair[1].cfg.Key.Public().(ed25519.PublicKey), pair[1].cfg.Listen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := pair[0].probeNode(ctx, p); !ok {
+			t.Fatal("verified room-node association failed")
+		}
+	}
+	var discoveryAttempts atomic.Int32
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		discoveryAttempts.Add(1)
+		http.Error(w, "direct discovery unavailable", http.StatusServiceUnavailable)
+	}))
+	defer broken.Close()
+	instance, err := client.Open(ctx, client.Config{StateDir: t.TempDir(), ConfigURL: broken.URL, DirectAddress: relay.cfg.Listen, DirectPublic: replicaKey.Public().(ed25519.PublicKey)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer instance.Close()
+	go func() {
+		for range instance.Notifications() {
+		}
+	}()
+	roomID, _ := community.RoomKeyText(genesis.RoomKey)
+	if _, err := instance.Join(ctx, roomID, nil); err != nil {
+		t.Fatal(err)
+	}
+	before := time.Now().Unix()
+	if _, err := instance.SendMessage(ctx, roomID, "forwarded local timestamp"); err != nil {
+		t.Fatal(err)
+	}
+	page, err := authority.Events(ctx, 0, 100)
+	if err != nil || len(page.Events) != 1 {
+		t.Fatal("forwarded commit missing", err)
+	}
+	event := page.Events[0]
+	if event.Verify(genesis.RoomKey, genesis.NodeKey) != nil || event.Proposal.Timestamp < before || event.Proposal.Timestamp > time.Now().Unix() || discoveryAttempts.Load() != 1 {
+		t.Fatal("forwarded proposal did not use local fallback")
+	}
+	copy, err := replicated.Events(ctx, 0, 100)
+	if err != nil || len(copy.Events) != 1 {
+		t.Fatal("replica did not retain commit", err)
+	}
+	want, _ := event.Hash()
+	got, _ := copy.Events[0].Hash()
+	if !bytes.Equal(want, got) {
+		t.Fatal("forwarding changed the canonical commit")
+	}
+	items, _, err := instance.Timeline(ctx, genesis.RoomKey, 0, 100)
+	if err != nil || len(items) != 1 || items[0]["text"] != "forwarded local timestamp" {
+		t.Fatal("client did not verify/persist the forwarded commit", err)
+	}
+	if pending, err := instance.GetPending(ctx, roomID); err != nil || pending != nil {
+		t.Fatalf("successful send retained pending tracking: %+v %v", pending, err)
+	}
 }
 
 func TestTONQUICRoutesDirectMessageBetweenOnlineIdentities(t *testing.T) {

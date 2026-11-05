@@ -69,7 +69,7 @@ func TestSequencerTimestampNeverTrustsRelayClock(t *testing.T) {
 	}
 }
 
-func TestSequencerTimestampFailsClosedWhenAuthorityIsUnavailable(t *testing.T) {
+func TestSequencerTimestampFailsClosedWithoutVerifiedReplica(t *testing.T) {
 	identity := clockTestKey(t)
 	room := clockTestKey(t)
 	sequencer := clockTestKey(t)
@@ -91,6 +91,176 @@ func TestSequencerTimestampFailsClosedWhenAuthorityIsUnavailable(t *testing.T) {
 	})
 	if !errors.Is(err, ErrSequencerUnavailable) {
 		t.Fatalf("error = %v, want sequencer unavailable", err)
+	}
+}
+
+type replicaClockFixture struct {
+	handle          *roomHandle
+	snapshot        roomIdentitySnapshot
+	room, sequencer ed25519.PrivateKey
+	replicaQueries  atomic.Int32
+}
+
+func verifiedReplicaClock(t *testing.T) *replicaClockFixture {
+	t.Helper()
+	f := &replicaClockFixture{room: clockTestKey(t), sequencer: clockTestKey(t)}
+	identity := clockTestKey(t)
+	genesis, err := community.NewGenesis(f.room, f.sequencer, time.Now(), "Room", "", true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer := clockTestPeer(t, identity, clockTestKey(t), int32(time.Now().Add(4*time.Minute).Unix()), &f.replicaQueries)
+	session := &replica.Session{Genesis: genesis, Peer: peer, Done: peer.Done()}
+	projection, err := community.NewProjection(genesis)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := community.SignRoomStateV3(f.room, projection.State())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.handle = &roomHandle{client: &Client{}, key: genesis.RoomKey, session: session, sessionEpoch: 1, projection: projection,
+		state: community.RoomStateResult{State: state, Stats: community.RoomStats{NodeRole: community.NodeRoleRelay, Ready: true}}}
+	f.snapshot = roomIdentitySnapshot{key: identity, session: session, epoch: 1}
+	return f
+}
+
+func TestReplicaTimestampFallbackThenDirectCalibration(t *testing.T) {
+	f := verifiedReplicaClock(t)
+	var queries atomic.Int32
+	now := time.Now()
+	peer := clockTestPeer(t, f.snapshot.key, f.sequencer, int32(now.Add(2*time.Minute).Unix()), &queries)
+	authority := &replica.Session{Genesis: f.snapshot.session.Genesis, Peer: peer, Done: peer.Done()}
+	dials := 0
+	f.handle.dialSequencer = func(ctx context.Context, _ replica.Config) (*replica.Session, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > timeQueryTimeout {
+			t.Fatal("direct calibration attempt has no bounded deadline")
+		}
+		dials++
+		if dials == 1 {
+			return nil, errors.New("direct discovery unavailable")
+		}
+		return authority, nil
+	}
+	before := time.Now().Unix()
+	local, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot)
+	if err != nil || local < before || local > time.Now().Unix() {
+		t.Fatalf("local fallback: %d %v", local, err)
+	}
+	if !f.handle.clockCalibrated.IsZero() || f.handle.clockSession != nil {
+		t.Fatal("local time was cached as sequencer calibration")
+	}
+	calibrated, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot)
+	if err != nil || calibrated < now.Unix()+119 || dials != 2 || queries.Load() != 1 {
+		t.Fatalf("direct calibration did not recover: %d %v", calibrated, err)
+	}
+	if _, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot); err != nil || dials != 2 || queries.Load() != 1 {
+		t.Fatal("direct calibration cache was lost", err)
+	}
+	if f.replicaQueries.Load() != 0 {
+		t.Fatal("replica clock was queried")
+	}
+	// A valid cached calibration cannot bypass cancellation or identity fencing.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := f.handle.sequencerTimestamp(ctx, f.snapshot); !errors.Is(err, context.Canceled) {
+		t.Fatal(err)
+	}
+	f.handle.mu.Lock()
+	f.handle.sessionEpoch++
+	f.handle.mu.Unlock()
+	if _, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot); !errors.Is(err, errRoomSessionChanged) {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicaTimestampRejectsInconsistenciesAndAuthenticatedSkew(t *testing.T) {
+	for _, failure := range []string{"genesis", "identity", "malformed discovery", "skew"} {
+		t.Run(failure, func(t *testing.T) {
+			f := verifiedReplicaClock(t)
+			genesis, peerKey, now := f.snapshot.session.Genesis, f.sequencer, time.Now()
+			if failure == "genesis" {
+				var err error
+				genesis, err = community.NewGenesis(f.room, f.sequencer, now, "Conflicting", "", true, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if failure == "identity" {
+				peerKey = clockTestKey(t)
+			}
+			if failure == "skew" {
+				now = now.Add(community.MutationClockSkew + time.Minute)
+			}
+			peer := clockTestPeer(t, f.snapshot.key, peerKey, int32(now.Unix()), nil)
+			f.handle.dialSequencer = func(context.Context, replica.Config) (*replica.Session, error) {
+				if failure == "malformed discovery" {
+					return nil, roomnet.ErrMalformedAnswer
+				}
+				return &replica.Session{Genesis: genesis, Peer: peer, Done: peer.Done()}, nil
+			}
+			_, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot)
+			want := ErrSequencerUnavailable
+			if failure == "skew" {
+				want = ErrSequencerClockSkew
+			}
+			if !errors.Is(err, want) || !f.handle.clockCalibrated.IsZero() || f.replicaQueries.Load() != 0 {
+				t.Fatalf("unsafe fallback after %s: %v", failure, err)
+			}
+		})
+	}
+}
+
+func TestReplicaTimestampCancellationAndSessionChangesDuringDial(t *testing.T) {
+	for _, failure := range []string{"cancelled", "deadline", "epoch", "closed"} {
+		t.Run(failure, func(t *testing.T) {
+			f := verifiedReplicaClock(t)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			want := errRoomSessionChanged
+			if failure == "cancelled" {
+				want = context.Canceled
+			}
+			if failure == "deadline" {
+				var stop context.CancelFunc
+				ctx, stop = context.WithTimeout(ctx, 5*time.Millisecond)
+				defer stop()
+				want = context.DeadlineExceeded
+			}
+			f.handle.dialSequencer = func(dialCtx context.Context, _ replica.Config) (*replica.Session, error) {
+				switch failure {
+				case "cancelled":
+					cancel()
+				case "deadline":
+					<-dialCtx.Done()
+				case "epoch":
+					f.handle.mu.Lock()
+					f.handle.sessionEpoch++
+					f.handle.mu.Unlock()
+				case "closed":
+					f.snapshot.session.Peer.Close()
+				}
+				return nil, errors.New("unavailable")
+			}
+			if _, err := f.handle.sequencerTimestamp(ctx, f.snapshot); !errors.Is(err, want) {
+				t.Fatalf("fallback ignored %s: %v", failure, err)
+			}
+		})
+	}
+}
+
+func TestReplicaTimestampFallsBackAfterDirectTimeConnectionLoss(t *testing.T) {
+	f := verifiedReplicaClock(t)
+	peer := clockTestPeer(t, f.snapshot.key, f.sequencer, int32(time.Now().Unix()), nil)
+	peer.Close()
+	f.handle.dialSequencer = func(context.Context, replica.Config) (*replica.Session, error) {
+		return &replica.Session{Genesis: f.snapshot.session.Genesis, Peer: peer, Done: peer.Done()}, nil
+	}
+	before := time.Now().Unix()
+	stamp, err := f.handle.sequencerTimestamp(context.Background(), f.snapshot)
+	if err != nil || stamp < before || stamp > time.Now().Unix() || !f.handle.clockCalibrated.IsZero() || f.replicaQueries.Load() != 0 {
+		t.Fatalf("time connection loss fallback: %d %v", stamp, err)
 	}
 }
 

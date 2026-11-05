@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -87,7 +89,7 @@ func (c *Connector) knownTargets(bootstrap []byte) []target {
 
 func (c *Connector) acquire(ctx context.Context, key ed25519.PrivateKey, candidate target) (*connectionLease, error) {
 	if !bytes.Equal(key, c.key) {
-		return nil, errors.New("connector identity does not match session")
+		return nil, fmt.Errorf("%w: connector identity does not match session", roomnet.ErrMalformedAnswer)
 	}
 	for {
 		c.mu.Lock()
@@ -148,7 +150,7 @@ func (e *connectorEntry) open() {
 	var capabilities community.Capabilities
 	if err == nil {
 		raw, dialErr := gateway.DialDefault(e.ctx, e.target.public, e.target.address)
-		err = dialErr
+		err = endpointDialError(dialErr)
 		if err == nil {
 			peer = roomnet.Wrap(raw)
 			peer.SetDisconnectHandler(func(string, ed25519.PublicKey) { e.owner.drop(e) })
@@ -178,6 +180,28 @@ func (e *connectorEntry) open() {
 	if err != nil {
 		e.closeTransport()
 	}
+}
+
+// Preserve authentication failures through candidate selection. The pinned
+// QUIC fork exposes TLS alerts as qerr.TransportError codes 0x100..0x1ff.
+// Inspect that concrete type, as roomnet does for stream resets, without adding
+// the indirect QUIC fork as a direct dependency or matching error text.
+func endpointDialError(err error) error {
+	for current := err; current != nil; current = errors.Unwrap(current) {
+		value := reflect.ValueOf(current)
+		if value.Kind() != reflect.Pointer || value.IsNil() {
+			continue
+		}
+		value = value.Elem()
+		if value.Kind() != reflect.Struct || value.Type().PkgPath() != "github.com/xssnick/quic-go-ton/internal/qerr" || value.Type().Name() != "TransportError" {
+			continue
+		}
+		code := value.FieldByName("ErrorCode")
+		if code.IsValid() && code.Kind() == reflect.Uint64 && code.Uint() >= 0x100 && code.Uint() < 0x200 {
+			return fmt.Errorf("%w: peer authentication: %w", roomnet.ErrMalformedAnswer, err)
+		}
+	}
+	return err
 }
 
 // Transport close always runs outside callbacks/owner locks. Waiting for ready

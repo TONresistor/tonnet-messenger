@@ -681,6 +681,9 @@ func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot,
 func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdentitySnapshot) (int64, error) {
 	r.clockMu.Lock()
 	defer r.clockMu.Unlock()
+	if err := r.clockSessionActive(ctx, snapshot); err != nil {
+		return 0, err
+	}
 
 	now := time.Now()
 	if r.clockSession == snapshot.session && r.clockEpoch == snapshot.epoch && !r.clockCalibrated.IsZero() {
@@ -689,9 +692,9 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 			return r.clockRemote + int64(age/time.Second), nil
 		}
 	}
-	if !r.isCurrentSession(snapshot.session, snapshot.epoch) {
-		return 0, errRoomSessionChanged
-	}
+	// The optional direct path cannot indefinitely hold up replica forwarding.
+	calibrationCtx, calibrationCancel := context.WithTimeout(ctx, timeQueryTimeout)
+	defer calibrationCancel()
 
 	authority := snapshot.session
 	if !bytes.Equal(authority.Peer.GetPubKey(), authority.Genesis.NodeKey) {
@@ -703,14 +706,11 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 		if dial == nil {
 			dial = replica.DialSequencer
 		}
-		authority, err = dial(ctx, replica.Config{
+		authority, err = dial(calibrationCtx, replica.Config{
 			Connector: snapshot.connector, ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: snapshot.key, BootstrapADNL: sequencerID,
 		})
 		if err != nil {
-			if ctx.Err() != nil {
-				return 0, ctx.Err()
-			}
-			return 0, fmt.Errorf("%w: %v", ErrSequencerUnavailable, err)
+			return r.replicaTimestamp(ctx, snapshot, err)
 		}
 		defer authority.Close()
 		expectedGenesis, err := snapshot.session.Genesis.Hash()
@@ -729,14 +729,9 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 
 	started := time.Now()
 	var remoteTime broadcast.Time
-	queryCtx, cancel := context.WithTimeout(ctx, timeQueryTimeout)
-	err := authority.Peer.Query(queryCtx, broadcast.GetTime{}, &remoteTime)
-	cancel()
+	err := authority.Peer.Query(calibrationCtx, broadcast.GetTime{}, &remoteTime)
 	if err != nil {
-		if ctx.Err() != nil {
-			return 0, ctx.Err()
-		}
-		return 0, fmt.Errorf("%w: time query failed: %v", ErrSequencerUnavailable, err)
+		return r.replicaTimestamp(ctx, snapshot, err)
 	}
 	midpoint := started.Add(time.Since(started) / 2)
 	offset := int64(remoteTime.Now) - midpoint.Unix()
@@ -744,14 +739,51 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 	if offset < -maxSkew || offset > maxSkew {
 		return 0, ErrSequencerClockSkew
 	}
-	if !r.isCurrentSession(snapshot.session, snapshot.epoch) {
-		return 0, errRoomSessionChanged
+	if err := r.clockSessionActive(ctx, snapshot); err != nil {
+		return 0, err
 	}
 	r.clockSession = snapshot.session
 	r.clockEpoch = snapshot.epoch
 	r.clockRemote = int64(remoteTime.Now)
 	r.clockCalibrated = midpoint
 	return r.clockRemote + int64(time.Since(midpoint)/time.Second), nil
+}
+
+func (r *roomHandle) clockSessionActive(ctx context.Context, snapshot roomIdentitySnapshot) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !r.isCurrentSession(snapshot.session, snapshot.epoch) {
+		return errRoomSessionChanged
+	}
+	select {
+	case <-snapshot.session.Done:
+		return errRoomSessionChanged
+	default:
+		return nil
+	}
+}
+
+// Local fallback is a proposal timestamp, never a successful calibration. The
+// sequencer still applies its clock-skew check when the replica forwards it.
+func (r *roomHandle) replicaTimestamp(ctx context.Context, snapshot roomIdentitySnapshot, unavailable error) (int64, error) {
+	if err := r.clockSessionActive(ctx, snapshot); err != nil {
+		return 0, err
+	}
+	if !errors.Is(unavailable, roomnet.ErrMalformedAnswer) {
+		r.mu.RLock()
+		verifiedReplica := r.state.Stats.NodeRole == community.NodeRoleRelay && r.state.Stats.Ready && r.projection != nil &&
+			bytes.Equal(r.state.State.RoomID, r.key) && r.state.State.Verify() == nil &&
+			!bytes.Equal(snapshot.session.Peer.GetPubKey(), snapshot.session.Genesis.NodeKey)
+		r.mu.RUnlock()
+		if verifiedReplica {
+			if err := r.clockSessionActive(ctx, snapshot); err != nil {
+				return 0, err
+			}
+			return time.Now().Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("%w: %w", ErrSequencerUnavailable, unavailable)
 }
 
 func (r *roomHandle) invalidateSequencerClock(session *replica.Session) {

@@ -317,3 +317,39 @@ func TestRejectedConnectionNeverPublishesCapabilities(t *testing.T) {
 		})
 	}
 }
+
+func TestCalibrationDialPreservesUntrustedEndpointErrors(t *testing.T) {
+	for _, pooled := range []bool{false, true} {
+		for _, invalid := range []string{"signature", "genesis", "TLS identity"} {
+			t.Run(fmt.Sprintf("pooled%v/%s", pooled, invalid), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				f := newCapabilityEndpoint(t)
+				cfg := f.config(t)
+				switch invalid {
+				case "signature":
+					f.genesis.Signature = bytes.Clone(f.genesis.Signature)
+					f.genesis.Signature[0] ^= 1
+				case "genesis":
+					f.genesis = newCapabilityEndpoint(t).genesis
+				case "TLS identity":
+					cfg.DirectPublic = capabilityKey(t).Public().(ed25519.PublicKey)
+				}
+				if pooled {
+					owner, err := NewConnector(ctx, cfg.NodeKey)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer owner.Close()
+					cfg.Connector = owner
+				}
+				if session, err := DialSequencer(ctx, cfg); !errors.Is(err, roomnet.ErrMalformedAnswer) {
+					if session != nil {
+						session.Close()
+					}
+					t.Fatalf("untrusted endpoint became generic unavailability: %v", err)
+				}
+			})
+		}
+	}
+}
