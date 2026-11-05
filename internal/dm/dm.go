@@ -9,6 +9,8 @@ import (
 	"fmt"
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
+
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
 const domain = "tonnet-dm-v2"
@@ -80,4 +82,54 @@ func OpenForRoom(roomID []byte, myPriv ed25519.PrivateKey, peerPub ed25519.Publi
 		return nil, fmt.Errorf("dm: ciphertext too short")
 	}
 	return gcm.Open(nil, box[:ns], box[ns:], directionAAD(roomID, peerPub, myPub))
+}
+
+func v3AEAD(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey) (cipher.AEAD, error) {
+	if len(myPriv) != ed25519.PrivateKeySize || len(peerPub) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("dm: invalid Ed25519 key length")
+	}
+	return aead(myPriv, peerPub)
+}
+
+func v3AAD(sender, recipient ed25519.PublicKey) []byte {
+	tag := sha256.Sum256([]byte("tonnet-dm-v3"))
+	return directionAAD(tag[:], sender, recipient)
+}
+
+// SealV3 encrypts a room-independent DM, binding both identities and direction.
+// The key derivation is unchanged; the V3 domain tag belongs only to the AAD.
+func SealV3(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, plaintext []byte) ([]byte, error) {
+	if err := community.ValidateDMPlaintext(string(plaintext)); err != nil {
+		return nil, err
+	}
+	gcm, err := v3AEAD(myPriv, peerPub)
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	return gcm.Seal(nonce, nonce, plaintext, v3AAD(myPriv.Public().(ed25519.PublicKey), peerPub)), nil
+}
+
+// OpenV3 authenticates and decrypts a room-independent DM, then validates the
+// plaintext. Rejected plaintext is never returned alongside an error.
+func OpenV3(myPriv ed25519.PrivateKey, peerPub ed25519.PublicKey, box []byte) ([]byte, error) {
+	if len(box) < 28 || len(box) > community.MaxDMCiphertextBytes {
+		return nil, fmt.Errorf("dm: V3 box must be 28..%d bytes", community.MaxDMCiphertextBytes)
+	}
+	gcm, err := v3AEAD(myPriv, peerPub)
+	if err != nil {
+		return nil, err
+	}
+	ns := gcm.NonceSize()
+	plaintext, err := gcm.Open(nil, box[:ns], box[ns:], v3AAD(peerPub, myPriv.Public().(ed25519.PublicKey)))
+	if err != nil {
+		return nil, err
+	}
+	if err := community.ValidateDMPlaintext(string(plaintext)); err != nil {
+		return nil, err
+	}
+	return plaintext, nil
 }
