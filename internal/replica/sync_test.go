@@ -40,6 +40,9 @@ func TestOverlayNotServedTriesNextDiscoveryCandidate(t *testing.T) {
 		gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 			peer := roomnet.Wrap(raw)
 			peer.SetQueryHandler(func(q *roomnet.Query) error {
+				if _, ok := q.Data.(community.GetCapabilities); ok {
+					return q.Answer(roomnet.LocalCapabilities())
+				}
 				calls <- serve
 				selectedID := id
 				if !serve {

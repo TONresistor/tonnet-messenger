@@ -192,6 +192,10 @@ func TestClientRejectsNonemptyBroadcastCertificate(t *testing.T) {
 }
 
 func selectTestRoomQuery(query *roomnet.Query, roomKey []byte) (bool, error) {
+	switch query.Data.(type) {
+	case community.GetCapabilities, *community.GetCapabilities:
+		return false, query.Answer(roomnet.LocalCapabilities())
+	}
 	id, err := community.OverlayID(roomKey)
 	if err != nil {
 		return false, err

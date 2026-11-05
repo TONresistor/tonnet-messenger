@@ -195,6 +195,10 @@ func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error
 }
 
 func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
+	switch q.Data.(type) {
+	case community.GetCapabilities, *community.GetCapabilities:
+		return q.Answer(roomnet.LocalCapabilities())
+	}
 	now := time.Now()
 	if n.penalties.banned(p.id, now) {
 		return nil

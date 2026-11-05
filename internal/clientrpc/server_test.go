@@ -273,6 +273,10 @@ func TestRoomJoinRejectsV2StateAsProtocolError(t *testing.T) {
 			gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 				peer := roomnet.Wrap(raw)
 				peer.SetQueryHandler(func(query *roomnet.Query) error {
+					switch query.Data.(type) {
+					case community.GetCapabilities, *community.GetCapabilities:
+						return query.Answer(roomnet.LocalCapabilities())
+					}
 					id, err := community.OverlayID(genesis.RoomKey)
 					if err != nil {
 						return err

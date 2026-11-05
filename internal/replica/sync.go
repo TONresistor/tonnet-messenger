@@ -112,16 +112,21 @@ func Sync(ctx context.Context, cfg Config, database *store.Store) (Result, error
 }
 
 type connected struct {
-	genesis community.Genesis
-	peer    *roomnet.Peer
-	done    <-chan struct{}
+	genesis      community.Genesis
+	capabilities community.Capabilities
+	peer         *roomnet.Peer
+	done         <-chan struct{}
 }
 
 type Session struct {
 	Genesis community.Genesis
-	Peer    *roomnet.Peer
-	Done    <-chan struct{}
-	close   func()
+	// Capabilities belongs to this dedicated client-only session. The Gateway
+	// is private and never dialed again after selection, so no connection can
+	// replace the one that answered the probe while retaining this value.
+	Capabilities community.Capabilities
+	Peer         *roomnet.Peer
+	Done         <-chan struct{}
+	close        func()
 }
 
 func DialSequencer(ctx context.Context, cfg Config) (*Session, error) {
@@ -137,7 +142,7 @@ func dialRoom(ctx context.Context, cfg Config, requireSequencer bool) (*Session,
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Genesis: connected.genesis, Peer: connected.peer, Done: connected.done, close: closeSession}, nil
+	return &Session{Genesis: connected.genesis, Capabilities: connected.capabilities, Peer: connected.peer, Done: connected.done, close: closeSession}, nil
 }
 
 func (s *Session) Close() {
@@ -193,6 +198,14 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 			continue
 		}
 		wrapper := roomnet.Wrap(peer)
+		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+		capabilities, probeErr := wrapper.ProbeCapabilities(probeCtx)
+		probeCancel()
+		if probeErr != nil {
+			lastQueryError = probeErr
+			peer.Close()
+			continue
+		}
 		var genesis community.Genesis
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
 		queryErr := wrapper.QueryRoom(queryCtx, cfg.RoomID, community.GetRoomGenesis{}, &genesis)
@@ -211,7 +224,7 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 				continue
 			}
 		}
-		return &connected{genesis: genesis, peer: wrapper, done: wrapper.Done()}, closeClient, nil
+		return &connected{genesis: genesis, capabilities: capabilities, peer: wrapper, done: wrapper.Done()}, closeClient, nil
 	}
 	closeClient()
 	if lastQueryError != nil {
