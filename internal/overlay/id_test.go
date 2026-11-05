@@ -19,3 +19,15 @@ func TestPublicRoomsUsesExactBoxedOverlayName(t *testing.T) {
 		t.Fatalf("wrong public-rooms overlay id: %x %v", got, err)
 	}
 }
+
+func TestRelaysUsesExactBoxedOverlayName(t *testing.T) {
+	raw, err := hex.DecodeString("cb45ba3410746f6e6e65742d72656c6179732d7631000000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := sha256.Sum256(raw)
+	got, err := RelaysID()
+	if err != nil || !bytes.Equal(got, want[:]) {
+		t.Fatalf("wrong relays overlay id: %x %v", got, err)
+	}
+}

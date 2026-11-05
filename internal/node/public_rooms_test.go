@@ -12,7 +12,6 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/control"
-	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
@@ -58,19 +57,19 @@ func fakePublicRooms(n *Node) ([]*fakeRoomPublisher, *atomic.Int32, *atomic.Bool
 		pubs[i] = &fakeRoomPublisher{room: r.genesis.RoomKey, started: make(chan struct{}), stopped: make(chan struct{})}
 	}
 	closed, premature := &atomic.Int32{}, &atomic.Bool{}
-	n.newPublishers = func(context.Context) ([]roomPublisher, roomPublisher, func(), error) {
+	n.newPublishers = func(context.Context) ([]roomPublisher, map[string]roomPublisher, func(), error) {
 		out := make([]roomPublisher, len(pubs))
 		for i, p := range pubs {
 			out[i] = p
 		}
 		all := append([]*fakeRoomPublisher(nil), pubs...)
-		var global roomPublisher
-		if n.catalog != nil {
-			p := &fakeRoomPublisher{room: []byte(ov.PublicRooms), started: make(chan struct{}), stopped: make(chan struct{})}
-			global = p
+		globals := make(map[string]roomPublisher)
+		for _, overlay := range n.globalOverlays() {
+			p := &fakeRoomPublisher{room: []byte(overlay.name), started: make(chan struct{}), stopped: make(chan struct{})}
+			globals[overlay.name] = p
 			all = append(all, p)
 		}
-		return out, global, func() {
+		return out, globals, func() {
 			for _, p := range all {
 				select {
 				case <-p.stopped:
@@ -355,7 +354,7 @@ func TestRoomGossipBoundsAndPublicationStartupFailure(t *testing.T) {
 	}
 	// No real DHT request is needed to prove that initialization failure tears
 	// down the already-started single control service.
-	n.newPublishers = func(context.Context) ([]roomPublisher, roomPublisher, func(), error) {
+	n.newPublishers = func(context.Context) ([]roomPublisher, map[string]roomPublisher, func(), error) {
 		return nil, nil, nil, errors.New("DHT initialization failed")
 	}
 	if err := n.Run(context.Background()); err == nil {

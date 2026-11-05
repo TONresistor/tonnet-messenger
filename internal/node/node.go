@@ -106,10 +106,11 @@ type Node struct {
 	closed          bool
 	closeOnce       sync.Once
 	closeErr        error
-	newPublishers   func(context.Context) ([]roomPublisher, roomPublisher, func(), error)
+	newPublishers   func(context.Context) ([]roomPublisher, map[string]roomPublisher, func(), error)
 
 	resolveRoomAlias func(context.Context, string) ([]byte, error)
 	catalog          *roomCatalog
+	relays           *relayDirectory
 	inbox            *inboxService
 }
 
@@ -244,6 +245,13 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("start TON QUIC server on %s: %w", cfg.Listen, err)
 	}
 	n.quicPacket = packet
+	if n.inbox != nil {
+		n.relays, err = newRelayDirectory(n)
+		if err != nil {
+			n.Close()
+			return nil, err
+		}
+	}
 	go func() { n.quicErr <- qgw.Serve(packet) }()
 	select {
 	case <-packet.ready:
@@ -403,7 +411,7 @@ func (n *Node) Status() control.Status {
 }
 
 func (n *Node) Run(ctx context.Context) error {
-	if len(n.roomList()) > 0 && !n.cfg.LocalOnly && n.cfg.Advertise == "" {
+	if (len(n.roomList()) > 0 || n.relays != nil) && !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
 	n.runMu.Lock()
@@ -450,12 +458,12 @@ func (n *Node) Run(ctx context.Context) error {
 			}
 		})
 	}
-	if !n.cfg.LocalOnly && len(n.roomList()) > 0 {
+	if !n.cfg.LocalOnly && (len(n.roomList()) > 0 || n.relays != nil) {
 		create := n.newPublishers
 		if create == nil {
 			create = n.createPublishers
 		}
-		pubs, catalogPub, closePublishers, err := create(ctx)
+		pubs, globals, closePublishers, err := create(ctx)
 		if err != nil {
 			return fmt.Errorf("dht publisher: %w", err)
 		}
@@ -469,8 +477,8 @@ func (n *Node) Run(ctx context.Context) error {
 			for _, r := range n.roomList() {
 				r.pub.Store(nil)
 			}
-			if n.catalog != nil {
-				n.catalog.pub.Store(nil)
+			for _, global := range n.globalOverlays() {
+				global.pub.Store(nil)
 			}
 		}()
 		if len(pubs) != len(n.roomList()) {
@@ -483,16 +491,17 @@ func (n *Node) Run(ctx context.Context) error {
 			start(func() { pub.Run(ctx) })
 			start(func() { r.discoveryLoop(ctx) })
 		}
-		if n.catalog != nil {
-			if catalogPub == nil {
-				return errors.New("missing public-rooms publisher")
+		for _, global := range n.globalOverlays() {
+			pub := globals[global.name]
+			if pub == nil {
+				return fmt.Errorf("missing %s publisher", global.name)
 			}
-			n.catalog.pub.Store(&roomPublication{catalogPub})
-			start(func() { catalogPub.Run(ctx) })
+			global.pub.Store(&roomPublication{pub})
+			start(func() { pub.Run(ctx) })
 		}
 	}
-	if n.catalog != nil {
-		start(func() { n.catalog.run(ctx) })
+	for _, global := range n.globalOverlays() {
+		start(func() { global.run(ctx) })
 	}
 	start(func() { n.databaseMaintenanceLoop(ctx) })
 	start(func() { n.peerMaintenanceLoop(ctx) })
@@ -514,9 +523,17 @@ func (n *Node) Run(ctx context.Context) error {
 	}
 }
 
-func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, roomPublisher, func(), error) {
+func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, map[string]roomPublisher, func(), error) {
 	rooms := n.roomList()
-	owner, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, rooms[0].genesis.RoomKey, rooms[0].overlayID)
+	var name, id []byte
+	if len(rooms) > 0 {
+		name, id = rooms[0].genesis.RoomKey, rooms[0].overlayID
+	} else if n.relays != nil {
+		name, id = []byte(ov.Relays), n.relays.id
+	} else {
+		return nil, nil, nil, errors.New("no overlay to publish")
+	}
+	owner, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, name, id)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -524,11 +541,11 @@ func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, roomPubli
 	for i, room := range rooms {
 		pubs[i] = owner.ForRoom(room.genesis.RoomKey, room.overlayID)
 	}
-	var catalog roomPublisher
-	if n.catalog != nil {
-		catalog = owner.ForRoom([]byte(ov.PublicRooms), n.catalog.id)
+	globals := make(map[string]roomPublisher)
+	for _, global := range n.globalOverlays() {
+		globals[global.name] = owner.ForRoom([]byte(global.name), global.id)
 	}
-	return pubs, catalog, owner.Close, nil
+	return pubs, globals, owner.Close, nil
 }
 
 func (n *roomRuntime) replicaReconcileLoop(ctx context.Context) {

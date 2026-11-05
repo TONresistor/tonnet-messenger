@@ -305,8 +305,8 @@ func TestCatalogOnlySequencersPublishAndLifecycleClosesBorrowers(t *testing.T) {
 	roomPub := &fakeRoomPublisher{room: n.room.genesis.RoomKey, started: make(chan struct{}), stopped: make(chan struct{})}
 	global := &fakeRoomPublisher{room: []byte(ov.PublicRooms), started: make(chan struct{}), stopped: make(chan struct{}), resolveEntered: make(chan struct{})}
 	closed := false
-	n.newPublishers = func(context.Context) ([]roomPublisher, roomPublisher, func(), error) {
-		return []roomPublisher{roomPub}, global, func() {
+	n.newPublishers = func(context.Context) ([]roomPublisher, map[string]roomPublisher, func(), error) {
+		return []roomPublisher{roomPub}, map[string]roomPublisher{ov.PublicRooms: global}, func() {
 			select {
 			case <-global.stopped:
 			default:

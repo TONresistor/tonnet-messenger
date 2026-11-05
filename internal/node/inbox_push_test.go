@@ -452,7 +452,7 @@ func TestInboxPushSharedQueueFullClosesOnlyPhysicalTargetAndKeepsDeposits(t *tes
 	// A stale job must neither fall back nor close this new same-key path.
 	f.n.enqueueInbox(managed, physical, sub, community.InboxPushV1{Seqno: 99, Message: last.Message})
 	var caps community.Capabilities
-	if err := replacement.peer.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != 0 {
+	if err := replacement.peer.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != community.RelayServiceDM {
 		t.Fatal("old queue target closed replacement or enabled flags", err)
 	}
 	release()

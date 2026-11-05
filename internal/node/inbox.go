@@ -15,8 +15,7 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
-// DMConfig enables the free inbox service. Advertisement and capability flags
-// remain disabled until discovery and the client service are available.
+// DMConfig enables the free inbox service and its relay advertisement.
 type DMConfig struct {
 	Limits       store.InboxLimits
 	ChallengeTTL time.Duration

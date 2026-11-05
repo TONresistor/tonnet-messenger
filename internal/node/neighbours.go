@@ -249,7 +249,11 @@ func verifyOverlayNode(nd *tonoverlay.Node, id []byte, at time.Time) ([]byte, ed
 func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 	switch q.Data.(type) {
 	case community.GetCapabilities, *community.GetCapabilities:
-		return q.Answer(roomnet.LocalCapabilities())
+		caps := roomnet.LocalCapabilities()
+		if n.inbox != nil {
+			caps.Flags = community.RelayServiceDM
+		}
+		return q.Answer(caps)
 	}
 	now := time.Now()
 	if isInboxQuery(q.Data) {
@@ -272,6 +276,15 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		return n.answer(p, q, broadcast.Time{Now: int32(now.Unix())})
 	case community.GetRoomCardsV1, *community.GetRoomCardsV1:
 		return n.answerRoomCards(q, now)
+	case community.GetRelayCardV1, *community.GetRelayCardV1:
+		if n.relays == nil {
+			return roomnet.ErrNoAnswer
+		}
+		card, err := n.relays.ownCard(now)
+		if err != nil {
+			return err
+		}
+		return q.Answer(card)
 	}
 	var id []byte
 	switch wrapper := q.Data.(type) {
@@ -282,8 +295,10 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 	default:
 		return roomnet.ErrNoAnswer
 	}
-	if n.catalog != nil && bytes.Equal(id, n.catalog.id) {
-		return n.catalog.answerPeers(q)
+	for _, global := range n.globalOverlays() {
+		if bytes.Equal(id, global.id) {
+			return global.answerPeers(q)
+		}
 	}
 	room := n.byOverlay[string(id)]
 	if room == nil && n.byOverlay == nil && n.room != nil && bytes.Equal(id, n.room.overlayID) {

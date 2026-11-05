@@ -190,8 +190,8 @@ func TestFreeInboxDepositsPagesAckAndDuplicateAfterReconnect(t *testing.T) {
 		t.Fatal("inbox queries joined a room")
 	}
 	var caps community.Capabilities
-	if err := r.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != 0 {
-		t.Fatal("partial service advertised DM/paid capability", err)
+	if err := r.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != community.RelayServiceDM {
+		t.Fatal("enabled service missing DM or advertising paid capability", err)
 	}
 	p.Close()
 	p = inboxPeer(t, ctx, f.n, sender)
@@ -347,6 +347,8 @@ func TestInboxZeroAndCombinedLifecycleMaintenanceAndDisabledAdmission(t *testing
 			f := freeInboxNode(t, 30*time.Second, combined)
 			if !combined {
 				f.n.cfg.LocalOnly = false
+				f.n.cfg.Advertise = "1.1.1.1:17400"
+				fakePublicRooms(f.n)
 			}
 			done := make(chan struct{})
 			var runErr error

@@ -3,19 +3,13 @@ package node
 import (
 	"bytes"
 	"context"
-	"fmt"
-	"log"
 	"math/rand/v2"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
-	"github.com/TONresistor/tonnet-messenger/internal/dht"
 	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
-	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
 )
 
 const maxCatalogCards = 1024
@@ -31,24 +25,35 @@ type catalogCard struct {
 // Remote advertisements have count/byte bounds; own cards are bounded by the
 // operator's configured sequencer rooms and always take precedence.
 type roomCatalog struct {
-	node       *Node
-	id         []byte
-	mu         sync.Mutex
-	own        map[string]community.RoomCardV1
-	cards      map[string]catalogCard
-	bytes      int
-	peers      map[*peer]tonoverlay.Node
-	pub        atomic.Pointer[roomPublication]
-	advertised chan tonoverlay.Node
+	*globalOverlay
+	own   map[string]community.RoomCardV1
+	cards map[string]catalogCard
+	bytes int
 }
 
 func newRoomCatalog(n *Node) (*roomCatalog, error) {
-	id, err := ov.PublicRoomsID()
+	global, err := newGlobalOverlay(n, ov.PublicRooms)
 	if err != nil {
 		return nil, err
 	}
-	c := &roomCatalog{node: n, id: id, own: make(map[string]community.RoomCardV1), cards: make(map[string]catalogCard), peers: make(map[*peer]tonoverlay.Node), advertised: make(chan tonoverlay.Node, maxGossipNodes)}
+	c := &roomCatalog{globalOverlay: global, own: make(map[string]community.RoomCardV1), cards: make(map[string]catalogCard)}
+	global.refreshOwn = c.refreshOwn
+	global.expireLocked = c.expireLocked
+	global.pull = c.pullCards
 	return c, c.refreshOwn(n.ctx, time.Now())
+}
+
+func (c *roomCatalog) pullCards(ctx context.Context, p *peer) {
+	var cards community.RoomCardListV1
+	if err := p.queryNode(ctx, community.GetRoomCardsV1{Limit: community.MaxPageLimit}, &cards); err != nil || len(cards.Cards) > community.MaxPageLimit {
+		return
+	}
+	for _, card := range cards.Cards {
+		if ctx.Err() != nil {
+			return
+		}
+		c.accept(ctx, card, time.Now())
+	}
 }
 
 func freshCard(version int32, now time.Time) bool {
@@ -207,202 +212,4 @@ func (n *Node) answerRoomCards(q *roomnet.Query, now time.Time) error {
 		return q.Answer(community.RoomCardListV1{})
 	}
 	return q.Answer(n.catalog.list(limit, now))
-}
-
-func (c *roomCatalog) forgetPeer(p *peer) { c.mu.Lock(); delete(c.peers, p); c.mu.Unlock() }
-
-func (c *roomCatalog) nodes(now time.Time) tonoverlay.NodesList {
-	self, err := c.node.signedOverlayNode(c.id)
-	if err != nil {
-		return tonoverlay.NodesList{}
-	}
-	list := []tonoverlay.Node{self}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for p, nd := range c.peers {
-		if !freshCard(nd.Version, now) {
-			delete(c.peers, p)
-			continue
-		}
-		if len(list) < 8 && c.node.outboundReady(p) {
-			list = append(list, nd)
-		}
-	}
-	return tonoverlay.NodesList{List: list}
-}
-
-func (c *roomCatalog) queue(nodes []tonoverlay.Node) {
-	if c.pub.Load() == nil {
-		return
-	}
-	for _, nd := range capNodes(nodes) {
-		id, _, err := verifyOverlayNode(&nd, c.id, time.Now())
-		if err != nil || bytes.Equal(id, c.node.qgw.ID()) {
-			continue
-		}
-		select {
-		case c.advertised <- nd:
-		default:
-		}
-	}
-}
-
-func (c *roomCatalog) answerPeers(q *roomnet.Query) error {
-	if selected, err := q.SelectOverlay(c.id); err != nil || !selected {
-		return err
-	}
-	var advertised tonoverlay.NodesList
-	switch request := q.Data.(type) {
-	case tonoverlay.GetRandomPeers:
-		advertised = request.List
-	case *tonoverlay.GetRandomPeers:
-		advertised = request.List
-	default:
-		return roomnet.ErrNoAnswer
-	}
-	c.queue(advertised.List)
-	return q.Answer(c.nodes(time.Now()))
-}
-
-func (c *roomCatalog) probe(ctx context.Context, p *peer) {
-	queryCtx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
-	defer cancel()
-	self, err := c.node.signedOverlayNode(c.id)
-	if err != nil {
-		return
-	}
-	var peers tonoverlay.NodesList
-	valid := false
-	err = p.withOutbound(func(conn *roomnet.Peer) error {
-		if err := conn.QueryOverlayOutbound(queryCtx, c.id, tonoverlay.GetRandomPeers{List: tonoverlay.NodesList{List: []tonoverlay.Node{self}}}, &peers); err != nil {
-			return err
-		}
-		peers.List = capNodes(peers.List)
-		for _, nd := range peers.List {
-			_, public, err := verifyOverlayNode(&nd, c.id, time.Now())
-			if err == nil && public.Equal(p.conn.GetPubKey()) && c.node.outboundReady(p) {
-				c.mu.Lock()
-				c.peers[p] = nd
-				c.mu.Unlock()
-				valid = true
-				break
-			}
-		}
-		return nil
-	})
-	if err != nil || !valid {
-		c.forgetPeer(p)
-		return
-	}
-	c.node.peers.markNodeGood(p.id, time.Now())
-	c.queue(peers.List)
-	var cards community.RoomCardListV1
-	if err := p.queryNode(queryCtx, community.GetRoomCardsV1{Limit: community.MaxPageLimit}, &cards); err != nil || len(cards.Cards) > community.MaxPageLimit {
-		return
-	}
-	for _, card := range cards.Cards {
-		if ctx.Err() != nil {
-			return
-		}
-		c.accept(queryCtx, card, time.Now())
-	}
-}
-
-func (c *roomCatalog) consider(ctx context.Context, nd tonoverlay.Node) {
-	pub := c.pub.Load()
-	if pub == nil {
-		return
-	}
-	id, public, err := verifyOverlayNode(&nd, c.id, time.Now())
-	if err != nil || bytes.Equal(id, c.node.qgw.ID()) {
-		return
-	}
-	if p, ok := c.node.peers.get(fmt.Sprintf("%x", id)); ok && c.node.outboundReady(p) {
-		c.mu.Lock()
-		_, known := c.peers[p]
-		c.mu.Unlock()
-		if !known {
-			c.probe(ctx, p)
-		}
-		return
-	}
-	if !c.node.acquireDial() {
-		return
-	}
-	defer c.node.releaseDial()
-	dialCtx, cancel := context.WithTimeout(ctx, dialTimeout)
-	defer cancel()
-	addresses, resolved, err := pub.ResolveAll(dialCtx, id)
-	if err != nil || !public.Equal(resolved) {
-		return
-	}
-	for _, address := range addresses {
-		p, err := c.node.dialCatalogNode(dialCtx, public, address)
-		if err == nil {
-			c.probe(ctx, p)
-			return
-		}
-	}
-}
-
-func (c *roomCatalog) discover(ctx context.Context) {
-	if pub := c.pub.Load(); pub != nil {
-		if nodes, err := pub.FindOverlayNodes(ctx, []byte(ov.PublicRooms)); err == nil && nodes != nil {
-			for _, nd := range capNodes(nodes.List) {
-				c.consider(ctx, nd)
-			}
-		}
-	}
-	c.mu.Lock()
-	peers := make([]*peer, 0, len(c.peers))
-	for p := range c.peers {
-		peers = append(peers, p)
-	}
-	c.expireLocked(time.Now())
-	c.mu.Unlock()
-	for _, p := range peers {
-		if ctx.Err() != nil {
-			return
-		}
-		c.probe(ctx, p)
-	}
-}
-
-func (c *roomCatalog) run(ctx context.Context) {
-	// New may precede Run by more than a card TTL. Start with current cards.
-	if err := c.refreshOwn(ctx, time.Now()); err != nil && ctx.Err() == nil {
-		log.Printf("room cards: %v", err)
-	}
-	// Refresh must not wait behind network discovery or alias resolution.
-	var refresh sync.WaitGroup
-	refresh.Add(1)
-	go func() {
-		defer refresh.Done()
-		ticker := time.NewTicker(dht.RepublishEach)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if err := c.refreshOwn(ctx, time.Now()); err != nil && ctx.Err() == nil {
-					log.Printf("room cards: %v", err)
-				}
-			}
-		}
-	}()
-	defer refresh.Wait()
-	discover := time.NewTimer(discoverWarmup)
-	defer discover.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-discover.C:
-			c.discover(ctx)
-			discover.Reset(DiscoverEach)
-		case nd := <-c.advertised:
-			c.consider(ctx, nd)
-		}
-	}
 }

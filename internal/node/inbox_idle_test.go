@@ -131,7 +131,7 @@ func TestRelayIdleAnsweredQueriesAndCombinedRoomMembership(t *testing.T) {
 	f.n.queries = newTokenBucket(0, 0)
 	ageIdleConnection(f.n, conn, base)
 	var caps community.Capabilities
-	if err := p.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != 0 {
+	if err := p.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != community.RelayServiceDM {
 		t.Fatal("capability under exhausted limit", err)
 	}
 	state := waitIdleCompletion(t, ctx, f.n, conn, base)
