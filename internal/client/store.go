@@ -34,7 +34,7 @@ type clientQueryer interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
-const clientSchemaVersion = 2
+const clientSchemaVersion = 3
 
 func openClientStore(ctx context.Context, path string) (*clientStore, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
@@ -128,6 +128,24 @@ CREATE TABLE IF NOT EXISTS pending_operations (
     genesis_hash BLOB NOT NULL CHECK(length(genesis_hash)=32),
     raw_proposal BLOB NOT NULL,
     raw_commit BLOB
+);
+CREATE TABLE IF NOT EXISTS received_inbox_dms (
+    inbox_id BLOB NOT NULL CHECK(length(inbox_id)=32),
+    dm_id BLOB NOT NULL CHECK(length(dm_id)=32),
+    raw_envelope BLOB NOT NULL,
+    PRIMARY KEY(inbox_id,dm_id)
+);
+CREATE TABLE IF NOT EXISTS inbox_cursors (
+    inbox_id BLOB NOT NULL CHECK(length(inbox_id)=32),
+    relay_key BLOB NOT NULL CHECK(length(relay_key)=32),
+    after_seqno INTEGER NOT NULL CHECK(after_seqno>=0),
+    PRIMARY KEY(inbox_id,relay_key)
+);
+CREATE TABLE IF NOT EXISTS pending_inbox_acks (
+    inbox_id BLOB NOT NULL CHECK(length(inbox_id)=32),
+    relay_key BLOB NOT NULL CHECK(length(relay_key)=32),
+    dm_id BLOB NOT NULL CHECK(length(dm_id)=32),
+    PRIMARY KEY(inbox_id,relay_key,dm_id)
 );
 `); err != nil {
 		return fmt.Errorf("client store migration: %w", err)
