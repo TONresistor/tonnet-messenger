@@ -2,7 +2,6 @@ package node
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
@@ -35,6 +34,9 @@ func (c DMConfig) validate() error {
 }
 
 type inboxConnection struct {
+	peer         *peer
+	lastActivity time.Time // Opening is the baseline until the first activity.
+	inFlight     int
 	challenges   map[string]community.InboxAuthV1ToSign
 	subscription *inboxSubscription
 	stop         func() bool
@@ -75,14 +77,12 @@ func (s *inboxService) pruneLocked(now int64) {
 				delete(state.challenges, nonce)
 			}
 		}
-		if conn.Context().Err() != nil || len(state.challenges) == 0 {
+		if conn.Context().Err() != nil {
 			delete(s.connections, conn)
 			state.stop()
 		}
 	}
 }
-
-func (s *inboxService) prune(now int64) { s.mu.Lock(); s.pruneLocked(now); s.mu.Unlock() }
 
 func (s *inboxService) close() {
 	s.mu.Lock()
@@ -106,18 +106,7 @@ func (s *inboxService) challenge(conn *quic.Client, inbox []byte, now int64) (co
 	}
 	state := s.connections[conn]
 	if state == nil {
-		if len(s.connections) >= s.maxConnections {
-			return community.InboxChallengeV1{}, &store.Rejection{Code: community.RejectRelayFullOrQuotaExceeded, Message: "inbox connection state is full"}
-		}
-		state = &inboxConnection{challenges: make(map[string]community.InboxAuthV1ToSign)}
-		s.connections[conn] = state
-		state.stop = context.AfterFunc(conn.Context(), func() {
-			s.mu.Lock()
-			if s.connections[conn] == state {
-				delete(s.connections, conn)
-			}
-			s.mu.Unlock()
-		})
+		return community.InboxChallengeV1{}, &store.Rejection{Code: community.RejectInboxAuthenticationFailed, Message: "connection is not active"}
 	}
 	// Retain these contexts until expiry so the same signed proof can be reused
 	// on fetch/ack without a key- or managed-Peer-scoped authorization cache.

@@ -36,7 +36,13 @@ func (n *Node) wirePeer(p *peer) {
 		n.handleCommunityMessage(p, message, time.Now())
 		return nil
 	})
-	p.conn.SetQueryHandler(func(query *roomnet.Query) error { return n.answerQuery(p, query) })
+	queryHandler := func(query *roomnet.Query) error { return n.answerQuery(p, query) }
+	if n.inbox != nil {
+		p.conn.SetConnectionHandler(func(conn *quic.Client) { n.inbox.open(p, conn, time.Now()) })
+		p.conn.SetQueryHandlerWithLifecycle(queryHandler, n.inbox.beginQuery)
+	} else {
+		p.conn.SetQueryHandler(queryHandler)
+	}
 	p.conn.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
 		p.outboundCaps.Store(nil)
 		removed := n.peers.removePeer(id, p)
@@ -96,6 +102,7 @@ func (n *Node) writeInboxPush(job outboundJob) {
 			log.Printf("inbox push failed: %v", err)
 			return
 		}
+		n.inbox.pushed(job.physical, job.subscription, time.Now())
 	}
 }
 

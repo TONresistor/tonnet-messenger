@@ -603,7 +603,7 @@ func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
 }
 
 func (n *Node) maintainInboxes(ctx context.Context, now time.Time) {
-	n.inbox.prune(now.Unix())
+	n.evictIdlePeers(now)
 	if _, err := n.database.ExpireInboxes(ctx, now); err != nil && ctx.Err() == nil {
 		log.Printf("inbox expiry: %v", err)
 	}

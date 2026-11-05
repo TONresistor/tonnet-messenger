@@ -177,7 +177,22 @@ func (p *Peer) GetRandomPeers(ctx context.Context, overlayID []byte) ([]overlay.
 	return result.List, nil
 }
 
+// SetConnectionHandler observes every authenticated physical opening, before
+// streams are dispatched, including a silent replacement on the same Peer.
+func (p *Peer) SetConnectionHandler(handler func(*quic.Client)) {
+	if p != nil && p.raw != nil {
+		p.raw.SetConnectionHandler(handler)
+	}
+}
+
 func (p *Peer) SetQueryHandler(handler func(*Query) error) {
+	p.SetQueryHandlerWithLifecycle(handler, nil)
+}
+
+// SetQueryHandlerWithLifecycle brackets decoding, dispatch and bounded answer
+// serialization. The finish callback reports whether a response was prepared;
+// ctx retains stream completion so observers can cover the subsequent write.
+func (p *Peer) SetQueryHandlerWithLifecycle(handler func(*Query) error, begin func(context.Context) func(bool)) {
 	if p == nil || p.raw == nil {
 		return
 	}
@@ -186,6 +201,11 @@ func (p *Peer) SetQueryHandler(handler func(*Query) error) {
 		return
 	}
 	p.raw.SetQueryHandler(func(ctx context.Context, payload []byte) ([]byte, error) {
+		answered := false
+		if begin != nil {
+			finish := begin(ctx)
+			defer func() { finish(answered) }()
+		}
 		if len(payload) > MaxWireObjectSize {
 			return nil, fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
 		}
@@ -207,6 +227,7 @@ func (p *Peer) SetQueryHandler(handler func(*Query) error) {
 		if len(encoded) > MaxAnswerPayloadSize {
 			return nil, fmt.Errorf("room transport: answer exceeds %d bytes", MaxAnswerObjectSize)
 		}
+		answered = ctx.Err() == nil
 		return encoded, nil
 	})
 }

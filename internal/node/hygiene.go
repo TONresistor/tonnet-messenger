@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
+	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 const (
@@ -27,14 +29,106 @@ func (n *Node) peerMaintenanceLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			now := time.Now()
-			for _, p := range n.peers.evictStale(now) {
-				n.closePeer(p, "leaf activity expired")
+			if n.inbox == nil {
+				n.evictIdlePeers(now)
 			}
 			for _, p := range n.peers.nodePeersIdleSince(now, peerKeepaliveIdle) {
 				workers.Add(1)
 				go func() { defer workers.Done(); n.keepalivePeer(ctx, p) }()
 			}
 		}
+	}
+}
+
+func (n *Node) evictIdlePeers(now time.Time) {
+	if n.inbox == nil {
+		for _, p := range n.peers.evictStale(now) {
+			n.closePeer(p, "leaf activity expired")
+		}
+		return
+	}
+	s := n.inbox
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now.Unix())
+	for conn, state := range s.connections {
+		// Keep the established verified-node lifecycle. The relay rule applies
+		// to clients; room membership uses the existing managed-peer model.
+		if n.peers.isHealthyNode(state.peer) {
+			continue
+		}
+		member, ok := n.peers.memberLeaf(state.peer.id)
+		if state.idleAt(now, ok && member == state.peer) {
+			// Serialize the decision with beginQuery. Never close another live
+			// connection selected by the managed Peer or a newer replacement.
+			conn.Close()
+		}
+	}
+}
+
+func (c *inboxConnection) idleAt(now time.Time, member bool) bool {
+	if c.inFlight != 0 {
+		return false
+	}
+	ttl := peerQuarantineTTL
+	if member || c.subscription != nil && c.subscription.expireAt > now.Unix() {
+		ttl = peerMemberIdleTTL
+	}
+	return now.Sub(c.lastActivity) >= ttl
+}
+
+func (s *inboxService) open(p *peer, conn *quic.Client, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pruneLocked(now.Unix())
+	if s.closed || conn.Context().Err() != nil || s.connections[conn] != nil {
+		return
+	}
+	if len(s.connections) >= s.maxConnections {
+		conn.Close()
+		return
+	}
+	state := &inboxConnection{peer: p, lastActivity: now, challenges: make(map[string]community.InboxAuthV1ToSign)}
+	s.connections[conn] = state
+	state.stop = context.AfterFunc(conn.Context(), func() {
+		s.mu.Lock()
+		if s.connections[conn] == state {
+			delete(s.connections, conn)
+		}
+		s.mu.Unlock()
+	})
+}
+
+func (s *inboxService) beginQuery(ctx context.Context) func(bool) {
+	conn, err := quic.ClientFromContext(ctx)
+	s.mu.Lock()
+	state := s.connections[conn]
+	if err != nil || state == nil {
+		s.mu.Unlock()
+		return func(bool) {}
+	}
+	state.inFlight++
+	s.mu.Unlock()
+	finished := make(chan bool, 1)
+	context.AfterFunc(ctx, func() {
+		// The stream includes the answer write. The handler may have returned
+		// its encoded response earlier, or the stream may have been reset.
+		answered := <-finished
+		s.mu.Lock()
+		state.inFlight--
+		if answered {
+			state.lastActivity = time.Now()
+		}
+		s.mu.Unlock()
+	})
+	return func(answered bool) { finished <- answered }
+}
+
+func (s *inboxService) pushed(conn *quic.Client, sub *inboxSubscription, now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if state := s.connections[conn]; state != nil && sub != nil && state.subscription == sub && sub.expireAt > now.Unix() {
+		state.lastActivity = now
 	}
 }
 
