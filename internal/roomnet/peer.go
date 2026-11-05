@@ -15,7 +15,7 @@ import (
 const (
 	MaxWireObjectSize    = 64 << 10
 	MaxIncomingStreams   = 4
-	MaxAnswerObjectSize  = quic.DefaultMaxObjectSize
+	MaxAnswerObjectSize  = 4 << 20
 	MaxAnswerPayloadSize = MaxAnswerObjectSize - 8
 	maxQUICObjectSize    = MaxWireObjectSize + 8
 )
@@ -26,9 +26,11 @@ var (
 )
 
 func NewGateway(keys ...ed25519.PrivateKey) (*quic.Gateway, error) {
-	return quic.NewGatewayWithConfig(quic.GatewayConfig{
-		MaxObjectSize: maxQUICObjectSize, MaxIncomingStreams: MaxIncomingStreams,
-	}, keys...)
+	limits := quic.DefaultLimits()
+	limits.MaxObjectSize = maxQUICObjectSize
+	limits.MaxIncomingStreams = MaxIncomingStreams
+	limits.MaxConcurrentIncomingStreamsPerConnection = MaxIncomingStreams
+	return quic.NewGatewayWithLimits(limits, keys...)
 }
 
 // Query is a decoded TON QUIC query and its single response.
@@ -96,7 +98,7 @@ func (p *Peer) query(ctx context.Context, request any) ([]byte, error) {
 	if len(payload) > MaxWireObjectSize {
 		return nil, fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
 	}
-	return p.raw.Query(ctx, payload, quic.DefaultMaxObjectSize)
+	return p.raw.Query(ctx, payload, MaxAnswerObjectSize)
 }
 
 func decodeAnswer(answer []byte, result any) error {

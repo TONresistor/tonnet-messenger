@@ -1,7 +1,5 @@
 module github.com/TONresistor/tonnet-messenger
 
-replace github.com/xssnick/tonutils-go => github.com/TONresistor/tonutils-go v1.17.1-0.20260901155046-f042b2f20322
-
 go 1.26.7
 
 require (
@@ -11,10 +9,10 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.8
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/spf13/cobra v1.10.2
-	github.com/xssnick/tonutils-go v1.18.0
-	golang.org/x/net v0.56.0
-	golang.org/x/sys v0.47.0
-	golang.org/x/term v0.44.0
+	github.com/xssnick/tonutils-go v1.19.1
+	golang.org/x/net v0.59.0
+	golang.org/x/sys v0.48.0
+	golang.org/x/term v0.46.0
 	modernc.org/sqlite v1.57.0
 )
 
@@ -36,14 +34,14 @@ require (
 	github.com/mattn/go-runewidth v0.0.27 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/pierrec/lz4/v4 v4.1.27 // indirect
+	github.com/pierrec/lz4/v4 v4.1.28 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	github.com/xssnick/quic-go-ton v0.0.0-20260707110703-14f3237f97b9 // indirect
-	github.com/xssnick/raptorq v1.5.0 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	github.com/xssnick/quic-go-ton v0.0.0-20261001181112-f2ad8f940a32 // indirect
+	github.com/xssnick/raptorq v1.6.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

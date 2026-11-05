@@ -124,4 +124,18 @@ func TestOverlaySizeBoundIncludesCompleteWrapper(t *testing.T) {
 	if _, err := rawPeer.Query(ctx, oversized, quic.DefaultMaxObjectSize); err == nil {
 		t.Fatal("inbound oversized wrapper accepted")
 	}
+	// Upstream also bounds outgoing requests. Use a wider upstream sender to
+	// ensure the Messenger receiver rejects an oversized object on the wire.
+	unbounded, err := quic.NewGateway(testKey(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unbounded.Close()
+	incoming, err := unbounded.DialDefault(ctx, peer.GetPubKey(), peer.RemoteAddr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := incoming.Query(ctx, oversized, roomnet.MaxAnswerObjectSize); err == nil {
+		t.Fatal("receiver accepted an oversized wrapper from a wider sender")
+	}
 }
