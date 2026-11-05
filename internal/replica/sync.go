@@ -8,12 +8,14 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
 	tondht "github.com/xssnick/tonutils-go/adnl/dht"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -23,6 +25,7 @@ import (
 )
 
 type Config struct {
+	Connector     *Connector
 	ConfigURL     string
 	RoomID        []byte
 	NodeKey       ed25519.PrivateKey
@@ -116,17 +119,20 @@ type connected struct {
 	capabilities community.Capabilities
 	peer         *roomnet.Peer
 	done         <-chan struct{}
+	subscribe    func(func(any) error)
 }
 
 type Session struct {
 	Genesis community.Genesis
-	// Capabilities belongs to this dedicated client-only session. The Gateway
-	// is private and never dialed again after selection, so no connection can
-	// replace the one that answered the probe while retaining this value.
+	// Capabilities belongs to the selected client-only connection, shared only
+	// through Connector leases. Reconnection always constructs and probes a new
+	// private Gateway; closing a lease never redials its connection.
 	Capabilities community.Capabilities
 	Peer         *roomnet.Peer
 	Done         <-chan struct{}
 	close        func()
+	subscribe    func(func(any) error)
+	closeOnce    sync.Once
 }
 
 func DialSequencer(ctx context.Context, cfg Config) (*Session, error) {
@@ -142,19 +148,36 @@ func dialRoom(ctx context.Context, cfg Config, requireSequencer bool) (*Session,
 	if err != nil {
 		return nil, err
 	}
-	return &Session{Genesis: connected.genesis, Capabilities: connected.capabilities, Peer: connected.peer, Done: connected.done, close: closeSession}, nil
+	return &Session{Genesis: connected.genesis, Capabilities: connected.capabilities, Peer: connected.peer, Done: connected.done, close: closeSession, subscribe: connected.subscribe}, nil
 }
 
 func (s *Session) Close() {
-	if s != nil && s.close != nil {
-		s.close()
-		s.close = nil
+	if s != nil {
+		s.closeOnce.Do(func() {
+			if s.close != nil {
+				s.close()
+			}
+		})
+	}
+}
+func (s *Session) SetMessageHandler(handler func(any) error) {
+	if s.subscribe != nil {
+		s.subscribe(handler)
+	} else {
+		s.Peer.SetMessageHandler(handler)
 	}
 }
 
 func connect(ctx context.Context, cfg Config, database *store.Store, requireSequencer bool) (*connected, func(), error) {
 	if len(cfg.RoomID) != ed25519.PublicKeySize || len(cfg.NodeKey) != ed25519.PrivateKeySize {
 		return nil, nil, fmt.Errorf("replica: invalid room or node key")
+	}
+	if cfg.Connector != nil && cfg.DirectAddress == "" {
+		if known := cfg.Connector.knownTargets(cfg.BootstrapADNL); len(known) > 0 {
+			if connection, closeConnection, err := connectTargets(ctx, cfg, database, requireSequencer, known); err == nil {
+				return connection, closeConnection, nil
+			}
+		}
 	}
 	var targets []target
 	if cfg.DirectAddress != "" {
@@ -186,25 +209,52 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 }
 
 func connectTargets(ctx context.Context, cfg Config, database *store.Store, requireSequencer bool, targets []target) (*connected, func(), error) {
-	gateway, err := roomnet.NewGateway(cfg.NodeKey)
-	if err != nil {
-		return nil, nil, err
+	var gateway *quic.Gateway
+	var err error
+	if cfg.Connector == nil {
+		gateway, err = roomnet.NewGateway(cfg.NodeKey)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
-	closeClient := func() { gateway.Close() }
+	closeClient := func() {
+		if gateway != nil {
+			gateway.Close()
+		}
+	}
 	var lastQueryError error
 	for _, candidate := range targets {
-		peer, err := gateway.DialDefault(ctx, candidate.public, candidate.address)
-		if err != nil {
-			continue
-		}
-		wrapper := roomnet.Wrap(peer)
-		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-		capabilities, probeErr := wrapper.ProbeCapabilities(probeCtx)
-		probeCancel()
-		if probeErr != nil {
-			lastQueryError = probeErr
-			peer.Close()
-			continue
+		var wrapper *roomnet.Peer
+		var capabilities community.Capabilities
+		var lease *connectionLease
+		var done <-chan struct{}
+		var release func()
+		if cfg.Connector != nil {
+			lease, err = cfg.Connector.acquire(ctx, cfg.NodeKey, candidate)
+			if err != nil {
+				lastQueryError = err
+				continue
+			}
+			wrapper = lease.entry.peer
+			capabilities = lease.entry.capabilities
+			done = lease.done
+			release = lease.close
+		} else {
+			peer, dialErr := gateway.DialDefault(ctx, candidate.public, candidate.address)
+			if dialErr != nil {
+				continue
+			}
+			wrapper = roomnet.Wrap(peer)
+			done = wrapper.Done()
+			release = func() { peer.Close() }
+			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+			capabilities, err = wrapper.ProbeCapabilities(probeCtx)
+			probeCancel()
+			if err != nil {
+				lastQueryError = err
+				release()
+				continue
+			}
 		}
 		var genesis community.Genesis
 		queryCtx, queryCancel := context.WithTimeout(ctx, 5*time.Second)
@@ -215,16 +265,22 @@ func connectTargets(ctx context.Context, cfg Config, database *store.Store, requ
 			if queryErr != nil {
 				lastQueryError = queryErr
 			}
-			peer.Close()
+			release()
 			continue
 		}
 		if database != nil {
 			if err := database.ValidateGenesis(ctx, genesis); err != nil {
-				peer.Close()
+				release()
 				continue
 			}
 		}
-		return &connected{genesis: genesis, capabilities: capabilities, peer: wrapper, done: wrapper.Done()}, closeClient, nil
+		selectedClose := closeClient
+		var subscribe func(func(any) error)
+		if lease != nil {
+			selectedClose = release
+			subscribe = func(handler func(any) error) { lease.subscribe(cfg.RoomID, handler) }
+		}
+		return &connected{genesis: genesis, capabilities: capabilities, peer: wrapper, done: done, subscribe: subscribe}, selectedClose, nil
 	}
 	closeClient()
 	if lastQueryError != nil {

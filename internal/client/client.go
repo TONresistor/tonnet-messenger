@@ -76,6 +76,7 @@ type Client struct {
 	directPublic  ed25519.PublicKey
 	keyPath       string
 	key           ed25519.PrivateKey
+	connector     *replica.Connector
 	store         *clientStore
 	lock          *stateLock
 
@@ -131,11 +132,12 @@ type canonicalEvent struct {
 }
 
 type roomIdentitySnapshot struct {
-	key     ed25519.PrivateKey
-	name    string
-	domain  string
-	session *replica.Session
-	epoch   uint64
+	connector *replica.Connector
+	key       ed25519.PrivateKey
+	name      string
+	domain    string
+	session   *replica.Session
+	epoch     uint64
 }
 
 func Open(ctx context.Context, cfg Config) (*Client, error) {
@@ -193,10 +195,17 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		return nil, err
 	}
 	clientCtx, cancel := context.WithCancel(ctx)
+	connector, err := replica.NewConnector(clientCtx, key)
+	if err != nil {
+		cancel()
+		store.Close()
+		releaseStateLock(lock)
+		return nil, err
+	}
 	c := &Client{
 		ctx: clientCtx, cancel: cancel, stateDir: cfg.StateDir, configURL: cfg.ConfigURL,
 		directAddress: cfg.DirectAddress, directPublic: append(ed25519.PublicKey(nil), cfg.DirectPublic...),
-		keyPath: keyPath, key: key, store: store, lock: lock, rooms: map[string]*roomHandle{},
+		keyPath: keyPath, key: key, connector: connector, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 	}
 	return c, nil
@@ -235,7 +244,11 @@ func (c *Client) Close() error {
 		room.closeSession()
 	}
 	c.rooms = map[string]*roomHandle{}
+	connector := c.connector
 	c.mu.Unlock()
+	if connector != nil {
+		connector.Close()
+	}
 	c.identityOps.Unlock()
 	c.notifyMu.Lock()
 	c.notifyClosed = true
@@ -370,6 +383,17 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 		return Identity{}, err
 	}
 	defer os.Remove(stagedPath)
+	nextConnector, err := replica.NewConnector(c.ctx, key)
+	if err != nil {
+		c.mu.Unlock()
+		return Identity{}, err
+	}
+	installed := false
+	defer func() {
+		if !installed {
+			nextConnector.Close()
+		}
+	}()
 	previousDomain := c.domain
 	if err := c.store.setMeta(ctx, "author_domain", ""); err != nil {
 		c.mu.Unlock()
@@ -386,12 +410,18 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 		c.mu.Unlock()
 		return Identity{}, err
 	}
+	previousConnector := c.connector
+	c.connector = nextConnector
+	installed = true
 	c.key = key
 	c.domain = ""
 	c.identityEpoch++
 	c.receivedDMs = directReplayCache{}
 	identity := Identity{Key: keyText(key.Public().(ed25519.PublicKey)), Name: c.name}
 	c.mu.Unlock()
+	if previousConnector != nil {
+		previousConnector.Close()
+	}
 	if err := c.notify(c.ctx, "identity.changed", identity); err != nil {
 		return identity, err
 	}
@@ -642,7 +672,8 @@ func (c *Client) snapshotRoomIdentity(handle *roomHandle) (roomIdentitySnapshot,
 		return roomIdentitySnapshot{}, fmt.Errorf("room is not connected")
 	}
 	return roomIdentitySnapshot{
-		key: append(ed25519.PrivateKey(nil), c.key...), name: c.name, domain: c.domain,
+		connector: c.connector,
+		key:       append(ed25519.PrivateKey(nil), c.key...), name: c.name, domain: c.domain,
 		session: handle.session, epoch: c.identityEpoch,
 	}, nil
 }
@@ -673,7 +704,7 @@ func (r *roomHandle) sequencerTimestamp(ctx context.Context, snapshot roomIdenti
 			dial = replica.DialSequencer
 		}
 		authority, err = dial(ctx, replica.Config{
-			ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: snapshot.key, BootstrapADNL: sequencerID,
+			Connector: snapshot.connector, ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: snapshot.key, BootstrapADNL: sequencerID,
 		})
 		if err != nil {
 			if ctx.Err() != nil {
@@ -847,9 +878,10 @@ func (r *roomHandle) connect(ctx context.Context) error {
 	r.client.mu.RLock()
 	identity := append(ed25519.PrivateKey(nil), r.client.key...)
 	identityEpoch := r.client.identityEpoch
+	connector := r.client.connector
 	r.client.mu.RUnlock()
 	session, err := replica.DialRoom(ctx, replica.Config{
-		ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
+		Connector: connector, ConfigURL: r.client.configURL, RoomID: r.key, NodeKey: identity, BootstrapADNL: r.boot,
 		DirectAddress: r.client.directAddress, DirectPublic: r.client.directPublic,
 	})
 	if err != nil {
@@ -861,7 +893,7 @@ func (r *roomHandle) connect(ctx context.Context) error {
 		session.Close()
 		return err
 	}
-	session.Peer.SetMessageHandler(func(message any) error {
+	session.SetMessageHandler(func(message any) error {
 		r.ingestSerializable(session, identityEpoch, message)
 		return nil
 	})
