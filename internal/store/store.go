@@ -18,7 +18,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
 
-const schemaVersion = 4
+const schemaVersion = 5
 
 var (
 	ErrAlreadyInitialized = errors.New("store: room is already initialized")

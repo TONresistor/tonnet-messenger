@@ -101,6 +101,11 @@ func legacyLayout(t *testing.T, db *sql.DB, version int) {
 		t.Fatal(err)
 	}
 	defer tx.Rollback()
+	for _, table := range []string{"inbox_messages", "inbox_rate", "inbox_receipts", "inbox_counters"} {
+		if _, err := tx.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
 	for _, table := range roomTables {
 		if _, err := tx.Exec("ALTER TABLE " + table.name + " RENAME TO fixture_" + table.name); err != nil {
 			t.Fatal(err)

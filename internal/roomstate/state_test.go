@@ -116,6 +116,12 @@ func TestLoadAuthorityRecoversLegacyStateAtEveryStart(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				for _, table := range []string{"inbox_messages", "inbox_rate", "inbox_receipts", "inbox_counters"} {
+					if _, err := tx.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+						t.Fatal(err)
+					}
+				}
+
 				for _, table := range []string{"room_genesis", "room_state", "replica_head", "events", "messages", "pins", "roles", "request_nonces"} {
 					rows, err := tx.Query("SELECT * FROM " + table + " LIMIT 0")
 					if err != nil {

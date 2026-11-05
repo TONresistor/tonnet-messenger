@@ -122,54 +122,65 @@ version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
 	if version == schemaVersion {
 		return nil
 	}
-	legacy := version > 0
-	var hasBans bool
-	if legacy {
-		if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='bans')").Scan(&hasBans); err != nil {
-			return err
-		}
-		for _, table := range roomTables {
-			if table.name == "bans" && !hasBans && version < 3 {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, "ALTER TABLE "+table.name+" RENAME TO legacy_"+table.name); err != nil {
-				return fmt.Errorf("store: migrate %s: %w", table.name, err)
-			}
-		}
-	}
-	if _, err := tx.ExecContext(ctx, roomSchema); err != nil {
-		return fmt.Errorf("store: create room schema: %w", err)
-	}
-	if legacy {
-		var count int
-		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM legacy_room_genesis").Scan(&count); err != nil {
-			return err
-		}
-		if count > 1 {
-			return fmt.Errorf("store: legacy database contains multiple genesis rows")
-		}
-		for _, table := range roomTables {
-			if table.name == "bans" && !hasBans {
-				continue
-			}
-			roomID := "(SELECT room_key FROM legacy_room_genesis WHERE singleton_id=1)"
-			if _, err := tx.ExecContext(ctx, "INSERT INTO "+table.name+"(room_id,"+table.columns+") SELECT "+roomID+","+table.columns+" FROM legacy_"+table.name); err != nil {
-				return fmt.Errorf("store: copy legacy %s: %w", table.name, err)
-			}
-		}
-		// Drop children before their parents while foreign-key checks remain on.
-		for i := len(roomTables) - 1; i >= 0; i-- {
-			table := roomTables[i]
-			if table.name == "bans" && !hasBans {
-				continue
-			}
-			if _, err := tx.ExecContext(ctx, "DROP TABLE legacy_"+table.name); err != nil {
+	if version < 4 {
+		legacy := version > 0
+		var hasBans bool
+		if legacy {
+			if err := tx.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='bans')").Scan(&hasBans); err != nil {
 				return err
 			}
+			for _, table := range roomTables {
+				if table.name == "bans" && !hasBans && version < 3 {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, "ALTER TABLE "+table.name+" RENAME TO legacy_"+table.name); err != nil {
+					return fmt.Errorf("store: migrate %s: %w", table.name, err)
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, roomSchema); err != nil {
+			return fmt.Errorf("store: create room schema: %w", err)
+		}
+		if legacy {
+			var count int
+			if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM legacy_room_genesis").Scan(&count); err != nil {
+				return err
+			}
+			if count > 1 {
+				return fmt.Errorf("store: legacy database contains multiple genesis rows")
+			}
+			for _, table := range roomTables {
+				if table.name == "bans" && !hasBans {
+					continue
+				}
+				roomID := "(SELECT room_key FROM legacy_room_genesis WHERE singleton_id=1)"
+				if _, err := tx.ExecContext(ctx, "INSERT INTO "+table.name+"(room_id,"+table.columns+") SELECT "+roomID+","+table.columns+" FROM legacy_"+table.name); err != nil {
+					return fmt.Errorf("store: copy legacy %s: %w", table.name, err)
+				}
+			}
+			// Drop children before their parents while foreign-key checks remain on.
+			for i := len(roomTables) - 1; i >= 0; i-- {
+				table := roomTables[i]
+				if table.name == "bans" && !hasBans {
+					continue
+				}
+				if _, err := tx.ExecContext(ctx, "DROP TABLE legacy_"+table.name); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)", 4, time.Now().Unix()); err != nil {
+			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)", schemaVersion, time.Now().Unix()); err != nil {
-		return err
+	if version < 5 {
+		if _, err := tx.ExecContext(ctx, inboxSchema); err != nil {
+			return fmt.Errorf("store: create inbox schema: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version,applied_at) VALUES (?,?)", 5, time.Now().Unix()); err != nil {
+			return err
+		}
 	}
+
 	return tx.Commit()
 }
