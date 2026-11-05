@@ -21,13 +21,14 @@ func newRelayCmd() *cobra.Command {
   dm,err:=dmFlags.config();if err!=nil{return err}
   state,err:=roomstate.OpenNode(cmd.Context(),stateDir);if err!=nil{return err}
   defer state.Close()
+	 payer,err:=dmFlags.startPayments(cmd.Context(),dm);if err!=nil{return err};if payer!=nil{defer payer.Close()}
   advertised:=""
   if !localOnly{advertised,err=resolveAdvertise(cmd.Context(),advertise,listen);if err!=nil{return fmt.Errorf("TON QUIC advertise address: %w",err)}}
   runtime,err:=node.New(node.Config{Key:state.NodePrivate,Listen:listen,Advertise:advertised,ConfigURL:cfgURL,Socket:state.Paths.Socket,MaxLeaves:maxLeaves,Store:state.Store,DM:dm,LocalOnly:localOnly})
   if err!=nil{return err}
   defer runtime.Close()
   printServeBanner(cmd.OutOrStdout(),runtime.ADNLID(),state,listen,advertised)
-  fmt.Fprintln(cmd.OutOrStdout(),"free DM relay enabled")
+  fmt.Fprintln(cmd.OutOrStdout(),"DM relay enabled")
   ctx,stop:=signal.NotifyContext(cmd.Context(),syscall.SIGINT,syscall.SIGTERM);defer stop()
   if err:=runtime.Run(ctx);err!=nil&&err!=context.Canceled{return err}
   return nil

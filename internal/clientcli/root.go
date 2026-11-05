@@ -22,6 +22,7 @@ import (
 var Version = "dev"
 
 type options struct {
+	tpnConfig     string
 	stateDir      string
 	configURL     string
 	directAddress string
@@ -56,6 +57,7 @@ func newRoot() *cobra.Command {
 		},
 	}
 	root.PersistentFlags().StringVar(&opts.stateDir, "state", "", "client state directory")
+	root.PersistentFlags().StringVar(&opts.tpnConfig, "tpn-config", "", "existing TPN operator config; explicitly enable paid DM offers")
 	root.PersistentFlags().StringVar(&opts.configURL, "config", "https://ton-blockchain.github.io/global.config.json", "TON global config URL")
 	root.PersistentFlags().StringVar(&opts.directAddress, "direct", "", "direct TON QUIC address for local testing")
 	root.PersistentFlags().StringVar(&opts.directKey, "direct-key", "", "direct node Ed25519 public key")
@@ -81,6 +83,7 @@ func open(cmd *cobra.Command, opts *options) (*client.Client, context.Context, c
 		}
 	}
 	c, err := client.Open(ctx, client.Config{
+		TPNConfig: opts.tpnConfig,
 		StateDir: opts.stateDir, ConfigURL: opts.configURL,
 		DirectAddress: opts.directAddress, DirectPublic: directPublic,
 	})

@@ -30,6 +30,7 @@ func newServeCmd() *cobra.Command {
 		Short: "Serve saved sequencer and replica rooms under one node identity",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if !dmEnabled&&(dmFlags.tpnConfig!=""||len(dmFlags.paidOffers)!=0){return fmt.Errorf("--tpn-config and --dm-paid-offer require --dm")}
 			var dm *node.DMConfig
 			var err error
 			if dmEnabled{dm,err=dmFlags.config();if err!=nil{return err}}
@@ -46,6 +47,7 @@ func newServeCmd() *cobra.Command {
 				return err
 			}
 			defer state.Close()
+			if dmEnabled{payer,err:=dmFlags.startPayments(cmd.Context(),dm);if err!=nil{return err};if payer!=nil{defer payer.Close()}}
 			advertised := ""
 			if !localOnly {
 				var advertiseErr error
@@ -69,7 +71,7 @@ func newServeCmd() *cobra.Command {
 			}
 			defer runtime.Close()
 			printServeBanner(cmd.OutOrStdout(), runtime.ADNLID(), state, listen, advertised)
-			if dmEnabled{fmt.Fprintln(cmd.OutOrStdout(),"free DM relay enabled")}
+			if dmEnabled{fmt.Fprintln(cmd.OutOrStdout(),"DM relay enabled")}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 			if err := runtime.Run(ctx); err != nil && err != context.Canceled {

@@ -19,6 +19,7 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
+	"github.com/TONresistor/tonnet-messenger/internal/payments"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
@@ -40,6 +41,7 @@ var (
 )
 
 type Config struct {
+	TPNConfig     string
 	StateDir      string
 	ConfigURL     string
 	DirectAddress string
@@ -78,6 +80,7 @@ type Client struct {
 	relays        *relayPool
 	dmRuntime     *dmRuntime
 	store         *clientStore
+	tpn           *payments.Runtime
 	lock          *stateLock
 
 	mu            sync.RWMutex
@@ -209,6 +212,10 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 	}
 	c.relays = newRelayPool(clientCtx, connector)
+	if cfg.TPNConfig != "" {
+		c.tpn, err = payments.OpenRuntime(clientCtx, cfg.TPNConfig, true)
+		if err != nil { c.Close(); return nil, err }
+	}
 	return c, nil
 }
 
@@ -273,6 +280,7 @@ func (c *Client) Close() error {
 	close(c.events)
 	c.submissionMu.Lock()
 	defer c.submissionMu.Unlock()
+	if c.tpn != nil { c.tpn.Close() }
 	err := c.store.Close()
 	releaseStateLock(c.lock)
 	return err

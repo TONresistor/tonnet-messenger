@@ -140,6 +140,10 @@ func (r *Relay) heldOpen(ctx context.Context, meta *db.ConditionalMeta) bool {
 }
 
 func (r *Relay) resolvePending(ctx context.Context, record store.PaymentRecord) error {
+	return r.resolveHeld(ctx, record, true)
+}
+
+func (r *Relay) resolveHeld(ctx context.Context, record store.PaymentRecord, recovery bool) error {
 	if record.Pending == nil { return nil }
 	meta, err := r.backend.GetVirtualChannelMeta(ctx, record.ChannelKey)
 	if err != nil || meta == nil || !bytes.Equal(meta.Key, record.ChannelKey) { return nil } // Unreadable is never evidence to clear.
@@ -150,7 +154,7 @@ func (r *Relay) resolvePending(ctx context.Context, record store.PaymentRecord) 
 	if held.Amount.Cmp(record.Pending) < 0 { return nil }
 	// Pending was validated before the SDK call. Do not reapply current offer,
 	// capacity or opening checks here, especially after an off-chain close.
-	if meta.Status != db.ConditionalStateClosed && !r.heldOpen(ctx, meta) { return nil }
+	if !(recovery && meta.Status == db.ConditionalStateClosed) && !r.heldOpen(ctx, meta) { return nil }
 	return r.store.CreditPayment(ctx, record.ChannelKey, held.Amount)
 }
 
@@ -205,7 +209,7 @@ func (r *Relay) Pay(ctx context.Context, client ed25519.PublicKey, request commu
 	// Even an error may follow a successful write. Only the subsequent SDK reads
 	// decide whether to credit, clear, or retain the pending record.
 	_ = r.backend.AddConditionalResolve(ctx, request.ChannelKey, c)
-	if err := r.resolvePending(ctx, record); err != nil { return denied(community.RejectRelayFullOrQuotaExceeded, "cannot persist payment credit") }
+	if err := r.resolveHeld(ctx, record, false); err != nil { return denied(community.RejectRelayFullOrQuotaExceeded, "cannot persist payment credit") }
 	updated, err := r.store.Payment(ctx, request.ChannelKey)
 	if err != nil { return denied(community.RejectRelayFullOrQuotaExceeded, "payment storage unavailable") }
 	if updated.Credited.Cmp(state.Amount) < 0 { return denied(community.RejectInsufficientPrepaidBalance, "payment collectibility is unproven") }
