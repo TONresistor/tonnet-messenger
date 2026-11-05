@@ -153,6 +153,22 @@ func (p *Peer) sendMessage(ctx context.Context, message any, outbound bool) erro
 	return p.raw.SendMessage(ctx, payload)
 }
 
+// SendMessageOn sends on exactly the authenticated physical connection supplied
+// by the transport handler, with the same application bound as Peer messages.
+func SendMessageOn(ctx context.Context, conn *quic.Client, message any) error {
+	if conn == nil {
+		return quic.ErrPeerClosed
+	}
+	payload, err := tl.Serialize(message, true)
+	if err != nil {
+		return err
+	}
+	if len(payload) > MaxWireObjectSize {
+		return fmt.Errorf("room transport: message exceeds %d bytes", MaxWireObjectSize)
+	}
+	return conn.SendMessage(ctx, payload)
+}
+
 func (p *Peer) GetRandomPeers(ctx context.Context, overlayID []byte) ([]overlay.Node, error) {
 	var result overlay.NodesList
 	if err := p.QueryOverlay(ctx, overlayID, overlay.GetRandomPeers{}, &result); err != nil {

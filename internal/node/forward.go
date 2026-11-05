@@ -7,8 +7,10 @@ import (
 	"log"
 	"time"
 
+	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
+	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
@@ -22,6 +24,9 @@ type outboundJob struct {
 	room  *roomContext
 	node  bool
 	items []tl.Serializable
+
+	physical     *quic.Client
+	subscription *inboxSubscription
 }
 
 func (n *Node) wirePeer(p *peer) {
@@ -49,6 +54,10 @@ func (n *Node) outboundWriter(p *peer) {
 		case <-p.stop:
 			return
 		case job := <-p.out:
+			if job.physical != nil {
+				n.writeInboxPush(job)
+				continue
+			}
 			for _, item := range job.items {
 				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
 				var err error
@@ -69,6 +78,44 @@ func (n *Node) outboundWriter(p *peer) {
 				}
 			}
 		}
+	}
+}
+
+func (n *Node) writeInboxPush(job outboundJob) {
+	if !n.inbox.subscribed(job.physical, job.subscription) {
+		return
+	}
+	deadline := time.Now().Add(relayTimeout)
+	if expiry := time.Unix(job.subscription.expireAt, 0); expiry.Before(deadline) {
+		deadline = expiry
+	}
+	ctx, cancel := context.WithDeadline(job.physical.Context(), deadline)
+	defer cancel()
+	for _, item := range job.items {
+		if err := roomnet.SendMessageOn(ctx, job.physical, item); err != nil {
+			log.Printf("inbox push failed: %v", err)
+			return
+		}
+	}
+}
+
+func (n *Node) enqueueInbox(p *peer, conn *quic.Client, sub *inboxSubscription, push community.InboxPushV1) bool {
+	select {
+	case <-p.stop:
+		return false
+	case <-conn.Context().Done():
+		return false
+	default:
+	}
+	select {
+	case p.out <- outboundJob{physical: conn, subscription: sub, items: []tl.Serializable{push}}:
+		return true
+	default:
+		n.stats.slowPeerDisconnects.Add(1)
+		// This handle cannot select a newer incoming replacement or an outbound
+		// path, unlike closing the managed Peer. The committed deposit survives.
+		conn.Close()
+		return false
 	}
 }
 
