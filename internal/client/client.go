@@ -77,6 +77,7 @@ type Client struct {
 	keyPath       string
 	key           ed25519.PrivateKey
 	connector     *replica.Connector
+	relays        *relayPool
 	store         *clientStore
 	lock          *stateLock
 
@@ -208,6 +209,7 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 		keyPath: keyPath, key: key, connector: connector, store: store, lock: lock, rooms: map[string]*roomHandle{},
 		name: name, domain: domain, profiles: map[string]string{}, events: make(chan Notification, 256), identityEpoch: 1,
 	}
+	c.relays = newRelayPool(clientCtx, connector)
 	return c, nil
 }
 
@@ -245,7 +247,11 @@ func (c *Client) Close() error {
 	}
 	c.rooms = map[string]*roomHandle{}
 	connector := c.connector
+	relays := c.relays
 	c.mu.Unlock()
+	if relays != nil {
+		relays.Close()
+	}
 	if connector != nil {
 		connector.Close()
 	}
@@ -411,7 +417,9 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 		return Identity{}, err
 	}
 	previousConnector := c.connector
+	previousRelays := c.relays
 	c.connector = nextConnector
+	c.relays = newRelayPool(c.ctx, nextConnector)
 	installed = true
 	c.key = key
 	c.domain = ""
@@ -419,6 +427,9 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	c.receivedDMs = directReplayCache{}
 	identity := Identity{Key: keyText(key.Public().(ed25519.PublicKey)), Name: c.name}
 	c.mu.Unlock()
+	if previousRelays != nil {
+		previousRelays.Close()
+	}
 	if previousConnector != nil {
 		previousConnector.Close()
 	}

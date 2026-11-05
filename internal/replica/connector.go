@@ -19,6 +19,9 @@ import (
 
 const maxConnectorPeers = 256
 
+// ErrConnectorFull is local capacity pressure, not remote unreliability.
+var ErrConnectorFull = errors.New("room connector is full")
+
 // Connector owns client-only connections under one immutable local identity.
 // Each entry dials once; reconnect creates a new entry/Gateway and capability
 // probe. Its Gateway is never exposed, served or redialed after selection.
@@ -47,6 +50,7 @@ type connectorEntry struct {
 }
 type connectionSubscription struct {
 	room    string
+	inbox   bool
 	handler func(any) error
 }
 type connectionLease struct {
@@ -111,7 +115,7 @@ func (c *Connector) acquire(ctx context.Context, key ed25519.PrivateKey, candida
 		if e == nil {
 			if len(c.entries) >= maxConnectorPeers {
 				c.mu.Unlock()
-				return nil, errors.New("room connector is full")
+				return nil, ErrConnectorFull
 			}
 			openCtx, cancel := context.WithTimeout(c.ctx, 10*time.Second)
 			e = &connectorEntry{owner: c, target: target{address: candidate.address, public: bytes.Clone(candidate.public)}, ctx: openCtx, cancel: cancel, ready: make(chan struct{}), gone: make(chan struct{}), leases: make(map[*connectionLease]connectionSubscription)}
@@ -271,38 +275,61 @@ func (l *connectionLease) subscribe(room []byte, handler func(any) error) {
 }
 
 func (e *connectorEntry) dispatch(message any) {
-	wrapper, ok := broadcast.AsBroadcast(message)
-	if !ok {
-		return
-	}
-	source, err := wrapper.SourceKey()
-	if err != nil {
-		return
-	}
-	room := source
-	if event, err := community.DecodeCommittedEvent(wrapper.Data); err == nil {
-		if !bytes.Equal(event.Proposal.RoomID, source) {
+	inbox := false
+	switch value := message.(type) {
+	case community.InboxPushV1:
+		inbox = true
+	case *community.InboxPushV1:
+		if value == nil {
 			return
 		}
-	} else if direct, err := community.DecodeDirectMessage(wrapper.Data); err == nil {
-		if !bytes.Equal(source, direct.FromKey) {
+		message = *value
+		inbox = true
+	}
+	var room []byte
+	if !inbox {
+		wrapper, ok := broadcast.AsBroadcast(message)
+		if !ok {
 			return
 		}
-		room = direct.RoomID
+		source, err := wrapper.SourceKey()
+		if err != nil {
+			return
+		}
+		room = source
+		if event, err := community.DecodeCommittedEvent(wrapper.Data); err == nil {
+			if !bytes.Equal(event.Proposal.RoomID, source) {
+				return
+			}
+		} else if direct, err := community.DecodeDirectMessage(wrapper.Data); err == nil {
+			if !bytes.Equal(source, direct.FromKey) {
+				return
+			}
+			room = direct.RoomID
+		}
 	}
 	c := e.owner
 	c.mu.Lock()
-	var callbacks []connectionSubscription
+	type callback struct {
+		lease        *connectionLease
+		subscription connectionSubscription
+	}
+	var callbacks []callback
 	if !e.dead {
-		for _, subscription := range e.leases {
-			if subscription.handler != nil && subscription.room == string(room) {
-				callbacks = append(callbacks, subscription)
+		for lease, subscription := range e.leases {
+			if subscription.handler != nil && subscription.inbox == inbox && (inbox || subscription.room == string(room)) {
+				callbacks = append(callbacks, callback{lease, subscription})
 			}
 		}
 	}
 	c.mu.Unlock()
-	for _, subscription := range callbacks {
-		_ = subscription.handler(message)
+	for _, target := range callbacks {
+		select {
+		case <-target.lease.done:
+			continue
+		default:
+		}
+		_ = target.subscription.handler(message)
 	}
 }
 

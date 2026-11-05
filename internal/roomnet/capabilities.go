@@ -37,7 +37,7 @@ func (p *Peer) probeCapabilities(ctx context.Context, outbound bool) (community.
 			if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
 				return community.Capabilities{}, context.DeadlineExceeded
 			}
-			if attempt == 0 && ctx.Err() == nil && isRemoteStreamReset(err) {
+			if attempt == 0 && ctx.Err() == nil && IsRemoteStreamReset(err) {
 				continue
 			}
 			return community.Capabilities{}, err
@@ -57,10 +57,10 @@ func (p *Peer) probeCapabilities(ctx context.Context, outbound bool) (community.
 	}
 }
 
-// The pinned transport wraps quic-go-ton's exported StreamError. Inspect its
-// type and Remote field without promoting the indirect QUIC module to a direct
+// IsRemoteStreamReset inspects the pinned transport's wrapped StreamError and
+// its Remote field without promoting the indirect QUIC module to a direct
 // dependency or depending on error-message text.
-func isRemoteStreamReset(err error) bool {
+func IsRemoteStreamReset(err error) bool {
 	for err != nil {
 		value := reflect.ValueOf(err)
 		if value.Kind() == reflect.Pointer && !value.IsNil() {

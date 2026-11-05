@@ -17,12 +17,15 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
+	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 )
 
 type capabilityEndpoint struct {
+	roomKey      ed25519.PrivateKey
+	peers        chan *roomnet.Peer
 	genesis      community.Genesis
 	state        community.RoomStateV3
 	target       target
@@ -63,7 +66,7 @@ func newCapabilityEndpoint(t *testing.T) *capabilityEndpoint {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &capabilityEndpoint{genesis: genesis, state: state}
+	f := &capabilityEndpoint{genesis: genesis, state: state, roomKey: room, peers: make(chan *roomnet.Peer, 16)}
 	f.capabilities.Store(roomnet.LocalCapabilities())
 	gateway, err := roomnet.NewGateway(node)
 	if err != nil {
@@ -73,6 +76,7 @@ func newCapabilityEndpoint(t *testing.T) *capabilityEndpoint {
 	id, _ := community.OverlayID(genesis.RoomKey)
 	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
 		peer := roomnet.Wrap(raw)
+		f.peers <- peer
 		peer.SetQueryHandler(func(q *roomnet.Query) error {
 			if _, ok := q.Data.(community.GetCapabilities); ok {
 				f.record("capabilities")
@@ -84,6 +88,9 @@ func newCapabilityEndpoint(t *testing.T) *capabilityEndpoint {
 					return q.Answer(tl.Raw{1, 2, 3, 4})
 				}
 				return q.Answer(f.capabilities.Load().(community.Capabilities))
+			}
+			if _, ok := q.Data.(broadcast.GetTime); ok {
+				return q.Answer(broadcast.Time{Now: 1})
 			}
 			if selected, err := q.SelectOverlay(id); err != nil || !selected {
 				return err
