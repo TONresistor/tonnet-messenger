@@ -256,7 +256,7 @@ func TestRelayInstallsStateReceivedFromAnotherVerifiedRelay(t *testing.T) {
 	sourcePeer.state = peerHealthy
 	sourcePeer.outboundCaps.Store(&session.Capabilities)
 	destinationPeers.m[sourcePeer.id] = sourcePeer
-	destination := &Node{genesis: genesis, store: destinationStore, peers: destinationPeers}
+	destination := &Node{room: fixtureRoom(t, Config{Key: integrationKey(t), Genesis: &genesis, Store: destinationStore, NodeRole: community.NodeRoleRelay}), peers: destinationPeers}
 	if err := destination.persistReplicaEvent(sourcePeer, committed.Event); err != nil {
 		t.Fatal(err)
 	}
@@ -345,7 +345,7 @@ func TestRelayReconcilesMissedTailWithoutAnotherBroadcast(t *testing.T) {
 	sequencerPeer.state = peerHealthy
 	sequencerPeer.outboundCaps.Store(&session.Capabilities)
 	peers.m[peerID] = sequencerPeer
-	destination := &Node{store: relayStore, peers: peers, genesis: genesis}
+	destination := &Node{room: fixtureRoom(t, Config{Key: integrationKey(t), Genesis: &genesis, Store: relayStore, NodeRole: community.NodeRoleRelay}), peers: peers}
 	if err := destination.reconcileReplicaOnce(); err != nil {
 		t.Fatal(err)
 	}
@@ -515,7 +515,7 @@ func TestRoomBansRefreshReplicaStateAndRejectAuthors(t *testing.T) {
 	source.state = peerHealthy
 	source.outboundCaps.Store(&sourceSession.Capabilities)
 	peers.m[source.id] = source
-	destination := &Node{store: destinationStore, peers: peers, genesis: genesis}
+	destination := &Node{room: fixtureRoom(t, Config{Key: integrationKey(t), Genesis: &genesis, Store: destinationStore, NodeRole: community.NodeRoleRelay}), peers: peers}
 	submit := func(session *replica.Session, author ed25519.PrivateKey, body any) any {
 		t.Helper()
 		nonce := make([]byte, 32)

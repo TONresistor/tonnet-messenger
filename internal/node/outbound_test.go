@@ -185,7 +185,7 @@ func TestNodeOutboundRejectsUnprobedAndIncompatibleTraffic(t *testing.T) {
 	p := reverseOutbound(t, ctx, n, f)
 	n.peers.markNodeGood(p.id, time.Now())
 	var genesis community.Genesis
-	if err := p.queryNodeRoom(ctx, n.genesis.RoomKey, community.GetRoomGenesis{}, &genesis); !errors.Is(err, errOutboundUnprobed) {
+	if err := p.queryNodeRoom(ctx, n.room.genesis.RoomKey, community.GetRoomGenesis{}, &genesis); !errors.Is(err, errOutboundUnprobed) {
 		t.Fatalf("unprobed query: %v", err)
 	}
 	if len(n.outboundTargets("", 0)) != 0 {
@@ -262,17 +262,17 @@ func TestNodeOutboundResetRetryAndBroadcast(t *testing.T) {
 			}
 			n.keepalivePeer(ctx, p)
 			var result community.RoomStateResult
-			if err := p.queryNodeRoom(ctx, n.genesis.RoomKey, community.GetRoomState{}, &result); err != nil || result.State.Verify() != nil {
+			if err := p.queryNodeRoom(ctx, n.room.genesis.RoomKey, community.GetRoomState{}, &result); err != nil || result.State.Verify() != nil {
 				t.Fatalf("strict state refresh: %v", err)
 			}
 			if len(n.outboundTargets("", 0)) != 1 {
 				t.Fatal("compatible broadcast target missing")
 			}
-			proposal, err := community.SignProposal(n.roomKey, n.genesis.NodeKey, community.EventProposal{RoomID: n.genesis.RoomKey, Nonce: community.Zero256(), Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: "broadcast"}})
+			proposal, err := community.SignProposal(n.room.roomKey, n.room.genesis.NodeKey, community.EventProposal{RoomID: n.room.genesis.RoomKey, Nonce: community.Zero256(), Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: "broadcast"}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			committed, err := n.store.Commit(ctx, proposal, n.roomKey, time.Now())
+			committed, err := n.room.store.Commit(ctx, proposal, n.room.roomKey, time.Now())
 			if err != nil {
 				t.Fatal(err)
 			}

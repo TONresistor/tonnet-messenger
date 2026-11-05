@@ -31,7 +31,7 @@ func TestDuplicateSurvivesDNSChange(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Node{genesis: genesis, store: database, roomKey: roomKey, domainCache: make(map[string]identityDomainCache)}
+	runtime := &Node{room: fixtureRoom(t, Config{Key: nodeKey, Genesis: &genesis, Store: database, RoomKey: roomKey})}
 	lookups := 0
 	runtime.resolveIdentity = func(context.Context, string) ([]byte, error) { lookups++; return proposal.AuthorKey, nil }
 	if _, err := runtime.commitProposal(ctx, proposal, now); err != nil {
@@ -71,7 +71,7 @@ func TestConcurrentDuplicateWinsOverDNSFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	runtime := &Node{genesis: genesis, store: database, roomKey: roomKey, domainCache: make(map[string]identityDomainCache)}
+	runtime := &Node{room: fixtureRoom(t, Config{Key: nodeKey, Genesis: &genesis, Store: database, RoomKey: roomKey})}
 	runtime.resolveIdentity = func(context.Context, string) ([]byte, error) {
 		if _, err := database.Commit(ctx, proposal, roomKey, now); err != nil {
 			return nil, err

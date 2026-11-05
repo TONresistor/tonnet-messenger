@@ -61,8 +61,8 @@ func testLocalSubmissionIdentityDomain(t *testing.T, domain string) {
 		t.Fatal(err)
 	}
 	runtime := &Node{
-		genesis: genesis, store: database, roomKey: roomKey, peers: newPeerTable(DefaultMaxLeaves),
-		domainCache: make(map[string]identityDomainCache),
+		room:  fixtureRoom(t, Config{Key: nodeKey, Genesis: &genesis, Store: database, RoomKey: roomKey}),
+		peers: newPeerTable(DefaultMaxLeaves),
 		resolveIdentity: func(context.Context, string) ([]byte, error) {
 			return integrationKey(t).Public().(ed25519.PublicKey), nil
 		},

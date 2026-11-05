@@ -159,7 +159,7 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
 	var result tonoverlay.NodesList
-	err := p.queryNodeRoom(gctx, n.genesis.RoomKey, tonoverlay.GetRandomPeers{}, &result)
+	err := p.queryNodeRoom(gctx, n.room.genesis.RoomKey, tonoverlay.GetRandomPeers{}, &result)
 	if err != nil {
 		if !errors.Is(err, errOutboundUnprobed) {
 			n.peerFailure(p, time.Now(), "peer probe failed")
@@ -171,7 +171,7 @@ func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool)
 }
 
 func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
-	if !bytes.Equal(nd.Overlay, n.cfg.OverlayID) {
+	if !bytes.Equal(nd.Overlay, n.room.overlayID) {
 		return nil, nil, fmt.Errorf("node advertises a different overlay")
 	}
 	if err := nd.CheckSignature(); err != nil {
@@ -213,7 +213,7 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		n.stats.queryRateDrops.Add(1)
 		return nil
 	}
-	selected, err := q.SelectOverlay(n.cfg.OverlayID)
+	selected, err := q.SelectOverlay(n.room.overlayID)
 	if err != nil || !selected {
 		return err
 	}
@@ -278,7 +278,7 @@ func (n *Node) myNodesList() tonoverlay.NodesList {
 func (n *Node) selfOverlayNode() (tonoverlay.Node, error) {
 	nd := tonoverlay.Node{
 		ID:      keys.PublicKeyED25519{Key: n.cfg.Key.Public().(ed25519.PublicKey)},
-		Overlay: n.cfg.OverlayID,
+		Overlay: n.room.overlayID,
 		Version: int32(time.Now().Unix()),
 	}
 	if err := nd.Sign(n.cfg.Key); err != nil {

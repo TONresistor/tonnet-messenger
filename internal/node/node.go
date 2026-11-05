@@ -23,7 +23,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/control"
 	"github.com/TONresistor/tonnet-messenger/internal/dht"
-	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
@@ -74,31 +73,19 @@ type Node struct {
 	quicPacket      net.PacketConn
 	quicErr         chan error
 	peers           *peerTable
-	dedup           *ov.Dedup
 	penalties       *penaltyBox
 	sources         *sourceLimits
 	queries         *tokenBucket
 	messages        *tokenBucket
 	stats           stats
-	pub             atomic.Pointer[dht.Publisher]
 	dialSem         chan struct{}
 	myID            string
 	started         time.Time
-	genesis         community.Genesis
-	store           *store.Store
-	roomKey         ed25519.PrivateKey
-	nodeRole        int32
+	room            *roomContext
+	database        *store.Store
 	nodeDialsMu     sync.Mutex
 	nodeDials       map[string]*nodeDialLock
-	replicaMu       sync.Mutex
-	domainMu        sync.Mutex
-	domainCache     map[string]identityDomainCache
 	resolveIdentity IdentityResolver
-}
-
-type identityDomainCache struct {
-	key     []byte
-	expires time.Time
 }
 
 type readyPacketConn struct {
@@ -126,42 +113,16 @@ func (c *readyPacketConn) ReadBatch(messages []ipv4.Message, flags int) (int, er
 }
 
 func New(cfg Config) (*Node, error) {
-	if cfg.Genesis == nil || cfg.Store == nil {
-		return nil, fmt.Errorf("persistent room genesis and store are required")
-	}
-	if err := cfg.Genesis.Verify(time.Now()); err != nil {
-		return nil, fmt.Errorf("invalid room genesis: %w", err)
-	}
-	overlayID, err := community.OverlayID(cfg.Genesis.RoomKey)
+	room, err := newRoomContext(context.Background(), cfg)
 	if err != nil {
 		return nil, err
 	}
-	cfg.OverlayID = overlayID
-	if cfg.NodeRole == 0 {
-		cfg.NodeRole = community.NodeRoleSequencer
-	}
-	if cfg.NodeRole != community.NodeRoleSequencer && cfg.NodeRole != community.NodeRoleRelay {
-		return nil, fmt.Errorf("invalid node role %d", cfg.NodeRole)
-	}
-	if cfg.NodeRole == community.NodeRoleSequencer {
-		if cfg.Socket == "" {
-			return nil, fmt.Errorf("sequencer requires a control socket")
-		}
-		if len(cfg.RoomKey) != ed25519.PrivateKeySize || !bytes.Equal(cfg.RoomKey.Public().(ed25519.PublicKey), cfg.Genesis.RoomKey) {
-			return nil, fmt.Errorf("sequencer room key does not match genesis")
-		}
-		if !bytes.Equal(cfg.Key.Public().(ed25519.PublicKey), cfg.Genesis.NodeKey) {
-			return nil, fmt.Errorf("sequencer node key does not match genesis")
-		}
-		if err := cfg.Store.ValidateGenesis(context.Background(), *cfg.Genesis); err != nil {
-			return nil, err
-		}
-		if err := cfg.Store.UpgradeRoomState(context.Background(), cfg.RoomKey); err != nil {
-			return nil, fmt.Errorf("sequencer signed state upgrade: %w", err)
-		}
-	} else if len(cfg.RoomKey) != 0 {
-		return nil, fmt.Errorf("relay must not receive room authority key")
-	}
+	// Config remains the single-room public input. The running node keeps its
+	// transport configuration separately from the context's owned authority.
+	database := cfg.Store
+	cfg.Key = bytes.Clone(cfg.Key)
+	cfg.Genesis, cfg.Store, cfg.RoomKey, cfg.OverlayID = nil, nil, nil, nil
+	cfg.NodeRole = 0
 	if cfg.MaxLeaves == 0 {
 		cfg.MaxLeaves = DefaultMaxLeaves
 	}
@@ -178,24 +139,20 @@ func New(cfg Config) (*Node, error) {
 		return nil, fmt.Errorf("create TON QUIC gateway: %w", err)
 	}
 	n := &Node{
-		cfg:         cfg,
-		gw:          gw,
-		qgw:         qgw,
-		quicErr:     make(chan error, 1),
-		peers:       newPeerTable(cfg.MaxLeaves),
-		dedup:       ov.NewDedup(deliveredCap),
-		penalties:   newPenaltyBox(),
-		sources:     newSourceLimits(),
-		queries:     newTokenBucket(globalQueryBurst, globalQueryRefill),
-		messages:    newTokenBucket(globalMessageBurst, globalMessageRefill),
-		domainCache: make(map[string]identityDomainCache),
-		dialSem:     make(chan struct{}, maxConcurrentDials),
-		myID:        hex.EncodeToString(qgw.ID()),
-		started:     time.Now(),
-		genesis:     *cfg.Genesis,
-		store:       cfg.Store,
-		roomKey:     cfg.RoomKey,
-		nodeRole:    cfg.NodeRole,
+		cfg:       cfg,
+		gw:        gw,
+		qgw:       qgw,
+		quicErr:   make(chan error, 1),
+		peers:     newPeerTable(cfg.MaxLeaves),
+		penalties: newPenaltyBox(),
+		sources:   newSourceLimits(),
+		queries:   newTokenBucket(globalQueryBurst, globalQueryRefill),
+		messages:  newTokenBucket(globalMessageBurst, globalMessageRefill),
+		dialSem:   make(chan struct{}, maxConcurrentDials),
+		myID:      hex.EncodeToString(qgw.ID()),
+		started:   time.Now(),
+		room:      room,
+		database:  database,
 	}
 	if cfg.ResolveIdentity != nil {
 		n.resolveIdentity = cfg.ResolveIdentity
@@ -260,20 +217,20 @@ func (n *Node) verifyIdentityDomain(ctx context.Context, domain string, key []by
 	if domain == "" {
 		return nil
 	}
-	n.domainMu.Lock()
-	if cached, ok := n.domainCache[domain]; ok && now.Before(cached.expires) && bytes.Equal(cached.key, key) {
-		n.domainMu.Unlock()
+	n.room.domainMu.Lock()
+	if cached, ok := n.room.domainCache[domain]; ok && now.Before(cached.expires) && bytes.Equal(cached.key, key) {
+		n.room.domainMu.Unlock()
 		return nil
 	}
-	n.domainMu.Unlock()
+	n.room.domainMu.Unlock()
 
 	resolved, err := n.resolveIdentity(ctx, domain)
 	if err != nil || !bytes.Equal(resolved, key) {
 		return fmt.Errorf("identity domain does not resolve to author")
 	}
-	n.domainMu.Lock()
-	n.domainCache[domain] = identityDomainCache{key: append([]byte(nil), key...), expires: now.Add(5 * time.Minute)}
-	n.domainMu.Unlock()
+	n.room.domainMu.Lock()
+	n.room.domainCache[domain] = identityDomainCache{key: append([]byte(nil), key...), expires: now.Add(5 * time.Minute)}
+	n.room.domainMu.Unlock()
 	return nil
 }
 
@@ -297,7 +254,7 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 	return nil
 }
 
-func (n *Node) publisher() *dht.Publisher { return n.pub.Load() }
+func (n *Node) publisher() *dht.Publisher { return n.room.pub.Load() }
 
 func (n *Node) acquireDial() bool {
 	select {
@@ -328,18 +285,18 @@ func (n *Node) countsString() string {
 
 func (n *Node) Status() control.Status {
 	members, nodes := n.peers.counts()
-	roomName := n.genesis.Name
-	roomID, _ := community.RoomKeyText(n.genesis.RoomKey)
+	roomName := n.room.genesis.Name
+	roomID, _ := community.RoomKeyText(n.room.genesis.RoomKey)
 	var seqno int64
 	ready := true
-	if state, err := n.store.State(context.Background()); err == nil {
+	if state, err := n.room.store.State(context.Background()); err == nil {
 		roomName = state.Name
 	}
-	if head, err := n.store.Head(context.Background()); err == nil {
+	if head, err := n.room.store.Head(context.Background()); err == nil {
 		seqno = head.Seqno
 	}
-	if n.nodeRole == community.NodeRoleRelay {
-		ready = n.store.ReplicaReady(context.Background()) == nil
+	if n.room.role == community.NodeRoleRelay {
+		ready = n.room.store.ReplicaReady(context.Background()) == nil
 	}
 	return control.Status{
 		ADNLID:    base64.StdEncoding.EncodeToString(n.qgw.ID()),
@@ -366,11 +323,11 @@ func (n *Node) Status() control.Status {
 		Rooms: []control.RoomStatus{{
 			RoomID:     roomID,
 			Name:       roomName,
-			OverlayID:  base64.StdEncoding.EncodeToString(n.cfg.OverlayID),
+			OverlayID:  base64.StdEncoding.EncodeToString(n.room.overlayID),
 			Members:    members,
 			Neighbours: nodes,
 			Seqno:      seqno,
-			NodeRole:   n.nodeRole,
+			NodeRole:   n.room.role,
 			Ready:      ready,
 		}},
 	}
@@ -380,7 +337,7 @@ func (n *Node) Run(ctx context.Context) error {
 	if !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
-	if n.nodeRole == community.NodeRoleSequencer {
+	if n.room.role == community.NodeRoleSequencer {
 		ready := make(chan struct{})
 		serveErr := make(chan error, 1)
 		go func() {
@@ -417,17 +374,17 @@ func (n *Node) Run(ctx context.Context) error {
 		}
 	}
 
-	pub, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, n.overlayKey(), n.cfg.OverlayID)
+	pub, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, n.overlayKey(), n.room.overlayID)
 	if err != nil {
 		return fmt.Errorf("dht publisher: %w", err)
 	}
-	n.pub.Store(pub)
+	n.room.pub.Store(pub)
 
 	go pub.Run(ctx)
 	go n.discoveryLoop(ctx)
 	go n.databaseMaintenanceLoop(ctx)
 	go n.peerMaintenanceLoop(ctx)
-	if n.nodeRole == community.NodeRoleRelay {
+	if n.room.role == community.NodeRoleRelay {
 		go n.replicaReconcileLoop(ctx)
 	}
 
@@ -463,8 +420,8 @@ func (n *Node) reconcileReplicaOnce() error {
 	if !ok {
 		return nil
 	}
-	n.replicaMu.Lock()
-	defer n.replicaMu.Unlock()
+	n.room.replicaMu.Lock()
+	defer n.room.replicaMu.Unlock()
 	return n.syncReplicaLocked(sequencer)
 }
 
@@ -476,7 +433,7 @@ func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := n.store.Checkpoint(ctx); err != nil {
+			if err := n.database.Checkpoint(ctx); err != nil {
 				log.Printf("database checkpoint: %v", err)
 			}
 		}
@@ -484,7 +441,7 @@ func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
 }
 
 func (n *Node) overlayKey() []byte {
-	return n.genesis.RoomKey
+	return n.room.genesis.RoomKey
 }
 
 func parseAddress(hostPort string) (address.Address, error) {
