@@ -487,73 +487,19 @@ func (n *roomRuntime) handleCommunityMessage(p *peer, data tl.Serializable, now 
 		}
 		return
 	}
-	if n.room == nil {
-		return
-	}
-	id, err := wrapper.ID()
-	if err != nil || !n.room.dedup.Reserve(id) {
-		if err == nil {
-			n.stats.duplicateDrops.Add(1)
-		}
-		return
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			n.room.dedup.Release(id)
-		}
-	}()
-	source, err := wrapper.SourceKey()
-	if err != nil {
-		n.stats.invalidDrops.Add(1)
-		return
-	}
-	if bytes.Equal(source, n.room.genesis.RoomKey) {
-		event, err := community.DecodeCommittedEvent(wrapper.Data)
-		if err != nil || event.Verify(n.room.genesis.RoomKey, n.room.genesis.NodeKey) != nil {
-			n.stats.invalidDrops.Add(1)
-			return
-		}
-		if n.room.role == community.NodeRoleSequencer {
-			return
-		}
-		if err := n.persistReplicaEvent(p, event); err != nil {
-			n.stats.invalidDrops.Add(1)
-			return
-		}
-		n.room.dedup.Commit(id)
-		committed = true
-		n.stats.accepted.Add(1)
-		for _, target := range append(n.outboundTargets(p.id, nodeFanout), n.peers.memberLeaves("")...) {
-			n.enqueue(target, wrapper)
-		}
-		return
-	}
-	direct, err := community.DecodeDirectMessage(wrapper.Data)
-	if err != nil || !bytes.Equal(source, direct.FromKey) || direct.Verify(n.room.genesis.RoomKey, now) != nil {
-		n.stats.invalidDrops.Add(1)
-		return
-	}
-	if !n.sources.allow(hex.EncodeToString(direct.FromKey), len(raw), now) {
-		n.stats.sourceRateDrops.Add(1)
-		return
-	}
-	fromNode := n.peers.isHealthyNode(p)
-	_, joined, accepted := n.peers.acceptInbound(p, now)
-	if !accepted {
-		return
-	}
-	if !fromNode && (p.conn == nil || !bytes.Equal(p.conn.GetPubKey(), direct.FromKey)) {
-		return
-	}
-	if joined {
-		n.stats.accepted.Add(1)
-	}
-	n.room.dedup.Commit(id)
-	committed = true
-	for _, target := range n.communityDirectTargets(p.id, direct) {
-		n.enqueue(target, wrapper)
-	}
+	if n.room == nil { return }
+ source,err:=wrapper.SourceKey()
+ if err!=nil||!bytes.Equal(source,n.room.genesis.RoomKey){return}
+ event,err:=community.DecodeCommittedEvent(wrapper.Data)
+ if err!=nil||event.Verify(n.room.genesis.RoomKey,n.room.genesis.NodeKey)!=nil{n.stats.invalidDrops.Add(1);return}
+ if n.room.role==community.NodeRoleSequencer{return}
+ id,err:=wrapper.ID()
+ if err!=nil||!n.room.dedup.Reserve(id){if err==nil{n.stats.duplicateDrops.Add(1)};return}
+ committed:=false
+ defer func(){if !committed{n.room.dedup.Release(id)}}()
+ if err:=n.persistReplicaEvent(p,event);err!=nil{n.stats.invalidDrops.Add(1);return}
+ n.room.dedup.Commit(id);committed=true;n.stats.accepted.Add(1)
+ for _,target:=range append(n.outboundTargets(p.id,nodeFanout),n.peers.memberLeaves("")...){n.enqueue(target,wrapper)}
 }
 
 func stateChangingBody(body any) bool {
@@ -571,19 +517,4 @@ func stateChangingBody(body any) bool {
 	default:
 		return false
 	}
-}
-
-func (n *roomRuntime) communityDirectTargets(fromID string, direct community.DirectMessage) []*peer {
-	targets := n.outboundTargets(fromID, nodeFanout)
-	targets = append(targets, n.peers.identityLeaves(direct.ToKey, fromID)...)
-	seen := make(map[string]struct{}, len(targets))
-	out := targets[:0]
-	for _, target := range targets {
-		if _, exists := seen[target.id]; exists {
-			continue
-		}
-		seen[target.id] = struct{}{}
-		out = append(out, target)
-	}
-	return out
 }

@@ -297,16 +297,8 @@ func (e *connectorEntry) dispatch(message any) {
 			return
 		}
 		room = source
-		if event, err := community.DecodeCommittedEvent(wrapper.Data); err == nil {
-			if !bytes.Equal(event.Proposal.RoomID, source) {
-				return
-			}
-		} else if direct, err := community.DecodeDirectMessage(wrapper.Data); err == nil {
-			if !bytes.Equal(source, direct.FromKey) {
-				return
-			}
-			room = direct.RoomID
-		}
+		event,err:=community.DecodeCommittedEvent(wrapper.Data)
+		if err!=nil||!bytes.Equal(event.Proposal.RoomID,source){return}
 	}
 	c := e.owner
 	c.mu.Lock()

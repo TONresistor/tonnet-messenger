@@ -530,7 +530,6 @@ func init() {
 	tl.Register(BatchItem{}, "tonnet.batchItemV2 code:int data:bytes = tonnet.BatchItem")
 	tl.Register(BatchResult{}, "tonnet.batchResultV2 items:(vector tonnet.BatchItem) = tonnet.BatchResult")
 
-	tl.Register(DirectMessage{}, "tonnet.directMessageV2 room_id:int256 from_key:int256 to_key:int256 author_name:string timestamp:long ciphertext:bytes signature:bytes = tonnet.DirectMessage")
 	tl.Register(DirectMessageToSign{}, "tonnet.directMessageV2.toSign room_id:int256 from_key:int256 to_key:int256 author_name:string timestamp:long ciphertext:bytes = tonnet.DirectMessageToSign")
 
 	tl.Register(RelayOfferV1{}, "tonnet.relayOfferV1 tier:int services:int max_object_bytes:int retention_seconds:int requests_per_minute:int inbox_quota_bytes:long price_nanoton:long unit_bytes:long = tonnet.RelayOffer")

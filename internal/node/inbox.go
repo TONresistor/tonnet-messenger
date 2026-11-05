@@ -32,6 +32,9 @@ func (c DMConfig) validate() error {
 	return nil
 }
 
+// Validate is shared by operator flags and runtime construction.
+func(c DMConfig)Validate()error{return c.validate()}
+
 type inboxConnection struct {
 	peer         *peer
 	lastActivity time.Time // Opening is the baseline until the first activity.

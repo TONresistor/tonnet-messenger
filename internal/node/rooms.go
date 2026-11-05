@@ -181,15 +181,11 @@ func (n *Node) submitLocal(ctx context.Context, raw []byte) ([]byte, error) {
 	return n.forRoom(r).submitLocal(ctx, raw)
 }
 func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Time) {
-	r := n.room
+	var r *roomContext
 	if wrapper, ok := broadcast.AsBroadcast(data); ok {
 		if key, err := wrapper.SourceKey(); err == nil {
 			if selected := n.findRoom(key); selected != nil {
 				r = selected
-			} else if direct, err := community.DecodeDirectMessage(wrapper.Data); err == nil {
-				if selected := n.findRoom(direct.RoomID); selected != nil {
-					r = selected
-				}
 			}
 		}
 	}
