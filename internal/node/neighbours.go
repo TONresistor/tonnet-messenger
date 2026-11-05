@@ -252,6 +252,9 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		return q.Answer(roomnet.LocalCapabilities())
 	}
 	now := time.Now()
+	if isInboxQuery(q.Data) {
+		return n.answerInbox(p, q, now)
+	}
 	if n.penalties.banned(p.id, now) {
 		return nil
 	}

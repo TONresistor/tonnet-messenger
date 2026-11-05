@@ -46,6 +46,7 @@ type RoomConfig struct {
 }
 
 type Config struct {
+	DM              *DMConfig
 	Rooms           []RoomConfig
 	Key             ed25519.PrivateKey
 	Listen          string
@@ -109,6 +110,7 @@ type Node struct {
 
 	resolveRoomAlias func(context.Context, string) ([]byte, error)
 	catalog          *roomCatalog
+	inbox            *inboxService
 }
 
 type readyPacketConn struct {
@@ -136,6 +138,18 @@ func (c *readyPacketConn) ReadBatch(messages []ipv4.Message, flags int) (int, er
 }
 
 func New(cfg Config) (*Node, error) {
+	if len(cfg.Key) != ed25519.PrivateKeySize || cfg.Store == nil {
+		return nil, errors.New("node identity and shared store are required")
+	}
+	if cfg.DM != nil {
+		dmConfig := *cfg.DM
+		if err := dmConfig.validate(); err != nil {
+			return nil, err
+		}
+		offer := *dmConfig.Limits.Offer
+		dmConfig.Limits.Offer = &offer
+		cfg.DM = &dmConfig
+	}
 	rooms, err := configuredRooms(context.Background(), cfg)
 	if err != nil {
 		return nil, err
@@ -174,17 +188,22 @@ func New(cfg Config) (*Node, error) {
 		dialSem:   make(chan struct{}, maxConcurrentDials),
 		myID:      hex.EncodeToString(qgw.ID()),
 		started:   time.Now(),
-		room:      rooms[0],
 		rooms:     rooms,
 		byOverlay: make(map[string]*roomContext),
 		byRoom:    make(map[string]*roomContext),
 		database:  database,
+	}
+	if len(rooms) > 0 {
+		n.room = rooms[0]
 	}
 	for _, room := range rooms {
 		n.byOverlay[string(room.overlayID)] = room
 		n.byRoom[string(room.genesis.RoomKey)] = room
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
+	if cfg.DM != nil {
+		n.inbox = newInboxService(n, *cfg.DM)
+	}
 	n.resolveRoomAlias = func(ctx context.Context, alias string) ([]byte, error) {
 		return tondns.ResolveRoom(ctx, cfg.ConfigURL, alias)
 	}
@@ -301,7 +320,12 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 	return nil
 }
 
-func (n *Node) publisher() roomPublisher { return n.forRoom(n.room).publisher() }
+func (n *Node) publisher() roomPublisher {
+	if n.room == nil {
+		return nil
+	}
+	return n.forRoom(n.room).publisher()
+}
 
 func (n *Node) acquireDial() bool {
 	select {
@@ -330,6 +354,9 @@ func (n *Node) Close() error {
 			<-done
 		}
 		quicErr := n.qgw.Close()
+		if n.inbox != nil {
+			n.inbox.close()
+		}
 		packetErr := n.quicPacket.Close()
 		if errors.Is(packetErr, net.ErrClosed) {
 			packetErr = nil
@@ -376,7 +403,7 @@ func (n *Node) Status() control.Status {
 }
 
 func (n *Node) Run(ctx context.Context) error {
-	if !n.cfg.LocalOnly && n.cfg.Advertise == "" {
+	if len(n.roomList()) > 0 && !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
 	n.runMu.Lock()
@@ -423,7 +450,7 @@ func (n *Node) Run(ctx context.Context) error {
 			}
 		})
 	}
-	if !n.cfg.LocalOnly {
+	if !n.cfg.LocalOnly && len(n.roomList()) > 0 {
 		create := n.newPublishers
 		if create == nil {
 			create = n.createPublishers
@@ -554,15 +581,31 @@ func (n *Node) backgroundContext() context.Context {
 func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
 	ticker := time.NewTicker(databaseCheckpointEach)
 	defer ticker.Stop()
+	var inboxTick <-chan time.Time
+	if n.inbox != nil {
+		sweep := time.NewTicker(time.Second)
+		defer sweep.Stop()
+		inboxTick = sweep.C
+		n.maintainInboxes(ctx, time.Now())
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case now := <-inboxTick:
+			n.maintainInboxes(ctx, now)
 		case <-ticker.C:
 			if err := n.database.Checkpoint(ctx); err != nil {
 				log.Printf("database checkpoint: %v", err)
 			}
 		}
+	}
+}
+
+func (n *Node) maintainInboxes(ctx context.Context, now time.Time) {
+	n.inbox.prune(now.Unix())
+	if _, err := n.database.ExpireInboxes(ctx, now); err != nil && ctx.Err() == nil {
+		log.Printf("inbox expiry: %v", err)
 	}
 }
 

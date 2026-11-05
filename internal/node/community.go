@@ -487,6 +487,9 @@ func (n *roomRuntime) handleCommunityMessage(p *peer, data tl.Serializable, now 
 		}
 		return
 	}
+	if n.room == nil {
+		return
+	}
 	id, err := wrapper.ID()
 	if err != nil || !n.room.dedup.Reserve(id) {
 		if err == nil {

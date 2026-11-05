@@ -36,10 +36,15 @@ func NewGateway(keys ...ed25519.PrivateKey) (*quic.Gateway, error) {
 // Query is a decoded TON QUIC query and its single response.
 type Query struct {
 	Data any
+	ctx  context.Context
 
 	response any
 	answered bool
 }
+
+// Context is the actual inbound stream context, including the transport's
+// authenticated physical-connection handle. It is not a managed Peer lifetime.
+func (q *Query) Context() context.Context { return q.ctx }
 
 func (q *Query) Answer(response any) error {
 	if q == nil {
@@ -164,7 +169,7 @@ func (p *Peer) SetQueryHandler(handler func(*Query) error) {
 		p.raw.SetQueryHandler(nil)
 		return
 	}
-	p.raw.SetQueryHandler(func(_ context.Context, payload []byte) ([]byte, error) {
+	p.raw.SetQueryHandler(func(ctx context.Context, payload []byte) ([]byte, error) {
 		if len(payload) > MaxWireObjectSize {
 			return nil, fmt.Errorf("room transport: query exceeds %d bytes", MaxWireObjectSize)
 		}
@@ -172,7 +177,7 @@ func (p *Peer) SetQueryHandler(handler func(*Query) error) {
 		if err != nil {
 			return nil, err
 		}
-		query := &Query{Data: value}
+		query := &Query{Data: value, ctx: ctx}
 		if err := handler(query); err != nil {
 			return nil, err
 		}

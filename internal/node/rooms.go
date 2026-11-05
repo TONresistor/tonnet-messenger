@@ -56,6 +56,12 @@ func (n *Node) hasSequencerRoom() bool {
 }
 
 func configuredRooms(ctx context.Context, cfg Config) ([]*roomContext, error) {
+	if len(cfg.Rooms) == 0 && cfg.Genesis == nil && cfg.DM != nil {
+		if len(cfg.RoomKey) != 0 || cfg.NodeRole != 0 || len(cfg.OverlayID) != 0 {
+			return nil, errors.New("room authority requires a selected room")
+		}
+		return nil, nil
+	}
 	if len(cfg.Rooms) == 0 {
 		r, err := newRoomContext(ctx, cfg)
 		if err != nil {
