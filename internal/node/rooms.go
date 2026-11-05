@@ -112,6 +112,9 @@ func (n *Node) cleanupRoomPeer(p *peer) {
 	for _, global := range n.globalOverlays() {
 		global.forgetPeer(p)
 	}
+	if n.holders != nil {
+		n.holders.forgetPeer(p)
+	}
 }
 func (n *Node) associateSingleRoom(p *peer) {
 	if len(n.roomList()) == 1 {

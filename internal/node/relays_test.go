@@ -22,12 +22,17 @@ func TestRelayOwnCardMatchesServiceAndRefreshes(t *testing.T) {
 	for _, combined := range []bool{false, true} {
 		f := freeInboxNode(t, 30*time.Second, combined)
 		p := inboxPeer(t, ctx, f.n, integrationKey(t))
-		f.n.queries = newTokenBucket(0, 0)
+		f.n.queries.mu.Lock()
+		f.n.queries.tokens, f.n.queries.refillPerSec = 0, 0
+		f.n.queries.mu.Unlock()
 		var caps community.Capabilities
 		if err := p.Query(ctx, community.GetCapabilities{}, &caps); err != nil || caps.Flags != community.RelayServiceDM {
 			t.Fatal("truthful/exempt capabilities", caps, err)
 		}
-		f.n.queries = newTokenBucket(globalQueryBurst, globalQueryRefill)
+		f.n.queries.mu.Lock()
+		f.n.queries.tokens, f.n.queries.refillPerSec = globalQueryBurst, globalQueryRefill
+		f.n.queries.last = time.Now()
+		f.n.queries.mu.Unlock()
 		var card community.RelayCardV1
 		if err := p.Query(ctx, community.GetRelayCardV1{}, &card); err != nil || card.Verify() != nil || !freshCard(card.Version, time.Now()) {
 			t.Fatal("own card", err)

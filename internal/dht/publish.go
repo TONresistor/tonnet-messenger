@@ -159,19 +159,43 @@ func (p *Publisher) publishAddress(ctx context.Context) bool {
 	return true
 }
 
-func (p *Publisher) publishOverlay(ctx context.Context) bool {
+// PublishOverlay borrows the shared DHT owner for one namespace publication.
+// key is the raw pub.overlay name, not its hashed overlay ID. It never writes
+// the node's address record or owns another client/transport lifetime.
+func (p *Publisher) PublishOverlay(ctx context.Context, key []byte, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id, err := tl.Hash(keys.PublicKeyOverlay{Key: key})
+	if err != nil {
+		return err
+	}
+	return p.storeOverlay(ctx, key, id, now)
+}
+
+func (p *Publisher) storeOverlay(ctx context.Context, key, id []byte, now time.Time) error {
 	node := overlay.Node{
 		ID:      keys.PublicKeyED25519{Key: p.key.Public().(ed25519.PublicKey)},
-		Overlay: p.overlayID,
-		Version: int32(time.Now().Unix()),
+		Overlay: id,
+		Version: int32(now.Unix()),
 	}
 	if err := node.Sign(p.key); err != nil {
-		log.Printf("sign overlay node: %v", err)
-		return false
+		return err
 	}
+	copies, _, err := p.d.StoreOverlayNodes(ctx, key, &overlay.NodesList{List: []overlay.Node{node}}, RecordTTL)
+	if err != nil {
+		return err
+	}
+	if copies < 1 {
+		return fmt.Errorf("stored 0 overlay copies")
+	}
+	return nil
+}
+
+func (p *Publisher) publishOverlay(ctx context.Context) bool {
 	cctx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
-	if copies, _, err := p.d.StoreOverlayNodes(cctx, p.room, &overlay.NodesList{List: []overlay.Node{node}}, RecordTTL); err != nil || copies < 1 {
+	if err := p.storeOverlay(cctx, p.room, p.overlayID, time.Now()); err != nil {
 		log.Printf("dht storeOverlayNodes: %v", err)
 		return false
 	}

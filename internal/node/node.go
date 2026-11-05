@@ -111,6 +111,7 @@ type Node struct {
 	resolveRoomAlias func(context.Context, string) ([]byte, error)
 	catalog          *roomCatalog
 	relays           *relayDirectory
+	holders          *inboxHolders
 	inbox            *inboxService
 }
 
@@ -251,6 +252,11 @@ func New(cfg Config) (*Node, error) {
 			n.Close()
 			return nil, err
 		}
+		n.holders, err = newInboxHolders(n)
+		if err != nil {
+			n.Close()
+			return nil, err
+		}
 	}
 	go func() { n.quicErr <- qgw.Serve(packet) }()
 	select {
@@ -365,6 +371,9 @@ func (n *Node) Close() error {
 		if n.inbox != nil {
 			n.inbox.close()
 		}
+		if n.holders != nil {
+			n.holders.close()
+		}
 		packetErr := n.quicPacket.Close()
 		if errors.Is(packetErr, net.ErrClosed) {
 			packetErr = nil
@@ -471,6 +480,9 @@ func (n *Node) Run(ctx context.Context) error {
 		defer func() {
 			cancel()
 			workers.Wait()
+			if n.holders != nil {
+				n.holders.setPublisher(nil)
+			}
 			if closePublishers != nil {
 				closePublishers()
 			}
@@ -499,9 +511,15 @@ func (n *Node) Run(ctx context.Context) error {
 			global.pub.Store(&roomPublication{pub})
 			start(func() { pub.Run(ctx) })
 		}
+		if n.holders != nil {
+			n.holders.setPublisher(n.relays.pub.Load())
+		}
 	}
 	for _, global := range n.globalOverlays() {
 		start(func() { global.run(ctx) })
+	}
+	if n.holders != nil {
+		start(func() { n.holders.run(ctx) })
 	}
 	start(func() { n.databaseMaintenanceLoop(ctx) })
 	start(func() { n.peerMaintenanceLoop(ctx) })
@@ -621,8 +639,15 @@ func (n *Node) databaseMaintenanceLoop(ctx context.Context) {
 
 func (n *Node) maintainInboxes(ctx context.Context, now time.Time) {
 	n.evictIdlePeers(now)
+	n.inbox.order.Lock()
+	defer n.inbox.order.Unlock()
 	if _, err := n.database.ExpireInboxes(ctx, now); err != nil && ctx.Err() == nil {
 		log.Printf("inbox expiry: %v", err)
+	}
+	if n.holders != nil {
+		if err := n.holders.restore(ctx, now); err != nil && ctx.Err() == nil {
+			log.Printf("inbox holders: %v", err)
+		}
 	}
 }
 

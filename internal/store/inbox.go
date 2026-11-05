@@ -66,6 +66,35 @@ type InboxPageResult struct {
 	Seqnos []int64
 }
 
+type LiveInbox struct {
+	InboxID  []byte
+	ExpireAt int64
+}
+
+// LiveInboxes ignores retained receipts and subscriptions. The last live
+// expiry lets routing stop at expiry even before the deletion sweep runs.
+func (s *Store) LiveInboxes(ctx context.Context, now time.Time) ([]LiveInbox, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.inbox_id,MAX(r.expire_at)
+FROM inbox_messages m JOIN inbox_receipts r ON r.dm_id=m.dm_id
+WHERE r.expire_at>? GROUP BY r.inbox_id ORDER BY r.inbox_id`, now.Unix())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []LiveInbox
+	for rows.Next() {
+		var entry LiveInbox
+		if err := rows.Scan(&entry.InboxID, &entry.ExpireAt); err != nil {
+			return nil, err
+		}
+		if len(entry.InboxID) != 32 {
+			return nil, fmt.Errorf("store: invalid live inbox id")
+		}
+		result = append(result, entry)
+	}
+	return result, rows.Err()
+}
+
 func validInboxEnvelope(m community.DirectMessageV3) bool {
 	return len(m.FromKey) == 32 && len(m.ToKey) == 32 && len(m.Ciphertext) >= 28 && len(m.Ciphertext) <= community.MaxDMCiphertextBytes &&
 		community.ValidateAuthorProfile(m.AuthorName, m.AuthorDomain) == nil

@@ -66,6 +66,41 @@ func inboxReject(t *testing.T, result InboxDepositResult, err error, code int32)
 	}
 }
 
+func TestLiveInboxesIgnoreTombstonesAndRestoreExpiry(t *testing.T) {
+	f := newInboxFixture(t)
+	first := f.deposit(t, f.message(t, 1, f.now, 30), f.now)
+	f.deposit(t, f.message(t, 2, f.now, 60), f.now)
+	live, err := f.store.LiveInboxes(f.ctx, f.now)
+	if err != nil || len(live) != 1 || !bytes.Equal(live[0].InboxID, first.Receipt.InboxID) || live[0].ExpireAt != f.now.Unix()+60 {
+		t.Fatal("live inbox/max expiry", live, err)
+	}
+	if _, err := f.store.AckInbox(f.ctx, first.Receipt.InboxID, [][]byte{first.Receipt.DMID}); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	f.store, err = Open(f.ctx, f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	live, err = f.store.LiveInboxes(f.ctx, f.now.Add(59*time.Second))
+	if err != nil || len(live) != 1 {
+		t.Fatal("live inbox not restored", err)
+	}
+	live, err = f.store.LiveInboxes(f.ctx, f.now.Add(60*time.Second))
+	if err != nil || len(live) != 0 {
+		t.Fatal("expired envelope counted before deletion", err)
+	}
+	if _, err := f.store.ExpireInboxes(f.ctx, f.now.Add(60*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	live, err = f.store.LiveInboxes(f.ctx, f.now)
+	if err != nil || len(live) != 0 {
+		t.Fatal("retained receipts invented holders", err)
+	}
+}
+
 func TestInboxAdmissionOrderAndTimeBoundaries(t *testing.T) {
 	for _, mode := range []string{"malformed", "signature", "peer", "tier", "no offer", "size before time", "boxed size", "exact size", "past 300", "past 301", "future 300", "future 301", "retention", "expired", "empty retention"} {
 		t.Run(mode, func(t *testing.T) {

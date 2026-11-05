@@ -87,15 +87,50 @@ type fakeDHT struct {
 	storeAddr    int
 	findCalls    int
 	storeOver    int
+	overlayKey   []byte
+	overlayNodes *overlay.NodesList
 }
 
 func (f *fakeDHT) StoreAddress(context.Context, address.List, time.Duration, ed25519.PrivateKey) (int, []byte, error) {
 	f.storeAddr++
 	return f.storeAddrN, nil, f.storeAddrErr
 }
-func (f *fakeDHT) StoreOverlayNodes(context.Context, []byte, *overlay.NodesList, time.Duration) (int, []byte, error) {
+func (f *fakeDHT) StoreOverlayNodes(_ context.Context, key []byte, nodes *overlay.NodesList, _ time.Duration) (int, []byte, error) {
 	f.storeOver++
+	f.overlayKey = bytes.Clone(key)
+	f.overlayNodes = nodes
 	return f.storeOverN, nil, f.storeOverErr
+}
+
+func TestSingleInboxPublicationBorrowsOwnerAndSkipsAddress(t *testing.T) {
+	d := &fakeDHT{storeOverN: 1}
+	owner := testPublisher(t, d)
+	key, err := ov.InboxKey(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := ov.InboxID(make([]byte, 32))
+	now := time.Now().Truncate(time.Second)
+	borrower := owner.ForRoom([]byte(ov.Relays), id)
+	if err := borrower.PublishOverlay(context.Background(), key, now); err != nil {
+		t.Fatal(err)
+	}
+	if d.storeAddr != 0 || d.findCalls != 0 || d.storeOver != 1 || !bytes.Equal(d.overlayKey, key) || len(d.overlayNodes.List) != 1 {
+		t.Fatal("publication used another value format/address write")
+	}
+	nd := d.overlayNodes.List[0]
+	if nd.CheckSignature() != nil || nd.Version != int32(now.Unix()) || !bytes.Equal(nd.Overlay, id) || !nd.ID.(keys.PublicKeyED25519).Key.Equal(owner.key.Public()) {
+		t.Fatal("publication signed wrong key/id/version")
+	}
+	d.storeOverN = 0
+	if err := borrower.PublishOverlay(context.Background(), key, now); err == nil {
+		t.Fatal("zero copies accepted")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := borrower.PublishOverlay(ctx, key, now); !errors.Is(err, context.Canceled) || d.storeOver != 2 {
+		t.Fatal("canceled publication attempted DHT write", err)
+	}
 }
 func (f *fakeDHT) FindAddresses(context.Context, []byte) (*address.List, ed25519.PublicKey, error) {
 	f.findCalls++

@@ -31,3 +31,29 @@ func TestRelaysUsesExactBoxedOverlayName(t *testing.T) {
 		t.Fatalf("wrong relays overlay id: %x %v", got, err)
 	}
 }
+
+func TestInboxUsesTwoDistinctHashStages(t *testing.T) {
+	inbox := make([]byte, 32)
+	for i := range inbox {
+		inbox[i] = byte(i)
+	}
+	preimage := append([]byte("tonnet-inbox"), inbox...)
+	wantKey := sha256.Sum256(preimage)
+	key, err := InboxKey(inbox)
+	if err != nil || !bytes.Equal(key, wantKey[:]) {
+		t.Fatal("wrong inbox DHT raw name", err)
+	}
+	// Boxed pub.overlay, 32-byte TL bytes and three padding bytes.
+	raw := append([]byte{0xcb, 0x45, 0xba, 0x34, 32}, wantKey[:]...)
+	raw = append(raw, 0, 0, 0)
+	wantID := sha256.Sum256(raw)
+	id, err := InboxID(inbox)
+	if err != nil || !bytes.Equal(id, wantID[:]) || bytes.Equal(id, key) {
+		t.Fatal("inbox selector used the raw name instead of boxed hash", err)
+	}
+	for _, bad := range [][]byte{nil, make([]byte, 31), make([]byte, 33)} {
+		if _, err := InboxID(bad); err == nil {
+			t.Fatal("invalid inbox id length")
+		}
+	}
+}

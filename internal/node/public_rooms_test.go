@@ -34,6 +34,9 @@ func (p *fakeRoomPublisher) Run(ctx context.Context) {
 	<-ctx.Done()
 	close(p.stopped)
 }
+func (p *fakeRoomPublisher) PublishOverlay(ctx context.Context, _ []byte, _ time.Time) error {
+	return ctx.Err()
+}
 func (p *fakeRoomPublisher) FindOverlayNodes(ctx context.Context, room []byte) (*tonoverlay.NodesList, error) {
 	p.finds.Add(1)
 	if !bytes.Equal(room, p.room) {

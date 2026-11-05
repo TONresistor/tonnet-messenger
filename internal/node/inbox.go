@@ -236,6 +236,11 @@ func (n *Node) answerInbox(p *peer, q *roomnet.Query, now time.Time) error {
 			return inboxStoreError(q, err)
 		}
 		if n.inbox != nil {
+			if !result.Duplicate && n.holders != nil {
+				if err := n.holders.join(store.LiveInbox{InboxID: result.Receipt.InboxID, ExpireAt: result.Receipt.ExpireAt}, now); err != nil {
+					return err
+				}
+			}
 			n.inbox.queueDeposit(result, request.Message)
 		}
 		return q.Answer(result.Receipt)
@@ -300,9 +305,16 @@ func (n *Node) answerInbox(p *peer, q *roomnet.Query, now time.Time) error {
 		if !n.inboxRate(p, now) {
 			return inboxFailure(q, community.RejectRelayFullOrQuotaExceeded, "inbox query rate exceeded")
 		}
+		n.inbox.order.Lock()
+		defer n.inbox.order.Unlock()
 		deleted, err := n.database.AckInbox(q.Context(), proof.InboxID, request.IDs)
 		if err != nil {
 			return inboxStoreError(q, err)
+		}
+		if n.holders != nil {
+			if err := n.holders.restore(q.Context(), now); err != nil {
+				return err
+			}
 		}
 		return q.Answer(community.InboxAckedV1{Deleted: int32(deleted)})
 	}

@@ -300,6 +300,11 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 			return global.answerPeers(q)
 		}
 	}
+	if n.holders != nil {
+		if held := n.holders.lookup(id, now); held != nil {
+			return held.overlay.answerPeers(q)
+		}
+	}
 	room := n.byOverlay[string(id)]
 	if room == nil && n.byOverlay == nil && n.room != nil && bytes.Equal(id, n.room.overlayID) {
 		room = n.room
