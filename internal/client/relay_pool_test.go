@@ -26,6 +26,7 @@ type poolEndpoint struct {
 	caps, card            atomic.Value
 	probes, cards, resets atomic.Int32
 	malformed, blocked    atomic.Bool
+	extra                 atomic.Value
 	peers                 chan *roomnet.Peer
 }
 
@@ -61,6 +62,11 @@ func newPoolEndpoint(t *testing.T) *poolEndpoint {
 		p := roomnet.Wrap(raw)
 		f.peers <- p
 		p.SetQueryHandler(func(q *roomnet.Query) error {
+			if hook := f.extra.Load(); hook != nil {
+				if handled, err := hook.(func(*roomnet.Query) (bool, error))(q); handled || err != nil {
+					return err
+				}
+			}
 			switch q.Data.(type) {
 			case community.GetCapabilities:
 				f.probes.Add(1)

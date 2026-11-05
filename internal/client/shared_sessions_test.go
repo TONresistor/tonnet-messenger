@@ -169,7 +169,7 @@ func TestClientSharesMultiRoomConnectionAcrossLeaveLossAndIdentityReset(t *testi
 		rooms = append(rooms, g)
 		configs = append(configs, node.RoomConfig{Genesis: &rooms[len(rooms)-1], RoomKey: roomKey})
 	}
-	n, err := node.New(node.Config{Key: nodeKey, Listen: address, Socket: filepath.Join(t.TempDir(), "node.sock"), Store: root, LocalOnly: true, Rooms: configs})
+	n, err := node.New(node.Config{Key: nodeKey, Listen: address, Socket: filepath.Join(t.TempDir(), "node.sock"), Store: root, LocalOnly: true, Rooms: configs, DM: testDMConfig()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,19 +225,6 @@ func TestClientSharesMultiRoomConnectionAcrossLeaveLossAndIdentityReset(t *testi
 	if sharedSession(alice, rooms[1].RoomKey).Peer != fresh {
 		t.Fatal("leave replaced B's connection")
 	}
-	// Existing legacy DM routing remains per-room on the shared dispatcher.
-	if _, err := bob.SendDM(ctx, keyText(rooms[1].RoomKey), alice.Identity().Key, "legacy B"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case n := <-received:
-		v := n.Params.(map[string]any)
-		if n.Method != "dm.message" || v["room"] != keyText(rooms[1].RoomKey) || v["text"] != "legacy B" {
-			t.Fatalf("misrouted DM: %#v", n)
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
 	// Rejoin A, then rotate identity with both rooms connected.
 	joinSharedRooms(t, ctx, alice, rooms[:1])
 	for _, text := range []string{"A", "after loss", "left room"} {
@@ -277,6 +264,30 @@ func TestClientSharesMultiRoomConnectionAcrossLeaveLossAndIdentityReset(t *testi
 	}
 	if sharedSession(alice, rooms[1].RoomKey).Peer != afterReset {
 		t.Fatal("stale close killed new identity")
+	}
+	// DM delivery is independent of the remaining room connection.
+	// The preceding scripted room burst exhausts the leaf's configured query
+	// budget. Exercise the DM cutover on a fresh, shared authenticated session.
+	oldBob := sharedSession(bob, rooms[1].RoomKey).Peer
+	_ = oldBob.Close()
+	waitSharedConnection(t, ctx, bob, rooms, oldBob)
+	alice.identityOps.Lock()
+	_, dmErr := alice.ensureDM()
+	alice.identityOps.Unlock()
+	if dmErr != nil {
+		t.Fatal(dmErr)
+	}
+	if _, err := bob.SendDM(ctx, alice.Identity().Key, "independent B"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-received:
+		v := n.Params.(map[string]any)
+		if n.Method != "dm.message" || v["room"] != nil || v["text"] != "independent B" {
+			t.Fatalf("misrouted DM: %#v", n)
+		}
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
 	}
 	if err := alice.Close(); err != nil {
 		t.Fatal(err)

@@ -269,12 +269,18 @@ func TestV050ResultDecodersAreClosed(t *testing.T) {
 func TestV050DirectAndStateConstructorsRemainDistinct(t *testing.T) {
 	key := bytes.Repeat([]byte{1}, 32)
 	old := DirectMessage{RoomID: key, FromKey: key, ToKey: key}
-	raw, err := Encode(old)
+	if _, err := Encode(old); err == nil {
+		t.Fatal("obsolete V2 DM is still registered")
+	}
+	raw, err := Encode(DirectMessageToSign{RoomID: key, FromKey: key, ToKey: key})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DecodeDirectMessage(raw); err != nil {
-		t.Fatal(err)
+	binary.LittleEndian.PutUint32(raw, 0xa5529daf)
+	raw = append(raw, 64)
+	raw = append(raw, make([]byte, 67)...)
+	if _, err := DecodeDirectMessage(raw); err == nil {
+		t.Fatal("obsolete V2 DM decoded")
 	}
 	if _, err := DecodeDirectMessageV3(raw); err == nil {
 		t.Fatal("V3 decoder accepted V2 DM")

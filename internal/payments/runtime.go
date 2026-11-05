@@ -149,7 +149,7 @@ func OpenRuntime(ctx context.Context, path string, payer bool) (_ *Runtime, err 
 	if err != nil {
 		return nil, err
 	}
-	database := db.NewDB(storage, paymentKey.Public().(ed25519.PublicKey))
+	database := db.NewDB(&ownedStorage{Storage: storage}, paymentKey.Public().(ed25519.PublicKey))
 	// Database closes last, after stopping the SDK and its transports.
 	r.cleanup = append([]func(){database.Close}, r.cleanup...)
 	if fresh {

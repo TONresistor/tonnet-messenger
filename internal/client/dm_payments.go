@@ -49,6 +49,16 @@ type payerChannel struct {
 	Final, Pending                  bool
 }
 
+type dmPayer interface {
+	Plan(ed25519.PublicKey, int64) (payments.ChannelPlan, error)
+	Open(context.Context, ed25519.PrivateKey, payments.ChannelPlan) error
+	SaveState(context.Context, ed25519.PublicKey, []byte) error
+	CanPay(context.Context, ed25519.PublicKey) (bool, error)
+	PaymentKey() ed25519.PublicKey
+	MinSafeTTL() time.Duration
+	Close() error
+}
+
 type dmSendTarget struct {
 	Key        ed25519.PublicKey
 	Address    string
@@ -204,7 +214,7 @@ ON CONFLICT(identity,relay_key,tier) DO UPDATE SET balance=excluded.balance,know
 
 func (r *dmRuntime) exchangePayment(ctx context.Context, lease *replica.RelayLease, ch *payerChannel) (int64, error) {
 	owner := r.key.Public().(ed25519.PublicKey)
-	if r.client.tpn == nil || !bytes.Equal(ch.SDKKey, r.client.tpn.Service.GetPrivateKey().Public().(ed25519.PublicKey)) {
+	if r.client.tpn == nil || !bytes.Equal(ch.SDKKey, r.client.tpn.PaymentKey()) {
 		return 0, fmt.Errorf("payment SDK identity changed")
 	}
 	key := ed25519.NewKeyFromSeed(ch.Seed).Public().(ed25519.PublicKey)
@@ -279,7 +289,7 @@ func (r *dmRuntime) topUpPrepaid(ctx context.Context, lease *replica.RelayLease,
 	if err != nil {
 		return 0, err
 	}
-	if ch != nil && (!bytes.Equal(ch.PaymentKey, target.PaymentKey) || !bytes.Equal(ch.SDKKey, r.client.tpn.Service.GetPrivateKey().Public().(ed25519.PublicKey))) {
+	if ch != nil && (!bytes.Equal(ch.PaymentKey, target.PaymentKey) || !bytes.Equal(ch.SDKKey, r.client.tpn.PaymentKey())) {
 		return 0, ErrProtocol
 	}
 	recovery := ch
@@ -316,7 +326,7 @@ func (r *dmRuntime) topUpPrepaid(ctx context.Context, lease *replica.RelayLease,
 	newChannel := ch == nil || ch.Final
 	if ch != nil && !newChannel {
 		capacity := ch.Plan.Parts[len(ch.Plan.Parts)-1].Capacity
-		newChannel = new(big.Int).Sub(capacity, amount).Cmp(big.NewInt(target.Offer.PriceNanoton)) < 0 || time.Until(ch.Plan.Parts[len(ch.Plan.Parts)-1].Deadline) < 300*time.Second+r.client.tpn.Service.GetMinSafeTTL()
+		newChannel = new(big.Int).Sub(capacity, amount).Cmp(big.NewInt(target.Offer.PriceNanoton)) < 0 || time.Until(ch.Plan.Parts[len(ch.Plan.Parts)-1].Deadline) < 300*time.Second+r.client.tpn.MinSafeTTL()
 		// Only renew after the preceding signed payment has a definitive
 		// balance reply. An uncertain payment must keep its original channel.
 		if !newChannel && len(ch.State) != 0 && !ch.Pending {
@@ -336,7 +346,7 @@ func (r *dmRuntime) topUpPrepaid(ctx context.Context, lease *replica.RelayLease,
 		if err != nil {
 			return 0, err
 		}
-		ch = &payerChannel{Seed: key.Seed(), Relay: bytes.Clone(target.Key), PaymentKey: bytes.Clone(target.PaymentKey), SDKKey: bytes.Clone(r.client.tpn.Service.GetPrivateKey().Public().(ed25519.PublicKey)), Tier: target.Offer.Tier, Plan: plan, Amount: "0"}
+		ch = &payerChannel{Seed: key.Seed(), Relay: bytes.Clone(target.Key), PaymentKey: bytes.Clone(target.PaymentKey), SDKKey: bytes.Clone(r.client.tpn.PaymentKey()), Tier: target.Offer.Tier, Plan: plan, Amount: "0"}
 		amount.SetInt64(0)
 		if err := r.client.store.savePayer(ctx, owner, ch); err != nil {
 			return 0, err

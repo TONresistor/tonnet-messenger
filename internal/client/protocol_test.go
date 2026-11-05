@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"errors"
 	"net"
 	"testing"
@@ -118,34 +119,28 @@ func TestSubmitRejectsUnrelatedCommit(t *testing.T) {
 
 func TestClientRejectsInvalidDMPlaintext(t *testing.T) {
 	ctx := context.Background()
-	roomKey, sender, recipient := clockTestKey(t), clockTestKey(t), clockTestKey(t)
-	roomID := roomKey.Public().(ed25519.PublicKey)
-	instance := &Client{ctx: ctx, key: recipient, identityEpoch: 1, profiles: make(map[string]string), events: make(chan Notification, 4)}
-	session := &replica.Session{}
-	handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
-	for _, plaintext := range []string{string([]byte{0xff, 0xfe})} {
-		box, err := dm.SealForRoom(roomID, sender, recipient.Public().(ed25519.PublicKey), []byte(plaintext))
-		if err != nil {
-			t.Fatal(err)
-		}
-		direct, err := community.SignDirectMessage(sender, community.DirectMessage{RoomID: roomID, ToKey: recipient.Public().(ed25519.PublicKey), Timestamp: time.Now().Unix(), Ciphertext: box})
-		if err != nil {
-			t.Fatal(err)
-		}
-		raw, err := community.Encode(direct)
-		if err != nil {
-			t.Fatal(err)
-		}
-		wrapper, err := broadcast.Sign(sender, tonoverlay.CertificateEmpty{}, raw, time.Now().Unix())
-		if err != nil {
-			t.Fatal(err)
-		}
-		handle.ingestSerializable(session, 1, wrapper)
-		select {
-		case notification := <-instance.events:
-			t.Fatalf("invalid plaintext accepted as %s", notification.Method)
-		default:
-		}
+	sender, recipient := clockTestKey(t), clockTestKey(t)
+	cache, _ := clientInboxStore(t)
+	instance := &Client{ctx: ctx, key: recipient, store: cache, identityEpoch: 1, events: make(chan Notification, 4)}
+	runtime := &dmRuntime{client: instance, key: recipient, epoch: 1}
+	tag := sha256.Sum256([]byte("tonnet-dm-v3"))
+	box, e := dm.SealForRoom(tag[:], sender, recipient.Public().(ed25519.PublicKey), []byte{0xff, 0xfe})
+	if e != nil {
+		t.Fatal(e)
+	}
+	m, e := community.SignDirectMessageV3(sender, community.DirectMessageV3{ToKey: recipient.Public().(ed25519.PublicKey), CreatedAt: time.Now().Unix(), ExpireAt: time.Now().Unix() + 60, Ciphertext: box})
+	if e != nil {
+		t.Fatal(e)
+	}
+	result, e := cache.receiveInboxPush(ctx, recipient, sender.Public().(ed25519.PublicKey), community.InboxPushV1{Seqno: 1, Message: m}, time.Now())
+	if e != nil {
+		t.Fatal(e)
+	}
+	runtime.deliver(ctx, result)
+	select {
+	case notification := <-instance.events:
+		t.Fatalf("invalid plaintext accepted as %s", notification.Method)
+	default:
 	}
 }
 
@@ -153,41 +148,49 @@ func TestClientRejectsNonemptyBroadcastCertificate(t *testing.T) {
 	ctx := context.Background()
 	roomKey, sender, recipient := clockTestKey(t), clockTestKey(t), clockTestKey(t)
 	roomID := roomKey.Public().(ed25519.PublicKey)
-	instance := &Client{ctx: ctx, key: recipient, identityEpoch: 1, profiles: make(map[string]string), events: make(chan Notification, 4)}
-	session := &replica.Session{}
-	handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
-	box, err := dm.SealForRoom(roomID, sender, recipient.Public().(ed25519.PublicKey), []byte("valid plaintext"))
-	if err != nil {
-		t.Fatal(err)
+	genesis, e := community.NewGenesis(roomKey, sender, time.Now(), "certificate", "", true, nil)
+	if e != nil {
+		t.Fatal(e)
 	}
-	direct, err := community.SignDirectMessage(sender, community.DirectMessage{RoomID: roomID, ToKey: recipient.Public().(ed25519.PublicKey), Timestamp: time.Now().Unix(), Ciphertext: box})
-	if err != nil {
-		t.Fatal(err)
+	proposal, e := community.SignProposal(sender, genesis.NodeKey, community.EventProposal{RoomID: roomID, Nonce: make([]byte, 32), Timestamp: time.Now().Unix(), Body: community.EventMessage{Text: "valid event"}})
+	if e != nil {
+		t.Fatal(e)
 	}
-	raw, err := community.Encode(direct)
-	if err != nil {
-		t.Fatal(err)
+	hash, _ := genesis.Hash()
+	event, e := community.SignCommit(roomKey, proposal, 1, hash, time.Now())
+	if e != nil {
+		t.Fatal(e)
 	}
-	wrapper, err := broadcast.Sign(sender, tonoverlay.CertificateEmpty{}, raw, time.Now().Unix())
-	if err != nil {
-		t.Fatal(err)
+	raw, e := community.Encode(event)
+	if e != nil {
+		t.Fatal(e)
 	}
-	for _, certificateLength := range []int{64, 5000} {
-		wrapper.Certificate = tonoverlay.Certificate{IssuedBy: wrapper.Src, ExpireAt: uint32(time.Now().Unix() + 60), MaxSize: 4096, Signature: make([]byte, certificateLength)}
-		encoded, err := community.Encode(wrapper)
-		if err != nil {
-			t.Fatal(err)
+	instance := &Client{ctx: ctx, key: recipient, identityEpoch: 1, events: make(chan Notification, 4)}
+	session := &replica.Session{Genesis: genesis}
+	handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1, events: make(chan canonicalEvent, 4)}
+	wrapper, e := broadcast.Sign(roomKey, tonoverlay.CertificateEmpty{}, raw, time.Now().Unix())
+	if e != nil {
+		t.Fatal(e)
+	}
+	for _, n := range []int{64, 5000} {
+		bad := wrapper
+		bad.Certificate = tonoverlay.Certificate{IssuedBy: wrapper.Src, ExpireAt: uint32(time.Now().Unix() + 60), MaxSize: 4096, Signature: make([]byte, n)}
+		encoded, e := community.Encode(bad)
+		if e != nil {
+			t.Fatal(e)
 		}
-		decoded, err := community.DecodeAny(encoded)
-		if err != nil {
-			t.Fatal(err)
+		decoded, e := community.DecodeAny(encoded)
+		if e != nil {
+			t.Fatal(e)
 		}
 		handle.ingestSerializable(session, 1, decoded)
-		select {
-		case <-instance.events:
+		if len(instance.events) != 0 || len(handle.events) != 0 {
 			t.Fatal("nonempty certificate accepted")
-		default:
 		}
+	}
+	handle.ingestSerializable(session, 1, wrapper)
+	if len(handle.events) != 1 {
+		t.Fatal("valid empty-certificate event was not queued")
 	}
 }
 

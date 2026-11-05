@@ -41,6 +41,11 @@ func (p PayerSettings) Validate() error {
 
 type ChannelPlan struct{ Parts []transport.TunnelChainPart }
 
+func (r *Runtime) PaymentKey() ed25519.PublicKey {
+	return bytes.Clone(r.Service.GetPrivateKey().Public().(ed25519.PublicKey))
+}
+func (r *Runtime) MinSafeTTL() time.Duration { return r.Service.GetMinSafeTTL() }
+
 func (r *Runtime) CanPay(ctx context.Context, key ed25519.PublicKey) (bool, error) {
 	meta, err := r.Service.GetVirtualChannelMeta(ctx, key)
 	if errors.Is(err, db.ErrNotFound) {
@@ -92,7 +97,7 @@ func (r *Runtime) Open(ctx context.Context, key ed25519.PrivateKey, plan Channel
 		if err != nil {
 			return err
 		}
-		first, tunnel, err := transport.GenerateTunnel(key, plan.Parts, 5, false, r.Service.GetPrivateKey(), coin)
+		first, tunnel, err := payerTunnel(key, plan, r.Service.GetPrivateKey(), coin)
 		if err != nil {
 			return err
 		}
@@ -123,6 +128,10 @@ func (r *Runtime) Open(ctx context.Context, key ed25519.PrivateKey, plan Channel
 		case <-tick.C:
 		}
 	}
+}
+
+func payerTunnel(key ed25519.PrivateKey, plan ChannelPlan, sender ed25519.PrivateKey, coin *sdkpayments.CoinConfig) (ed25519.PublicKey, []transport.AddConditionalInstruction, error) {
+	return transport.GenerateTunnel(key, plan.Parts, 5, false, sender, coin)
 }
 
 // SaveState rereads the SDK even after an Add error, and retries a state that

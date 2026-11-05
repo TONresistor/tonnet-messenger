@@ -145,7 +145,10 @@ func readState(c *cell.Cell) (*conditionals.VirtualChannelState, error) {
 		return nil, fmt.Errorf("payments: missing state")
 	}
 	state := new(conditionals.VirtualChannelState)
-	slice := c.BeginParse()
+	slice, err := c.BeginParse()
+	if err != nil {
+		return nil, err
+	}
 	if err := state.LoadFromCell(slice); err != nil {
 		return nil, err
 	}
@@ -161,7 +164,11 @@ func (r *Relay) conditional(ctx context.Context, key []byte, meta *db.Conditiona
 		return nil, fmt.Errorf("payments: not an incoming-only virtual channel")
 	}
 	cond := new(conditionals.ConditionalVirtualChannel)
-	if err := cond.Parse(ctx, meta.Incoming.Conditional.BeginParse(), r.backend); err != nil {
+	slice, err := meta.Incoming.Conditional.BeginParse()
+	if err != nil {
+		return nil, err
+	}
+	if err := cond.Parse(ctx, slice, r.backend); err != nil {
 		return nil, err
 	}
 	if !bytes.Equal(cond.Key, key) || cond.Capacity == nil || cond.GetAction() == nil {

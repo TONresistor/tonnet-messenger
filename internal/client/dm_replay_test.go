@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/dm"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
@@ -19,79 +18,71 @@ func TestClientDeduplicatesReceivedDMs(t *testing.T) {
 	for _, mode := range []string{"sequential", "concurrent", "reconnect", "rejoin", "rewrapped", "invalid_then_valid", "two_distinct_messages", "obsolete_session"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()
-			room, sender, recipient := clientTestPrivateKey(t), clientTestPrivateKey(t), clientTestPrivateKey(t)
-			roomID := room.Public().(ed25519.PublicKey)
-			instance := &Client{ctx: ctx, key: recipient, identityEpoch: 1, events: make(chan Notification, 64)}
-			session := &replica.Session{}
-			handle := &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
-			create := func() (community.DirectMessage, broadcast.Broadcast) {
-				box, err := dm.SealForRoom(roomID, sender, recipient.Public().(ed25519.PublicKey), []byte("same text"))
-				if err != nil {
-					t.Fatal(err)
+			sender, recipient := clientTestPrivateKey(t), clientTestPrivateKey(t)
+			cache, _ := clientInboxStore(t)
+			instance := &Client{ctx: ctx, key: recipient, store: cache, identityEpoch: 1, events: make(chan Notification, 64)}
+			relay := clientTestPrivateKey(t).Public().(ed25519.PublicKey)
+			runtime := &dmRuntime{client: instance, key: recipient, epoch: 1}
+			create := func() community.DirectMessageV3 {
+				box, e := dm.SealV3(sender, recipient.Public().(ed25519.PublicKey), []byte("same text"))
+				if e != nil {
+					t.Fatal(e)
 				}
-				direct, err := community.SignDirectMessage(sender, community.DirectMessage{RoomID: roomID, ToKey: recipient.Public().(ed25519.PublicKey), Timestamp: time.Now().Unix(), Ciphertext: box})
-				if err != nil {
-					t.Fatal(err)
+				m, e := community.SignDirectMessageV3(sender, community.DirectMessageV3{ToKey: recipient.Public().(ed25519.PublicKey), CreatedAt: time.Now().Unix(), ExpireAt: time.Now().Unix() + 60, Ciphertext: box})
+				if e != nil {
+					t.Fatal(e)
 				}
-				raw, err := community.Encode(direct)
-				if err != nil {
-					t.Fatal(err)
-				}
-				wrapper, err := broadcast.Sign(sender, nil, raw, time.Now().Unix())
-				if err != nil {
-					t.Fatal(err)
-				}
-				return direct, wrapper
+				return m
 			}
-			direct, wrapper := create()
+			deliver := func(m community.DirectMessageV3) {
+				result, e := cache.receiveInboxPush(ctx, recipient, relay, community.InboxPushV1{Seqno: 1, Message: m}, time.Now())
+				if e != nil {
+					t.Error(e)
+					return
+				}
+				runtime.deliver(ctx, result)
+			}
+			message := create()
 			expected := 1
 			switch mode {
 			case "concurrent":
 				var wg sync.WaitGroup
 				for i := 0; i < 32; i++ {
 					wg.Add(1)
-					go func() { defer wg.Done(); handle.ingestSerializable(session, 1, wrapper) }()
+					go func() { defer wg.Done(); deliver(message) }()
 				}
 				wg.Wait()
 			case "invalid_then_valid":
-				invalid := wrapper
-				invalid.Signature = append([]byte(nil), wrapper.Signature...)
-				invalid.Signature[0] ^= 1
-				handle.ingestSerializable(session, 1, invalid)
+				bad := message
+				bad.Signature = append([]byte(nil), message.Signature...)
+				bad.Signature[0] ^= 1
+				deliver(bad)
 				if len(instance.events) != 0 {
-					t.Fatal("invalid signature was accepted")
+					t.Fatal("invalid signature accepted")
 				}
-				handle.ingestSerializable(session, 1, wrapper)
+				deliver(message)
 			case "obsolete_session":
-				handle.session = &replica.Session{}
-				handle.ingestSerializable(session, 1, wrapper)
+				runtime.epoch = 0
+				deliver(message)
 				expected = 0
 			default:
-				handle.ingestSerializable(session, 1, wrapper)
+				deliver(message)
 				switch mode {
-				case "reconnect":
-					session = &replica.Session{}
-					handle.session = session
+				case "reconnect", "rewrapped":
+					relay = clientTestPrivateKey(t).Public().(ed25519.PublicKey)
 				case "rejoin":
-					session = &replica.Session{}
-					handle = &roomHandle{client: instance, key: roomID, ctx: ctx, session: session, sessionEpoch: 1}
-				case "rewrapped":
-					var err error
-					wrapper, err = broadcast.Sign(sender, nil, wrapper.Data, int64(wrapper.Date)+1)
-					if err != nil {
-						t.Fatal(err)
-					}
+					runtime = &dmRuntime{client: instance, key: recipient, epoch: 1}
 				case "two_distinct_messages":
-					other, next := create()
-					expected = 2
-					oldID, _ := community.HashBoxed(direct)
-					newID, _ := community.HashBoxed(other)
-					if string(oldID) == string(newID) {
-						t.Fatal("distinct sends unexpectedly have same ID")
+					other := create()
+					a, _ := community.HashBoxed(message)
+					b, _ := community.HashBoxed(other)
+					if string(a) == string(b) {
+						t.Fatal("distinct sends have same ID")
 					}
-					wrapper = next
+					message = other
+					expected = 2
 				}
-				handle.ingestSerializable(session, 1, wrapper)
+				deliver(message)
 			}
 			if len(instance.events) != expected {
 				t.Fatalf("observed %d notifications, want %d", len(instance.events), expected)

@@ -429,12 +429,12 @@ func TestInboxV4MigrationPreservesRoomsAndRollsBack(t *testing.T) {
 	roomCommit(t, f, f.user, community.EventMessage{Text: "preserved"}, nil)
 	legacySnapshot(t, f)
 	before := preservedRoomRows(t, f.store)
-	for _, table := range []string{"inbox_messages", "inbox_rate", "inbox_receipts", "inbox_counters"} {
+	for _, table := range []string{"inbox_messages", "inbox_rate", "inbox_receipts", "inbox_counters", "relay_payments", "prepaid_balances", "payment_identity"} {
 		if _, err := f.store.db.Exec("DROP TABLE " + table); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := f.store.db.Exec("DELETE FROM schema_migrations WHERE version=5"); err != nil {
+	if _, err := f.store.db.Exec("DELETE FROM schema_migrations WHERE version>=5"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := f.store.db.Exec(`CREATE TRIGGER fail_inbox_schema BEFORE INSERT ON schema_migrations WHEN NEW.version=5 BEGIN SELECT RAISE(ABORT,'rollback inbox schema'); END`); err != nil {

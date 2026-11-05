@@ -80,7 +80,7 @@ type Client struct {
 	relays        *relayPool
 	dmRuntime     *dmRuntime
 	store         *clientStore
-	tpn           *payments.Runtime
+	tpn           dmPayer
 	lock          *stateLock
 
 	mu            sync.RWMutex

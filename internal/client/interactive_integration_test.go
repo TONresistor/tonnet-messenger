@@ -55,7 +55,7 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 	listener.Close()
 	runtime, err := node.New(node.Config{
 		Key: nodeKey, Listen: address, Socket: filepath.Join(t.TempDir(), "node.sock"), Genesis: &genesis,
-		Store: database, RoomKey: roomKey, NodeRole: community.NodeRoleSequencer,
+		Store: database, RoomKey: roomKey, NodeRole: community.NodeRoleSequencer, DM: testDMConfig(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -63,7 +63,7 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 	defer runtime.Close()
 	connect := func(name string) (*Client, <-chan Notification) {
 		t.Helper()
-		instance, err := Open(ctx, Config{StateDir: t.TempDir()})
+		instance, err := Open(ctx, Config{StateDir: t.TempDir(), DirectAddress: address, DirectPublic: nodeKey.Public().(ed25519.PublicKey)})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -87,7 +87,7 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 			t.Fatal(err)
 		}
 		session, err := replica.DialRoom(ctx, replica.Config{
-			RoomID: genesis.RoomKey, NodeKey: instance.key, DirectAddress: address, DirectPublic: nodeKey.Public().(ed25519.PublicKey),
+			Connector: instance.connector, RoomID: genesis.RoomKey, NodeKey: instance.key, DirectAddress: address, DirectPublic: nodeKey.Public().(ed25519.PublicKey),
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -98,7 +98,7 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 			session: session, sessionEpoch: 1, events: make(chan canonicalEvent, canonicalEventQueueCapacity),
 		}
 		instance.rooms[keyText(genesis.RoomKey)] = handle
-		session.Peer.SetMessageHandler(func(value any) error { handle.ingestSerializable(session, 1, value); return nil })
+		session.SetMessageHandler(func(value any) error { handle.ingestSerializable(session, 1, value); return nil })
 		if err := handle.syncSessionLocked(ctx, session, 1); err != nil {
 			t.Fatal(err)
 		}
@@ -108,6 +108,12 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 		if err != nil || len(items) != 100 || !more {
 			t.Fatalf("large history sync failed: len=%d more=%v err=%v", len(items), more, err)
 		}
+		instance.identityOps.Lock()
+		_, err = instance.ensureDM()
+		instance.identityOps.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
 		return instance, directs
 	}
 	alice, aliceDirects := connect("Alice")
@@ -115,7 +121,7 @@ func TestInteractiveSessionSyncAndDirectMessages(t *testing.T) {
 	if _, err := alice.SendMessage(ctx, keyText(genesis.RoomKey), "public message"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := alice.SendDM(ctx, keyText(genesis.RoomKey), bob.Identity().Key, "encrypted hello"); err != nil {
+	if _, err := alice.SendDM(ctx, bob.Identity().Key, "encrypted hello"); err != nil {
 		t.Fatal(err)
 	}
 	for _, expected := range []struct {

@@ -135,9 +135,9 @@ func (backend *fakeBackend) Send(_ context.Context, room, text string) (Event, e
 	backend.sentRoom, backend.sentText = room, text
 	return Event{Room: room, ID: "sent", Seqno: 601, Kind: "message", Text: text}, backend.sendErr
 }
-func (backend *fakeBackend) SendDirect(_ context.Context, room, peer, text string) (Direct, error) {
-	backend.sentRoom, backend.sentPeer, backend.sentText = room, peer, text
-	return Direct{Room: room, Peer: peer, Text: text, ID: "sent", Direction: "sent"}, backend.sendErr
+func (backend *fakeBackend) SendDirect(_ context.Context, peer, text string) (Direct, error) {
+	backend.sentRoom, backend.sentPeer, backend.sentText = "", peer, text
+	return Direct{Peer: peer, Text: text, ID: "sent", Direction: "sent"}, backend.sendErr
 }
 func (backend *fakeBackend) SetName(_ context.Context, name string) (client.Identity, error) {
 	identity := backend.Identity()
@@ -269,8 +269,8 @@ func TestDirectsRemainLiveAcrossMenusAndDeduplicate(t *testing.T) {
 	}
 	message.Room = strings.Repeat("R", 43)
 	model.receiveDirect(message)
-	if len(model.directs) != 2 {
-		t.Fatal("DMs from different rooms mixed")
+	if len(model.directs) != 1 || len(conversation.Messages) != 2 {
+		t.Fatal("room label split or duplicated the identity conversation")
 	}
 	for index := 0; index < 550; index++ {
 		message.ID = fmt.Sprint(index)
@@ -336,7 +336,7 @@ func TestDirectRecipientResolutionAndSendOrdering(t *testing.T) {
 			if len(conversation.Messages) != 1 || conversation.Name != "bob.ton" {
 				t.Fatal("send reply and notification not merged")
 			}
-			if backend.sentRoom != testRoom || backend.sentPeer != testPeer || model.input.Value() != "" {
+			if backend.sentRoom != "" || backend.sentPeer != testPeer || model.input.Value() != "" {
 				t.Fatal("incorrect send binding or draft")
 			}
 		})

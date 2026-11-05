@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"net"
 	"net/http"
@@ -131,7 +132,7 @@ func TestClientLocalTimestampCommitsThroughVerifiedRoomReplica(t *testing.T) {
 	}
 }
 
-func TestTONQUICRoutesDirectMessageBetweenOnlineIdentities(t *testing.T) {
+func TestTONQUICDropsLegacyDirectMessageWithoutScoringButChecksOuterSignature(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	roomKey, nodeKey := integrationKey(t), integrationKey(t)
@@ -186,35 +187,38 @@ func TestTONQUICRoutesDirectMessageBetweenOnlineIdentities(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, err := community.Encode(direct)
+	raw, err := community.Encode(community.DirectMessageToSign{RoomID: direct.RoomID, FromKey: direct.FromKey, ToKey: direct.ToKey, AuthorName: direct.AuthorName, Timestamp: direct.Timestamp, Ciphertext: direct.Ciphertext})
 	if err != nil {
 		t.Fatal(err)
 	}
+	binary.LittleEndian.PutUint32(raw, 0xa5529daf)
+	raw = append(raw, 64)
+	raw = append(raw, direct.Signature...)
+	raw = append(raw, 0, 0, 0)
 	wrapper, err := broadcast.Sign(alice, tonoverlay.CertificateEmpty{}, raw, now.Unix())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := aliceSession.Peer.SendMessage(ctx, wrapper); err != nil {
-		t.Fatal(err)
+	id, _ := community.KeyID(alice.Public().(ed25519.PublicKey))
+	p, ok := runtime.peers.get(hex.EncodeToString(id))
+	if !ok {
+		t.Fatal("missing authenticated peer")
 	}
-
+	runtime.handleCommunityMessage(p, wrapper, now)
+	if runtime.penalties.banned(p.id, now) {
+		t.Fatal("legacy inner body was scored")
+	}
 	select {
 	case message := <-received:
-		got, ok := broadcast.AsBroadcast(message)
-		if !ok {
-			t.Fatalf("received %T, want signed broadcast", message)
-		}
-		delivered, err := community.DecodeDirectMessage(got.Data)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if !bytes.Equal(delivered.FromKey, alice.Public().(ed25519.PublicKey)) ||
-			!bytes.Equal(delivered.ToKey, bob.Public().(ed25519.PublicKey)) {
-			t.Fatal("direct message identities changed in transit")
-		}
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
+		t.Fatalf("legacy DM forwarded: %T", message)
+	default:
 	}
+	wrapper.Signature[0] ^= 1
+	runtime.handleCommunityMessage(p, wrapper, now)
+	if !runtime.penalties.banned(p.id, now) {
+		t.Fatal("bad outer signature was not penalized")
+	}
+
 }
 
 func TestTONQUICClientReadsFromVerifiedRelay(t *testing.T) {
