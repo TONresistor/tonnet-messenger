@@ -33,7 +33,7 @@ func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "tonnet-messenger-server",
 		Short: "Tonnet Messenger - persistent communities over TON overlays",
-		Long: "tonnet-messenger-server creates and serves one operator-owned persistent community per process.\n" +
+		Long: "tonnet-messenger-server serves selected owned rooms and room replicas under one node identity and database.\n" +
 			"Only this operator CLI creates room authority state.",
 		SilenceUsage:  true,
 		SilenceErrors: true,

@@ -135,6 +135,23 @@ func roomArtifacts(paths Paths, genesis community.Genesis) (Artifacts, error) {
 	return Artifacts{Paths: paths, Genesis: genesis, GenesisHash: hash, OverlayID: id}, nil
 }
 
+// LoadArtifacts selects public artifacts without acquiring private authority or
+// opening the database. An omitted room key retains the legacy root selection.
+func LoadArtifacts(dir string, roomID []byte, now time.Time) (Artifacts, error) {
+	paths, err := Resolve(dir)
+	if err != nil {
+		return Artifacts{}, err
+	}
+	if len(roomID) == 0 {
+		genesis, err := LoadGenesis(paths.Genesis, now)
+		if err != nil {
+			return Artifacts{}, err
+		}
+		roomID = genesis.RoomKey
+	}
+	return selectedArtifacts(paths, roomID, now)
+}
+
 func LoadRooms(ctx context.Context, dir string, selections []Selection, now time.Time) (*NodeState, error) {
 	return loadRooms(ctx, dir, selections, now, false)
 }

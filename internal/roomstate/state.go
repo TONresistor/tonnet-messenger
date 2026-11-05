@@ -152,7 +152,15 @@ func loadAuthority(ctx context.Context, dir string, now time.Time, readOnly bool
 	if err != nil {
 		return nil, err
 	}
-	n, err := loadRooms(ctx, dir, []Selection{{RoomID: genesis.RoomKey, Role: community.NodeRoleSequencer}}, now, readOnly)
+	return loadSelectedAuthority(ctx, dir, genesis.RoomKey, now, readOnly)
+}
+
+func LoadAuthorityForRoomReadOnly(ctx context.Context, dir string, roomID []byte, now time.Time) (*Authority, error) {
+	return loadSelectedAuthority(ctx, dir, roomID, now, true)
+}
+
+func loadSelectedAuthority(ctx context.Context, dir string, roomID []byte, now time.Time, readOnly bool) (*Authority, error) {
+	n, err := loadRooms(ctx, dir, []Selection{{RoomID: roomID, Role: community.NodeRoleSequencer}}, now, readOnly)
 	if err != nil {
 		return nil, err
 	}

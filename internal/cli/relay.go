@@ -21,7 +21,7 @@ func newRelayCmd() *cobra.Command {
 	var maxLeaves int
 	cmd := &cobra.Command{
 		Use:   "relay",
-		Short: "Run a verified read replica without room authority",
+		Short: "Run one verified room replica without room authority",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			roomID, err := community.ParseRoomKeyText(roomReference)
@@ -65,10 +65,10 @@ func newRelayCmd() *cobra.Command {
 				return err
 			}
 			defer runtime.Close()
-			fmt.Printf("✓ relay      %s\n", roomReference)
+			fmt.Printf("✓ room replica %s\n", roomReference)
 			fmt.Printf("✓ synced     seqno %d\n", synced.Head.Seqno)
 			fmt.Printf("✓ database   %s\n", relayState.Paths.Database)
-			fmt.Println("relay ready · no room.key · verified reads enabled")
+			fmt.Println("room replica ready · no room authority loaded · verified reads enabled")
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 			if err := runtime.Run(ctx); err != nil && err != context.Canceled {
@@ -77,7 +77,7 @@ func newRelayCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateDir, "state", "", "relay state directory")
+	cmd.Flags().StringVar(&stateDir, "state", "", "room replica state directory")
 	cmd.Flags().StringVar(&roomReference, "room", "", "canonical room public key")
 	cmd.Flags().StringVar(&bootstrap, "bootstrap", "", "optional authoritative ADNL id")
 	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:17400", "TON QUIC UDP bind address ip:port")

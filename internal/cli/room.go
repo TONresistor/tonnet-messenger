@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
@@ -26,7 +27,7 @@ import (
 func newRoomCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "room", Short: "Create and inspect persistent community rooms"}
 	cmd.AddCommand(
-		newRoomCreateCmd(), newRoomShowCmd(), newRoomIDCmd(), newRoomFindCmd(),
+		newRoomCreateCmd(), newRoomAddCmd(), newRoomRetainCmd(), newRoomShowCmd(), newRoomIDCmd(), newRoomFindCmd(),
 		newRoomLinkDomainCmd(),
 		newRoomMetadataCmd(), newRoomRoleCmd("admin"), newRoomRoleCmd("moderator"),
 		newRoomWritePolicyCmd(),
@@ -36,27 +37,31 @@ func newRoomCmd() *cobra.Command {
 
 func newRoomLinkDomainCmd() *cobra.Command {
 	var stateDir, configURL string
+	var rooms []string
 	var txURL bool
 	cmd := &cobra.Command{
 		Use:   "link-domain DOMAIN",
 		Short: "Build a wallet-confirmed TON DNS messenger record",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			paths, err := roomstate.Resolve(stateDir)
+			id, err := selectedRoomID(rooms)
 			if err != nil {
 				return err
 			}
-			genesis, err := roomstate.LoadGenesis(paths.Genesis, time.Now())
+			artifacts, err := roomstate.LoadArtifacts(stateDir, id, time.Now())
 			if err != nil {
 				return err
 			}
+			genesis := artifacts.Genesis
+
 			return tondns.LinkDomain(cmd.Context(), tondns.LinkOptions{
 				ConfigURL: configURL, Domain: args[0], RoomID: genesis.RoomKey,
 				TxURL: txURL, Output: cmd.OutOrStdout(),
 			})
 		},
 	}
-	cmd.Flags().StringVar(&stateDir, "state", "", "room state directory")
+	cmd.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
+	addRoomSelector(cmd, &rooms)
 	cmd.Flags().StringVar(&configURL, "config", defaultConfigURL, "TON global config URL")
 	cmd.Flags().BoolVar(&txURL, "tx-url", false, "print the wallet deep link instead of a QR code")
 	_ = cmd.MarkFlagRequired("state")
@@ -66,6 +71,7 @@ func newRoomLinkDomainCmd() *cobra.Command {
 func newRoomMetadataCmd() *cobra.Command {
 	parent := &cobra.Command{Use: "metadata", Short: "Manage signed room metadata"}
 	var stateDir, name, description string
+	var rooms []string
 	set := &cobra.Command{
 		Use:   "set",
 		Short: "Update room name or description through the running sequencer",
@@ -74,7 +80,7 @@ func newRoomMetadataCmd() *cobra.Command {
 			if !cmd.Flags().Changed("name") && !cmd.Flags().Changed("description") {
 				return fmt.Errorf("set at least one of --name or --description")
 			}
-			authority, err := roomstate.LoadAuthorityReadOnly(cmd.Context(), stateDir, time.Now())
+			authority, err := loadOwner(cmd.Context(), stateDir, rooms, time.Now())
 			if err != nil {
 				return err
 			}
@@ -89,12 +95,13 @@ func newRoomMetadataCmd() *cobra.Command {
 			if !cmd.Flags().Changed("description") {
 				description = state.Description
 			}
-			return submitOwnerBody(authority, community.EventMetadata{Name: name, Description: description})
+			return submitOwnerBody(authority, community.EventMetadata{Name: name, Description: description}, cmd.OutOrStdout())
 		},
 	}
-	set.Flags().StringVar(&stateDir, "state", "", "authoritative room state directory")
+	set.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
 	set.Flags().StringVar(&name, "name", "", "new display name")
 	set.Flags().StringVar(&description, "description", "", "new description")
+	addRoomSelector(set, &rooms)
 	_ = set.MarkFlagRequired("state")
 	parent.AddCommand(set)
 	return parent
@@ -105,6 +112,7 @@ func newRoomRoleCmd(role string) *cobra.Command {
 	for _, action := range []string{"grant", "revoke"} {
 		action := action
 		var stateDir string
+		var rooms []string
 		command := &cobra.Command{
 			Use:   action + " --state DIR IDENTITY_KEY",
 			Short: action + " a delegated " + role + " role",
@@ -114,7 +122,7 @@ func newRoomRoleCmd(role string) *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("invalid identity key: %w", err)
 				}
-				authority, err := roomstate.LoadAuthorityReadOnly(cmd.Context(), stateDir, time.Now())
+				authority, err := loadOwner(cmd.Context(), stateDir, rooms, time.Now())
 				if err != nil {
 					return err
 				}
@@ -130,10 +138,11 @@ func newRoomRoleCmd(role string) *cobra.Command {
 				default:
 					body = community.EventModeratorRevoke{SubjectKey: subject}
 				}
-				return submitOwnerBody(authority, body)
+				return submitOwnerBody(authority, body, cmd.OutOrStdout())
 			},
 		}
-		command.Flags().StringVar(&stateDir, "state", "", "authoritative room state directory")
+		command.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
+		addRoomSelector(command, &rooms)
 		_ = command.MarkFlagRequired("state")
 		parent.AddCommand(command)
 	}
@@ -150,6 +159,7 @@ func parseIdentityKeyText(value string) ([]byte, error) {
 func newRoomWritePolicyCmd() *cobra.Command {
 	parent := &cobra.Command{Use: "write-policy", Short: "Manage the public write policy"}
 	var stateDir string
+	var rooms []string
 	set := &cobra.Command{
 		Use:   "set --state DIR everyone|admins",
 		Short: "Choose who may publish messages",
@@ -158,21 +168,22 @@ func newRoomWritePolicyCmd() *cobra.Command {
 			if args[0] != "everyone" && args[0] != "admins" {
 				return fmt.Errorf("write policy must be everyone or admins")
 			}
-			authority, err := roomstate.LoadAuthorityReadOnly(cmd.Context(), stateDir, time.Now())
+			authority, err := loadOwner(cmd.Context(), stateDir, rooms, time.Now())
 			if err != nil {
 				return err
 			}
 			defer authority.Close()
-			return submitOwnerBody(authority, community.EventWritePolicy{AnyoneCanWrite: args[0] == "everyone"})
+			return submitOwnerBody(authority, community.EventWritePolicy{AnyoneCanWrite: args[0] == "everyone"}, cmd.OutOrStdout())
 		},
 	}
-	set.Flags().StringVar(&stateDir, "state", "", "authoritative room state directory")
+	set.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
+	addRoomSelector(set, &rooms)
 	_ = set.MarkFlagRequired("state")
 	parent.AddCommand(set)
 	return parent
 }
 
-func submitOwnerBody(authority *roomstate.Authority, body any) error {
+func submitOwnerBody(authority *roomstate.Authority, body any, output io.Writer) error {
 	nonce := make([]byte, 32)
 	if _, err := rand.Read(nonce); err != nil {
 		return err
@@ -197,10 +208,10 @@ func submitOwnerBody(authority *roomstate.Authority, body any) error {
 	}
 	switch value := response.(type) {
 	case community.SubmitAccepted:
-		fmt.Printf("✓ committed at seqno %d\n", value.Event.Seqno)
+		fmt.Fprintf(output, "✓ committed at seqno %d\n", value.Event.Seqno)
 		return nil
 	case community.SubmitDuplicate:
-		fmt.Printf("✓ already committed at seqno %d\n", value.Event.Seqno)
+		fmt.Fprintf(output, "✓ already committed at seqno %d\n", value.Event.Seqno)
 		return nil
 	case community.SubmitRejected:
 		return fmt.Errorf("mutation rejected (%d): %s", value.Code, value.Message)
@@ -209,37 +220,80 @@ func submitOwnerBody(authority *roomstate.Authority, body any) error {
 	}
 }
 
-func newRoomCreateCmd() *cobra.Command {
+func newRoomCreateCmd() *cobra.Command { return roomCreateCommand(false) }
+func newRoomAddCmd() *cobra.Command    { return roomCreateCommand(true) }
+
+func roomCreateCommand(additional bool) *cobra.Command {
 	var stateDir, name, description string
+	use, short := "create", "Create a new node state with an authoritative room"
+	create := roomstate.Create
+	if additional {
+		use, short, create = "add", "Add an owned room to existing node state", roomstate.CreateRoom
+	}
+	stateHelp := "new node state directory"
+	if additional {
+		stateHelp = "existing shared node state directory"
+	}
 	cmd := &cobra.Command{
-		Use:   "create",
-		Short: "Create a new authoritative room",
-		Args:  cobra.NoArgs,
+		Use: use, Short: short, Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			artifacts, err := roomstate.Create(cmd.Context(), stateDir, name, description, time.Now())
+			artifacts, err := create(cmd.Context(), stateDir, name, description, time.Now())
 			if err != nil {
 				return err
 			}
-			roomKey, _ := community.RoomKeyText(artifacts.Genesis.RoomKey)
-			fmt.Printf("✓ room       %s\n", roomKey)
-			fmt.Printf("✓ overlay    %s\n", base64.RawURLEncoding.EncodeToString(artifacts.OverlayID))
-			fmt.Printf("✓ genesis    %s\n", hex.EncodeToString(artifacts.GenesisHash))
-			fmt.Printf("✓ state      %s\n", artifacts.Paths.Dir)
-			fmt.Printf("  room key   %s\n", artifacts.Paths.RoomKey)
-			fmt.Printf("  node key   %s\n", artifacts.Paths.NodeKey)
-			fmt.Printf("  genesis    %s\n", artifacts.Paths.Genesis)
-			fmt.Printf("  database   %s\n", artifacts.Paths.Database)
-			fmt.Printf("→ DNS text   %s\n", roomKey)
-			fmt.Println("! back up room.key, node.key, genesis.boc, and room.db together")
+			printRoomArtifacts(cmd.OutOrStdout(), artifacts, true)
+			if !additional {
+				fmt.Fprintln(cmd.OutOrStdout(), "! back up room.key, node.key, genesis.boc, and room.db together")
+			}
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateDir, "state", "", "new room state directory")
+	cmd.Flags().StringVar(&stateDir, "state", "", stateHelp)
 	cmd.Flags().StringVar(&name, "name", "", "initial room display name")
 	cmd.Flags().StringVar(&description, "description", "", "initial room description")
 	_ = cmd.MarkFlagRequired("state")
 	_ = cmd.MarkFlagRequired("name")
 	return cmd
+}
+
+func newRoomRetainCmd() *cobra.Command {
+	var stateDir string
+	var genesisFiles []string
+	cmd := &cobra.Command{
+		Use: "retain", Short: "Retain verified replica genesis in existing node state", Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if len(genesisFiles) != 1 || genesisFiles[0] == "" {
+				return fmt.Errorf("--genesis must select exactly one genesis artifact")
+			}
+			genesis, err := roomstate.LoadGenesis(genesisFiles[0], time.Now())
+			if err != nil {
+				return err
+			}
+			artifacts, err := roomstate.RetainReplica(cmd.Context(), stateDir, genesis, time.Now())
+			if err != nil {
+				return err
+			}
+			printRoomArtifacts(cmd.OutOrStdout(), artifacts, false)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&stateDir, "state", "", "existing shared node state directory")
+	cmd.Flags().StringArrayVar(&genesisFiles, "genesis", nil, "verified room genesis BoC artifact to retain")
+	_ = cmd.MarkFlagRequired("state")
+	_ = cmd.MarkFlagRequired("genesis")
+	return cmd
+}
+
+func printRoomArtifacts(out io.Writer, artifacts roomstate.Artifacts, owned bool) {
+	id, _ := community.RoomKeyText(artifacts.Genesis.RoomKey)
+	fmt.Fprintf(out, "✓ room       %s\n✓ overlay    %s\n✓ genesis    %s\n✓ state      %s\n", id, base64.RawURLEncoding.EncodeToString(artifacts.OverlayID), hex.EncodeToString(artifacts.GenesisHash), artifacts.Paths.Dir)
+	if owned {
+		fmt.Fprintf(out, "  room key   %s\n", artifacts.Paths.RoomKey)
+	}
+	fmt.Fprintf(out, "  node key   %s\n  genesis    %s\n  database   %s\n", artifacts.Paths.NodeKey, artifacts.Paths.Genesis, artifacts.Paths.Database)
+	if owned {
+		fmt.Fprintf(out, "→ DNS text   %s\n", id)
+	}
 }
 
 type roomShowOutput struct {
@@ -261,12 +315,17 @@ type roomShowOutput struct {
 func newRoomShowCmd() *cobra.Command {
 	var stateDir string
 	var asJSON bool
+	var rooms []string
 	cmd := &cobra.Command{
 		Use:   "show",
 		Short: "Inspect a room's verified persistent state",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			output, err := inspectRoom(cmd.Context(), stateDir, time.Now())
+			id, err := selectedRoomID(rooms)
+			if err != nil {
+				return err
+			}
+			output, err := inspectSelectedRoom(cmd.Context(), stateDir, id, time.Now())
 			if err != nil {
 				return err
 			}
@@ -275,37 +334,40 @@ func newRoomShowCmd() *cobra.Command {
 				if err != nil {
 					return err
 				}
-				fmt.Println(string(encoded))
+				fmt.Fprintln(cmd.OutOrStdout(), string(encoded))
 				return nil
 			}
-			fmt.Printf("room        %s\n", output.RoomID)
-			fmt.Printf("overlay     %s\n", output.OverlayID)
-			fmt.Printf("genesis     %s\n", output.GenesisHash)
-			fmt.Printf("name        %s\n", output.Name)
-			fmt.Printf("description %s\n", output.Description)
-			fmt.Printf("write       %s\n", output.WritePolicy)
-			fmt.Printf("events      %d (state revision %d)\n", output.LatestSeqno, output.RevisionSeqno)
-			fmt.Printf("roles       %d admin(s), %d moderator(s)\n", len(output.Admins), len(output.Moderators))
-			fmt.Printf("pins        %d\n", len(output.PinnedMessages))
-			fmt.Printf("banned      %d\n", len(output.Banned))
+			fmt.Fprintf(cmd.OutOrStdout(), "room        %s\n", output.RoomID)
+			fmt.Fprintf(cmd.OutOrStdout(), "overlay     %s\n", output.OverlayID)
+			fmt.Fprintf(cmd.OutOrStdout(), "genesis     %s\n", output.GenesisHash)
+			fmt.Fprintf(cmd.OutOrStdout(), "name        %s\n", output.Name)
+			fmt.Fprintf(cmd.OutOrStdout(), "description %s\n", output.Description)
+			fmt.Fprintf(cmd.OutOrStdout(), "write       %s\n", output.WritePolicy)
+			fmt.Fprintf(cmd.OutOrStdout(), "events      %d (state revision %d)\n", output.LatestSeqno, output.RevisionSeqno)
+			fmt.Fprintf(cmd.OutOrStdout(), "roles       %d admin(s), %d moderator(s)\n", len(output.Admins), len(output.Moderators))
+			fmt.Fprintf(cmd.OutOrStdout(), "pins        %d\n", len(output.PinnedMessages))
+			fmt.Fprintf(cmd.OutOrStdout(), "banned      %d\n", len(output.Banned))
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateDir, "state", "", "room state directory")
+	cmd.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
 	cmd.Flags().BoolVar(&asJSON, "json", false, "output JSON")
+	addRoomSelector(cmd, &rooms)
 	_ = cmd.MarkFlagRequired("state")
 	return cmd
 }
 
 func inspectRoom(ctx context.Context, dir string, now time.Time) (roomShowOutput, error) {
-	paths, err := roomstate.Resolve(dir)
+	return inspectSelectedRoom(ctx, dir, nil, now)
+}
+
+func inspectSelectedRoom(ctx context.Context, dir string, id []byte, now time.Time) (roomShowOutput, error) {
+	artifacts, err := roomstate.LoadArtifacts(dir, id, now)
 	if err != nil {
 		return roomShowOutput{}, err
 	}
-	genesis, err := roomstate.LoadGenesis(paths.Genesis, now)
-	if err != nil {
-		return roomShowOutput{}, err
-	}
+	paths, genesis := artifacts.Paths, artifacts.Genesis
+
 	owner, err := store.OpenReadOnly(ctx, paths.Database)
 	if err != nil {
 		return roomShowOutput{}, err

@@ -4,8 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"io"
 	"net"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -22,16 +22,21 @@ func newServeCmd() *cobra.Command {
 	var stateDir, listen, advertise, cfgURL string
 	var maxLeaves int
 	var localOnly bool
+	var sequencers, replicas []string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Run the authoritative sequencer for one persistent room",
+		Short: "Serve saved sequencer and replica rooms under one node identity",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			authority, err := roomstate.LoadAuthority(cmd.Context(), stateDir, time.Now())
+			selections, err := serveSelections(stateDir, sequencers, replicas, time.Now())
 			if err != nil {
 				return err
 			}
-			defer authority.Close()
+			state, err := roomstate.LoadRooms(cmd.Context(), stateDir, selections, time.Now())
+			if err != nil {
+				return err
+			}
+			defer state.Close()
 			advertised := ""
 			if !localOnly {
 				var advertiseErr error
@@ -40,27 +45,33 @@ func newServeCmd() *cobra.Command {
 					return fmt.Errorf("TON QUIC advertise address: %w", advertiseErr)
 				}
 			}
+			rooms := make([]node.RoomConfig, len(state.Rooms))
+			for i := range state.Rooms {
+				r := &state.Rooms[i]
+				rooms[i] = node.RoomConfig{Genesis: &r.Genesis, RoomKey: r.RoomPrivate, NodeRole: r.Role}
+			}
 			runtime, err := node.New(node.Config{
-				Key: authority.NodePrivate, Listen: listen, Advertise: advertised,
-				ConfigURL: cfgURL, Socket: authority.Paths.Socket, MaxLeaves: maxLeaves,
-				Genesis: &authority.Genesis, Store: authority.Store,
-				RoomKey: authority.RoomPrivate, NodeRole: community.NodeRoleSequencer, LocalOnly: localOnly,
+				Key: state.NodePrivate, Listen: listen, Advertise: advertised,
+				ConfigURL: cfgURL, Socket: state.Paths.Socket, MaxLeaves: maxLeaves,
+				Rooms: rooms, Store: state.Store, LocalOnly: localOnly,
 			})
 			if err != nil {
 				return err
 			}
 			defer runtime.Close()
-			printServeBanner(runtime.ADNLID(), authority, listen, advertised)
+			printServeBanner(cmd.OutOrStdout(), runtime.ADNLID(), state, listen, advertised)
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 			if err := runtime.Run(ctx); err != nil && err != context.Canceled {
 				return err
 			}
-			fmt.Fprintln(os.Stderr, "node stopped")
+			fmt.Fprintln(cmd.ErrOrStderr(), "node stopped")
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&stateDir, "state", "", "authoritative room state directory")
+	cmd.Flags().StringVar(&stateDir, "state", "", "shared node state directory")
+	cmd.Flags().StringArrayVar(&sequencers, "sequencer", nil, "saved owned room public key (repeat for each room)")
+	cmd.Flags().StringArrayVar(&replicas, "replica", nil, "saved replica room public key (repeat for each room)")
 	cmd.Flags().StringVar(&listen, "listen", "0.0.0.0:17400", "TON QUIC UDP bind address ip:port")
 	cmd.Flags().StringVar(&advertise, "advertise", "", "public TON QUIC ip:port to publish (default: autodetect)")
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
@@ -88,17 +99,22 @@ func resolveAdvertise(ctx context.Context, advertise, listen string) (string, er
 	return net.JoinHostPort(ip.String(), port), nil
 }
 
-func printServeBanner(adnlID []byte, authority *roomstate.Authority, listen, advertise string) {
-	roomID, _ := community.RoomKeyText(authority.Genesis.RoomKey)
-	fmt.Printf("✓ identity   %s (ADNL %s)\n", authority.Paths.NodeKey, shortB64(base64.RawURLEncoding.EncodeToString(adnlID)))
+func printServeBanner(out io.Writer, adnlID []byte, state *roomstate.NodeState, listen, advertise string) {
+	fmt.Fprintf(out, "✓ identity   %s (ADNL %s)\n", state.Paths.NodeKey, shortB64(base64.RawURLEncoding.EncodeToString(adnlID)))
 	if advertise != "" {
-		fmt.Printf("✓ TON QUIC   %s (public %s)\n", listen, advertise)
+		fmt.Fprintf(out, "✓ TON QUIC   %s (public %s)\n", listen, advertise)
 	} else {
-		fmt.Printf("! TON QUIC   %s (no public address - pass --advertise)\n", listen)
+		fmt.Fprintf(out, "✓ TON QUIC   %s (local, no DHT publication)\n", listen)
 	}
-	fmt.Printf("✓ room       %s (%s)\n", authority.Genesis.Name, roomID)
-	fmt.Printf("✓ overlay    %s\n", base64.RawURLEncoding.EncodeToString(authority.OverlayID))
-	fmt.Printf("✓ database   %s\n", authority.Paths.Database)
-	fmt.Printf("✓ control    %s\n", authority.Paths.Socket)
-	fmt.Println("sequencer live · ctrl-C to stop · reads are public")
+	for _, r := range state.Rooms {
+		id, _ := community.RoomKeyText(r.Genesis.RoomKey)
+		role := "sequencer"
+		if r.Role == community.NodeRoleRelay {
+			role = "room replica"
+		}
+		fmt.Fprintf(out, "✓ room       %s (%s, %s)\n", r.Genesis.Name, id, role)
+		fmt.Fprintf(out, "✓ overlay    %s\n", base64.RawURLEncoding.EncodeToString(r.OverlayID))
+	}
+	fmt.Fprintf(out, "✓ database   %s\n✓ control    %s\n", state.Paths.Database, state.Paths.Socket)
+	fmt.Fprintln(out, "node live · ctrl-C to stop · reads are public")
 }
