@@ -70,7 +70,10 @@ func (n *Node) outboundReady(p *peer) bool {
 }
 
 func (n *Node) outboundTargets(exclude string, max int) []*peer {
-	candidates := n.peers.nodeTargets(exclude, 0)
+	return n.forRoom(n.room).outboundTargets(exclude, max)
+}
+
+func (n *Node) filterOutboundTargets(candidates []*peer, max int) []*peer {
 	targets := candidates[:0]
 	for _, p := range candidates {
 		if n.outboundReady(p) {
@@ -110,6 +113,7 @@ func (n *Node) dialNode(ctx context.Context, public ed25519.PublicKey, address s
 		n.peers.setSigned(id, nil)
 		if n.hasNodeOutbound(previous) && previous.outboundProbed {
 			if previous.outboundCaps.Load() != nil {
+				n.associateSingleRoom(previous)
 				return previous, nil
 			}
 			if previous.outboundError != nil {
@@ -148,6 +152,7 @@ func (n *Node) dialNode(ctx context.Context, public ed25519.PublicKey, address s
 		return nil, err
 	}
 	p.outboundCaps.Store(&capabilities)
+	n.associateSingleRoom(p)
 	return p, nil
 }
 

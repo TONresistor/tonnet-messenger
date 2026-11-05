@@ -19,6 +19,8 @@ const (
 )
 
 type outboundJob struct {
+	room  *roomContext
+	node  bool
 	items []tl.Serializable
 }
 
@@ -32,7 +34,9 @@ func (n *Node) wirePeer(p *peer) {
 	p.conn.SetQueryHandler(func(query *roomnet.Query) error { return n.answerQuery(p, query) })
 	p.conn.SetDisconnectHandler(func(_ string, _ ed25519.PublicKey) {
 		p.outboundCaps.Store(nil)
-		if n.peers.removePeer(id, p) {
+		removed := n.peers.removePeer(id, p)
+		n.cleanupRoomPeer(p)
+		if removed {
 			p.stopOnce.Do(func() { close(p.stop) })
 			log.Printf("peer left    %s… (%s)", short(id), n.countsString())
 		}
@@ -49,7 +53,7 @@ func (n *Node) outboundWriter(p *peer) {
 				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
 				var err error
 				p.outboundMu.RLock()
-				if n.peers.isNode(p) {
+				if job.node || n.forRoom(job.room).peers.isNode(p) {
 					err = p.useOutbound(func(conn *roomnet.Peer) error { return conn.SendOutboundMessage(ctx, item) })
 				} else {
 					err = p.conn.SendMessage(ctx, item)
@@ -69,13 +73,17 @@ func (n *Node) outboundWriter(p *peer) {
 }
 
 func (n *Node) enqueue(p *peer, items ...tl.Serializable) bool {
+	return n.enqueueRoom(n.room, p, items...)
+}
+
+func (n *Node) enqueueRoom(room *roomContext, p *peer, items ...tl.Serializable) bool {
 	if p == nil || p.conn == nil || len(items) == 0 {
 		return false
 	}
 	select {
 	case <-p.stop:
 		return false
-	case p.out <- outboundJob{items: items}:
+	case p.out <- outboundJob{room: room, node: n.forRoom(room).peers.isNode(p), items: items}:
 		return true
 	default:
 		n.stats.slowPeerDisconnects.Add(1)

@@ -18,7 +18,7 @@ import (
 
 const maxCommunityBatchWireSize = 8*1024 - 128
 
-func (n *Node) answerCommunityQuery(p *peer, query *roomnet.Query, now time.Time) (bool, error) {
+func (n *roomRuntime) answerCommunityQuery(p *peer, query *roomnet.Query, now time.Time) (bool, error) {
 	switch request := query.Data.(type) {
 	case community.GetRoomGenesis, *community.GetRoomGenesis:
 		return true, n.answer(p, query, n.room.genesis)
@@ -53,7 +53,7 @@ func (n *Node) answerCommunityQuery(p *peer, query *roomnet.Query, now time.Time
 	}
 }
 
-func (n *Node) communityStateResult(ctx context.Context, now time.Time) (community.RoomStateResult, error) {
+func (n *roomRuntime) communityStateResult(ctx context.Context, now time.Time) (community.RoomStateResult, error) {
 	if n.room.role == community.NodeRoleRelay {
 		n.room.replicaMu.Lock()
 		defer n.room.replicaMu.Unlock()
@@ -77,11 +77,11 @@ func (n *Node) communityStateResult(ctx context.Context, now time.Time) (communi
 	}}, nil
 }
 
-func (n *Node) requireReadIdentity(p *peer) bool {
-	return n.peers.isHealthyNode(p) || (p != nil && p.kind == kindLeaf && p.member && p.state == peerHealthy && p.conn != nil)
+func (n *roomRuntime) requireReadIdentity(p *peer) bool {
+	return n.peers.isHealthyNode(p) || n.peers.isMember(p)
 }
 
-func (n *Node) answerEvents(p *peer, query *roomnet.Query, request community.GetEvents, now time.Time) error {
+func (n *roomRuntime) answerEvents(p *peer, query *roomnet.Query, request community.GetEvents, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -92,7 +92,7 @@ func (n *Node) answerEvents(p *peer, query *roomnet.Query, request community.Get
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerRecent(p *peer, query *roomnet.Query, request community.GetMessagesRecent, now time.Time) error {
+func (n *roomRuntime) answerRecent(p *peer, query *roomnet.Query, request community.GetMessagesRecent, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -103,7 +103,7 @@ func (n *Node) answerRecent(p *peer, query *roomnet.Query, request community.Get
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerBefore(p *peer, query *roomnet.Query, request community.GetMessagesBefore, now time.Time) error {
+func (n *roomRuntime) answerBefore(p *peer, query *roomnet.Query, request community.GetMessagesBefore, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -114,7 +114,7 @@ func (n *Node) answerBefore(p *peer, query *roomnet.Query, request community.Get
 	return n.answer(p, query, result)
 }
 
-func (n *Node) answerSubmit(p *peer, query *roomnet.Query, request community.SubmitEvent, now time.Time) error {
+func (n *roomRuntime) answerSubmit(p *peer, query *roomnet.Query, request community.SubmitEvent, now time.Time) error {
 	if n.room.role != community.NodeRoleSequencer {
 		return n.forwardSubmit(p, query, request)
 	}
@@ -141,7 +141,7 @@ func (n *Node) answerSubmit(p *peer, query *roomnet.Query, request community.Sub
 	return n.answer(p, query, community.SubmitAccepted{Event: result.Event})
 }
 
-func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community.SubmitEvent) error {
+func (n *roomRuntime) forwardSubmit(leaf *peer, query *roomnet.Query, request community.SubmitEvent) error {
 	if !n.peers.acceptsAuthor(leaf, request.Proposal.AuthorKey) {
 		return n.answer(leaf, query, community.SubmitRejected{Code: community.RejectPermissionDenied, Message: "connection is not bound to author"})
 	}
@@ -188,7 +188,7 @@ func (n *Node) forwardSubmit(leaf *peer, query *roomnet.Query, request community
 	return n.answer(leaf, query, response)
 }
 
-func (n *Node) sequencerPeer() (*peer, bool) {
+func (n *roomRuntime) sequencerPeer() (*peer, bool) {
 	id, err := community.KeyID(n.room.genesis.NodeKey)
 	if err != nil {
 		return nil, false
@@ -200,7 +200,7 @@ func (n *Node) sequencerPeer() (*peer, bool) {
 	return peer, true
 }
 
-func (n *Node) persistReplicaEvent(source *peer, event community.CommittedEvent) error {
+func (n *roomRuntime) persistReplicaEvent(source *peer, event community.CommittedEvent) error {
 	n.room.replicaMu.Lock()
 	defer n.room.replicaMu.Unlock()
 	appended, err := n.room.store.AppendReplica(context.Background(), event)
@@ -231,7 +231,7 @@ func (n *Node) persistReplicaEvent(source *peer, event community.CommittedEvent)
 	return nil
 }
 
-func (n *Node) syncReplicaFromPeers(source *peer) error {
+func (n *roomRuntime) syncReplicaFromPeers(source *peer) error {
 	var failures []error
 	if source != nil && source.conn != nil && n.peers.isHealthyNode(source) {
 		if err := n.syncReplicaLocked(source); err == nil {
@@ -254,7 +254,7 @@ func (n *Node) syncReplicaFromPeers(source *peer) error {
 	return errors.Join(failures...)
 }
 
-func (n *Node) syncReplicaLocked(source *peer) error {
+func (n *roomRuntime) syncReplicaLocked(source *peer) error {
 	head, err := n.room.store.Head(context.Background())
 	if err != nil {
 		return err
@@ -290,7 +290,7 @@ func (n *Node) syncReplicaLocked(source *peer) error {
 	return n.installStateFromPeer(source)
 }
 
-func (n *Node) installStateFromPeer(source *peer) error {
+func (n *roomRuntime) installStateFromPeer(source *peer) error {
 	var result community.RoomStateResult
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	err := source.queryNodeRoom(ctx, n.room.genesis.RoomKey, community.GetRoomState{}, &result)
@@ -301,7 +301,7 @@ func (n *Node) installStateFromPeer(source *peer) error {
 	return n.room.store.InstallReplicaState(context.Background(), result.State)
 }
 
-func (n *Node) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, error) {
+func (n *roomRuntime) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, error) {
 	proposal, err := community.DecodeProposal(rawProposal)
 	if err != nil {
 		return community.Encode(community.SubmitRejected{Code: community.RejectMalformedRequest, Message: "malformed proposal"})
@@ -323,7 +323,7 @@ func (n *Node) submitLocal(ctx context.Context, rawProposal []byte) ([]byte, err
 	return community.Encode(community.SubmitAccepted{Event: result.Event})
 }
 
-func (n *Node) commitProposal(ctx context.Context, proposal community.EventProposal, now time.Time) (store.CommitResult, error) {
+func (n *roomRuntime) commitProposal(ctx context.Context, proposal community.EventProposal, now time.Time) (store.CommitResult, error) {
 	eventID, err := proposal.ID()
 	if err != nil {
 		return store.CommitResult{}, &store.Rejection{Code: community.RejectMalformedRequest, Message: "malformed proposal", Err: err}
@@ -361,7 +361,7 @@ func (n *Node) commitProposal(ctx context.Context, proposal community.EventPropo
 	return n.room.store.Commit(ctx, proposal, n.room.roomKey, now)
 }
 
-func (n *Node) answerBatch(p *peer, query *roomnet.Query, request community.Batch, now time.Time) error {
+func (n *roomRuntime) answerBatch(p *peer, query *roomnet.Query, request community.Batch, now time.Time) error {
 	if !n.requireReadIdentity(p) {
 		return nil
 	}
@@ -392,7 +392,7 @@ func setBatchItem(items []community.BatchItem, index int, candidate community.Ba
 	return false
 }
 
-func (n *Node) batchItem(raw []byte, now time.Time) community.BatchItem {
+func (n *roomRuntime) batchItem(raw []byte, now time.Time) community.BatchItem {
 	var request any
 	rest, err := tl.Parse(&request, raw, true)
 	if err != nil || len(rest) != 0 {
@@ -429,7 +429,7 @@ func (n *Node) batchItem(raw []byte, now time.Time) community.BatchItem {
 	return community.BatchItem{Data: encoded}
 }
 
-func (n *Node) broadcastCommitted(event community.CommittedEvent, now time.Time) error {
+func (n *roomRuntime) broadcastCommitted(event community.CommittedEvent, now time.Time) error {
 	raw, err := community.Encode(event)
 	if err != nil {
 		return err
@@ -450,7 +450,7 @@ func (n *Node) broadcastCommitted(event community.CommittedEvent, now time.Time)
 	return nil
 }
 
-func (n *Node) handleCommunityMessage(p *peer, data tl.Serializable, now time.Time) {
+func (n *roomRuntime) handleCommunityMessage(p *peer, data tl.Serializable, now time.Time) {
 	if p == nil || n.penalties.banned(p.id, now) {
 		return
 	}
@@ -562,7 +562,7 @@ func stateChangingBody(body any) bool {
 	}
 }
 
-func (n *Node) communityDirectTargets(fromID string, direct community.DirectMessage) []*peer {
+func (n *roomRuntime) communityDirectTargets(fromID string, direct community.DirectMessage) []*peer {
 	targets := n.outboundTargets(fromID, nodeFanout)
 	targets = append(targets, n.peers.identityLeaves(direct.ToKey, fromID)...)
 	seen := make(map[string]struct{}, len(targets))

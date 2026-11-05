@@ -131,7 +131,7 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 		if err != nil {
 			continue
 		}
-		n.peers.setSigned(idHex, &signed)
+		n.forRoom(n.room).peers.setNode(p, &signed)
 		if nodes, ok := n.probeNode(ctx, p); ok {
 			for i := range capNodes(nodes) {
 				nd := nodes[i]
@@ -146,31 +146,36 @@ func (n *Node) considerNode(ctx context.Context, nd *tonoverlay.Node) {
 
 func (n *Node) alreadyMeshed(idHex string, signed *tonoverlay.Node) bool {
 	if p, ok := n.peers.get(idHex); ok {
-		n.peers.setSigned(idHex, signed)
+		n.forRoom(n.room).peers.setNode(p, signed)
 		return n.outboundReady(p)
 	}
 	return false
 }
 
-func (n *Node) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool) {
+func (n *roomRuntime) probeNode(ctx context.Context, p *peer) ([]tonoverlay.Node, bool) {
 	if p == nil || p.conn == nil {
 		return nil, false
 	}
 	gctx, cancel := context.WithTimeout(ctx, peerKeepaliveTimeout)
 	defer cancel()
 	var result tonoverlay.NodesList
-	err := p.queryNodeRoom(gctx, n.room.genesis.RoomKey, tonoverlay.GetRandomPeers{}, &result)
+	self, err := n.selfOverlayNode()
+	if err != nil {
+		return nil, false
+	}
+	err = p.queryNodeRoom(gctx, n.room.genesis.RoomKey, tonoverlay.GetRandomPeers{List: tonoverlay.NodesList{List: []tonoverlay.Node{self}}}, &result)
 	if err != nil {
 		if !errors.Is(err, errOutboundUnprobed) {
 			n.peerFailure(p, time.Now(), "peer probe failed")
 		}
 		return nil, false
 	}
-	n.peers.markNodeGood(p.id, time.Now())
+	n.Node.peers.markNodeGood(p.id, time.Now())
+	n.observeRoomNode(p, result.List)
 	return result.List, true
 }
 
-func (n *Node) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
+func (n *roomRuntime) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
 	if !bytes.Equal(nd.Overlay, n.room.overlayID) {
 		return nil, nil, fmt.Errorf("node advertises a different overlay")
 	}
@@ -213,41 +218,55 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		n.stats.queryRateDrops.Add(1)
 		return nil
 	}
-	selected, err := q.SelectOverlay(n.room.overlayID)
+	switch q.Data.(type) {
+	case broadcast.GetTime, *broadcast.GetTime:
+		return n.answer(p, q, broadcast.Time{Now: int32(now.Unix())})
+	}
+	var id []byte
+	switch wrapper := q.Data.(type) {
+	case community.OverlayQueryV1:
+		id = wrapper.Overlay
+	case *community.OverlayQueryV1:
+		id = wrapper.Overlay
+	default:
+		return roomnet.ErrNoAnswer
+	}
+	room := n.byOverlay[string(id)]
+	if room == nil && n.byOverlay == nil && n.room != nil && bytes.Equal(id, n.room.overlayID) {
+		room = n.room
+	}
+	if room == nil {
+		return q.Answer(community.OverlayRejectedV1{Code: community.RejectOverlayNotServed, Message: "overlay not served"})
+	}
+	selected, err := q.SelectOverlay(room.overlayID)
 	if err != nil || !selected {
 		return err
 	}
+	r := n.forRoom(room)
 	var advertised tonoverlay.NodesList
-	switch req := q.Data.(type) {
+	switch request := q.Data.(type) {
 	case tonoverlay.GetRandomPeers:
-		advertised = req.List
+		advertised = request.List
 	case *tonoverlay.GetRandomPeers:
-		advertised = req.List
-	case broadcast.GetTime, *broadcast.GetTime:
-		return n.answer(p, q, broadcast.Time{Now: int32(time.Now().Unix())})
+		advertised = request.List
 	default:
-		acceptedPeer, _, accepted := n.peers.acceptInbound(p, now)
-		if !accepted {
+		accepted, _, ok := r.peers.acceptInbound(p, now)
+		if !ok {
 			return nil
 		}
-		p = acceptedPeer
-		handled, err := n.answerCommunityQuery(p, q, now)
-		if handled {
-			return err
-		}
-		return nil
-	}
-	n.peers.markSeen(p.id, now)
-
-	if err := q.Answer(n.myNodesList()); err != nil {
-		n.peerFailure(p, time.Now(), "answer getRandomPeers failed")
+		_, err := r.answerCommunityQuery(accepted, q, now)
 		return err
 	}
-	n.peers.markNodeGood(p.id, time.Now())
-
+	n.peers.markSeen(p.id, now)
+	if err := q.Answer(r.myNodesList()); err != nil {
+		return err
+	}
+	n.peers.markNodeGood(p.id, now)
 	for i := range capNodes(advertised.List) {
 		nd := advertised.List[i]
-		go n.considerNode(context.Background(), &nd)
+		if len(n.roomList()) == 1 {
+			go n.considerNode(context.Background(), &nd)
+		}
 	}
 	return nil
 }
@@ -261,7 +280,7 @@ func (n *Node) answer(p *peer, q *roomnet.Query, resp tl.Serializable) error {
 	return nil
 }
 
-func (n *Node) myNodesList() tonoverlay.NodesList {
+func (n *roomRuntime) myNodesList() tonoverlay.NodesList {
 	list := make([]tonoverlay.Node, 0, 8)
 	if self, err := n.selfOverlayNode(); err == nil {
 		list = append(list, self)
@@ -275,7 +294,7 @@ func (n *Node) myNodesList() tonoverlay.NodesList {
 	return tonoverlay.NodesList{List: list}
 }
 
-func (n *Node) selfOverlayNode() (tonoverlay.Node, error) {
+func (n *roomRuntime) selfOverlayNode() (tonoverlay.Node, error) {
 	nd := tonoverlay.Node{
 		ID:      keys.PublicKeyED25519{Key: n.cfg.Key.Public().(ed25519.PublicKey)},
 		Overlay: n.room.overlayID,

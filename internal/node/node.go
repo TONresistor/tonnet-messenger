@@ -38,7 +38,14 @@ const replicaReconcileEach = 30 * time.Second
 
 type IdentityResolver func(context.Context, string) ([]byte, error)
 
+type RoomConfig struct {
+	Genesis  *community.Genesis
+	RoomKey  ed25519.PrivateKey
+	NodeRole int32
+}
+
 type Config struct {
+	Rooms           []RoomConfig
 	Key             ed25519.PrivateKey
 	Listen          string
 	Advertise       string
@@ -81,6 +88,9 @@ type Node struct {
 	dialSem         chan struct{}
 	myID            string
 	started         time.Time
+	rooms           []*roomContext
+	byOverlay       map[string]*roomContext
+	byRoom          map[string]*roomContext
 	room            *roomContext
 	database        *store.Store
 	nodeDialsMu     sync.Mutex
@@ -113,7 +123,7 @@ func (c *readyPacketConn) ReadBatch(messages []ipv4.Message, flags int) (int, er
 }
 
 func New(cfg Config) (*Node, error) {
-	room, err := newRoomContext(context.Background(), cfg)
+	rooms, err := configuredRooms(context.Background(), cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -123,6 +133,7 @@ func New(cfg Config) (*Node, error) {
 	cfg.Key = bytes.Clone(cfg.Key)
 	cfg.Genesis, cfg.Store, cfg.RoomKey, cfg.OverlayID = nil, nil, nil, nil
 	cfg.NodeRole = 0
+	cfg.Rooms = nil
 	if cfg.MaxLeaves == 0 {
 		cfg.MaxLeaves = DefaultMaxLeaves
 	}
@@ -151,8 +162,15 @@ func New(cfg Config) (*Node, error) {
 		dialSem:   make(chan struct{}, maxConcurrentDials),
 		myID:      hex.EncodeToString(qgw.ID()),
 		started:   time.Now(),
-		room:      room,
+		room:      rooms[0],
+		rooms:     rooms,
+		byOverlay: make(map[string]*roomContext),
+		byRoom:    make(map[string]*roomContext),
 		database:  database,
+	}
+	for _, room := range rooms {
+		n.byOverlay[string(room.overlayID)] = room
+		n.byRoom[string(room.genesis.RoomKey)] = room
 	}
 	if cfg.ResolveIdentity != nil {
 		n.resolveIdentity = cfg.ResolveIdentity
@@ -213,7 +231,7 @@ func listenQUIC(listen string) (*readyPacketConn, error) {
 	return &readyPacketConn{UDPConn: conn, ready: make(chan struct{}), batch: ipv4.NewPacketConn(conn)}, nil
 }
 
-func (n *Node) verifyIdentityDomain(ctx context.Context, domain string, key []byte, now time.Time) error {
+func (n *roomRuntime) verifyIdentityDomain(ctx context.Context, domain string, key []byte, now time.Time) error {
 	if domain == "" {
 		return nil
 	}
@@ -245,6 +263,9 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 	}
 	if replaced != nil {
 		closePeerConnection(replaced)
+	}
+	if len(n.roomList()) == 1 && n.peers.isNode(p) {
+		n.forRoom(n.room).peers.setNode(p, nil)
 	}
 	if added {
 		n.wirePeer(p)
@@ -284,19 +305,9 @@ func (n *Node) countsString() string {
 }
 
 func (n *Node) Status() control.Status {
-	members, nodes := n.peers.counts()
-	roomName := n.room.genesis.Name
-	roomID, _ := community.RoomKeyText(n.room.genesis.RoomKey)
-	var seqno int64
-	ready := true
-	if state, err := n.room.store.State(context.Background()); err == nil {
-		roomName = state.Name
-	}
-	if head, err := n.room.store.Head(context.Background()); err == nil {
-		seqno = head.Seqno
-	}
-	if n.room.role == community.NodeRoleRelay {
-		ready = n.room.store.ReplicaReady(context.Background()) == nil
+	var rooms []control.RoomStatus
+	for _, room := range n.roomList() {
+		rooms = append(rooms, n.forRoom(room).status())
 	}
 	return control.Status{
 		ADNLID:    base64.StdEncoding.EncodeToString(n.qgw.ID()),
@@ -320,24 +331,18 @@ func (n *Node) Status() control.Status {
 			SlowPeerDisconnects: n.stats.slowPeerDisconnects.Load(),
 			ReplayedItems:       n.stats.replayedItems.Load(),
 		},
-		Rooms: []control.RoomStatus{{
-			RoomID:     roomID,
-			Name:       roomName,
-			OverlayID:  base64.StdEncoding.EncodeToString(n.room.overlayID),
-			Members:    members,
-			Neighbours: nodes,
-			Seqno:      seqno,
-			NodeRole:   n.room.role,
-			Ready:      ready,
-		}},
+		Rooms: rooms,
 	}
 }
 
 func (n *Node) Run(ctx context.Context) error {
+	if len(n.roomList()) > 1 && !n.cfg.LocalOnly {
+		return errors.New("public multi-room runtime is not supported yet")
+	}
 	if !n.cfg.LocalOnly && n.cfg.Advertise == "" {
 		return errors.New("public TON QUIC advertise address is required")
 	}
-	if n.room.role == community.NodeRoleSequencer {
+	if n.hasSequencerRoom() {
 		ready := make(chan struct{})
 		serveErr := make(chan error, 1)
 		go func() {
@@ -416,13 +421,24 @@ func (n *Node) replicaReconcileLoop(ctx context.Context) {
 }
 
 func (n *Node) reconcileReplicaOnce() error {
-	sequencer, ok := n.sequencerPeer()
-	if !ok {
-		return nil
+	var failures []error
+	for _, room := range n.roomList() {
+		r := n.forRoom(room)
+		if room.role != community.NodeRoleRelay {
+			continue
+		}
+		sequencer, ok := r.sequencerPeer()
+		if !ok {
+			continue
+		}
+		room.replicaMu.Lock()
+		err := r.syncReplicaLocked(sequencer)
+		room.replicaMu.Unlock()
+		if err != nil {
+			failures = append(failures, err)
+		}
 	}
-	n.room.replicaMu.Lock()
-	defer n.room.replicaMu.Unlock()
-	return n.syncReplicaLocked(sequencer)
+	return errors.Join(failures...)
 }
 
 func (n *Node) databaseMaintenanceLoop(ctx context.Context) {

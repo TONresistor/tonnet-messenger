@@ -142,6 +142,10 @@ func (t *peerTable) acceptInbound(p *peer, now time.Time) (*peer, bool, bool) {
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.acceptInboundLocked(p, now)
+}
+
+func (t *peerTable) acceptInboundLocked(p *peer, now time.Time) (*peer, bool, bool) {
 	existing, ok := t.m[p.id]
 	if !ok || existing != p {
 		return nil, false, false
@@ -246,6 +250,10 @@ func (t *peerTable) markKnownLocked(id string) {
 func (t *peerTable) setSigned(id string, signed *tonoverlay.Node) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	return t.setSignedLocked(id, signed)
+}
+
+func (t *peerTable) setSignedLocked(id string, signed *tonoverlay.Node) bool {
 	t.markKnownLocked(id)
 	p, ok := t.m[id]
 	if !ok {

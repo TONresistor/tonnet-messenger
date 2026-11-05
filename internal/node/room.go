@@ -18,7 +18,7 @@ import (
 // roomContext owns one room's authority and verified data. The selected store
 // is a borrowed ForRoom view; the caller still owns the shared database.
 // Connection identity, outbound capability lifetimes and transport limits stay
-// on Node. This unit still binds exactly one context to the network runtime.
+// on Node. The runtime selects a context per request.
 type roomContext struct {
 	genesis   community.Genesis
 	overlayID []byte
@@ -26,11 +26,13 @@ type roomContext struct {
 	roomKey   ed25519.PrivateKey
 	role      int32
 
-	replicaMu   sync.Mutex
-	dedup       *ov.Dedup
-	domainMu    sync.Mutex
-	domainCache map[string]identityDomainCache
-	pub         atomic.Pointer[dht.Publisher]
+	replicaMu    sync.Mutex
+	dedup        *ov.Dedup
+	domainMu     sync.Mutex
+	domainCache  map[string]identityDomainCache
+	pub          atomic.Pointer[dht.Publisher]
+	peersMu      sync.RWMutex
+	associations map[*peer]roomAssociation
 }
 
 type identityDomainCache struct {
@@ -39,6 +41,19 @@ type identityDomainCache struct {
 }
 
 func newRoomContext(ctx context.Context, cfg Config) (*roomContext, error) {
+	r, err := bindRoomContext(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if r.role == community.NodeRoleSequencer {
+		if err := r.store.UpgradeRoomState(ctx, r.roomKey); err != nil {
+			return nil, fmt.Errorf("sequencer signed state upgrade: %w", err)
+		}
+	}
+	return r, nil
+}
+
+func bindRoomContext(ctx context.Context, cfg Config) (*roomContext, error) {
 	if cfg.Genesis == nil || cfg.Store == nil {
 		return nil, fmt.Errorf("persistent room genesis and store are required")
 	}
@@ -83,12 +98,8 @@ func newRoomContext(ctx context.Context, cfg Config) (*roomContext, error) {
 	if err := selected.ValidateGenesis(ctx, genesis); err != nil {
 		return nil, err
 	}
-	if role == community.NodeRoleSequencer {
-		if err := selected.UpgradeRoomState(ctx, key); err != nil {
-			return nil, fmt.Errorf("sequencer signed state upgrade: %w", err)
-		}
-	}
-	return &roomContext{genesis: genesis, overlayID: overlayID, store: selected, roomKey: key, role: role, dedup: ov.NewDedup(deliveredCap), domainCache: make(map[string]identityDomainCache)}, nil
+
+	return &roomContext{genesis: genesis, overlayID: overlayID, store: selected, roomKey: key, role: role, dedup: ov.NewDedup(deliveredCap), domainCache: make(map[string]identityDomainCache), associations: make(map[*peer]roomAssociation)}, nil
 }
 
 func cloneRoomGenesis(g community.Genesis) community.Genesis {
