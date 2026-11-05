@@ -23,6 +23,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/control"
 	"github.com/TONresistor/tonnet-messenger/internal/dht"
+	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	"github.com/TONresistor/tonnet-messenger/internal/tondns"
@@ -104,7 +105,10 @@ type Node struct {
 	closed          bool
 	closeOnce       sync.Once
 	closeErr        error
-	newPublishers   func(context.Context) ([]roomPublisher, func(), error)
+	newPublishers   func(context.Context) ([]roomPublisher, roomPublisher, func(), error)
+
+	resolveRoomAlias func(context.Context, string) ([]byte, error)
+	catalog          *roomCatalog
 }
 
 type readyPacketConn struct {
@@ -181,6 +185,18 @@ func New(cfg Config) (*Node, error) {
 		n.byRoom[string(room.genesis.RoomKey)] = room
 	}
 	n.ctx, n.cancel = context.WithCancel(context.Background())
+	n.resolveRoomAlias = func(ctx context.Context, alias string) ([]byte, error) {
+		return tondns.ResolveRoom(ctx, cfg.ConfigURL, alias)
+	}
+	if n.hasSequencerRoom() {
+		n.catalog, err = newRoomCatalog(n)
+		if err != nil {
+			n.cancel()
+			qgw.Close()
+			gw.Close()
+			return nil, err
+		}
+	}
 	if cfg.ResolveIdentity != nil {
 		n.resolveIdentity = cfg.ResolveIdentity
 	} else {
@@ -276,9 +292,6 @@ func (n *Node) onInbound(peer *roomnet.Peer) error {
 	}
 	if replaced != nil {
 		closePeerConnection(replaced)
-	}
-	if len(n.roomList()) == 1 && n.peers.isNode(p) {
-		n.forRoom(n.room).peers.setNode(p, nil)
 	}
 	if added {
 		n.wirePeer(p)
@@ -415,7 +428,7 @@ func (n *Node) Run(ctx context.Context) error {
 		if create == nil {
 			create = n.createPublishers
 		}
-		pubs, closePublishers, err := create(ctx)
+		pubs, catalogPub, closePublishers, err := create(ctx)
 		if err != nil {
 			return fmt.Errorf("dht publisher: %w", err)
 		}
@@ -429,6 +442,9 @@ func (n *Node) Run(ctx context.Context) error {
 			for _, r := range n.roomList() {
 				r.pub.Store(nil)
 			}
+			if n.catalog != nil {
+				n.catalog.pub.Store(nil)
+			}
 		}()
 		if len(pubs) != len(n.roomList()) {
 			return errors.New("missing room publisher")
@@ -440,6 +456,16 @@ func (n *Node) Run(ctx context.Context) error {
 			start(func() { pub.Run(ctx) })
 			start(func() { r.discoveryLoop(ctx) })
 		}
+		if n.catalog != nil {
+			if catalogPub == nil {
+				return errors.New("missing public-rooms publisher")
+			}
+			n.catalog.pub.Store(&roomPublication{catalogPub})
+			start(func() { catalogPub.Run(ctx) })
+		}
+	}
+	if n.catalog != nil {
+		start(func() { n.catalog.run(ctx) })
 	}
 	start(func() { n.databaseMaintenanceLoop(ctx) })
 	start(func() { n.peerMaintenanceLoop(ctx) })
@@ -461,17 +487,21 @@ func (n *Node) Run(ctx context.Context) error {
 	}
 }
 
-func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, func(), error) {
+func (n *Node) createPublishers(ctx context.Context) ([]roomPublisher, roomPublisher, func(), error) {
 	rooms := n.roomList()
 	owner, err := dht.NewPublisher(ctx, n.gw, n.cfg.ConfigURL, n.cfg.Key, rooms[0].genesis.RoomKey, rooms[0].overlayID)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	pubs := make([]roomPublisher, len(rooms))
 	for i, room := range rooms {
 		pubs[i] = owner.ForRoom(room.genesis.RoomKey, room.overlayID)
 	}
-	return pubs, owner.Close, nil
+	var catalog roomPublisher
+	if n.catalog != nil {
+		catalog = owner.ForRoom([]byte(ov.PublicRooms), n.catalog.id)
+	}
+	return pubs, catalog, owner.Close, nil
 }
 
 func (n *roomRuntime) replicaReconcileLoop(ctx context.Context) {

@@ -218,13 +218,17 @@ func (n *roomRuntime) queueNodes(nodes []tonoverlay.Node) {
 }
 
 func (n *roomRuntime) verifyNode(nd *tonoverlay.Node) ([]byte, ed25519.PublicKey, error) {
-	if !bytes.Equal(nd.Overlay, n.room.overlayID) {
+	return verifyOverlayNode(nd, n.room.overlayID, time.Now())
+}
+
+func verifyOverlayNode(nd *tonoverlay.Node, id []byte, at time.Time) ([]byte, ed25519.PublicKey, error) {
+	if !bytes.Equal(nd.Overlay, id) {
 		return nil, nil, fmt.Errorf("node advertises a different overlay")
 	}
 	if err := nd.CheckSignature(); err != nil {
 		return nil, nil, fmt.Errorf("bad node signature: %w", err)
 	}
-	now := time.Now().Unix()
+	now := at.Unix()
 	if age := now - int64(nd.Version); age > int64(nodeMaxAge.Seconds()) {
 		return nil, nil, fmt.Errorf("stale node: age=%ds", age)
 	}
@@ -263,6 +267,8 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 	switch q.Data.(type) {
 	case broadcast.GetTime, *broadcast.GetTime:
 		return n.answer(p, q, broadcast.Time{Now: int32(now.Unix())})
+	case community.GetRoomCardsV1, *community.GetRoomCardsV1:
+		return n.answerRoomCards(q, now)
 	}
 	var id []byte
 	switch wrapper := q.Data.(type) {
@@ -272,6 +278,9 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		id = wrapper.Overlay
 	default:
 		return roomnet.ErrNoAnswer
+	}
+	if n.catalog != nil && bytes.Equal(id, n.catalog.id) {
+		return n.catalog.answerPeers(q)
 	}
 	room := n.byOverlay[string(id)]
 	if room == nil && n.byOverlay == nil && n.room != nil && bytes.Equal(id, n.room.overlayID) {
@@ -332,9 +341,13 @@ func (n *roomRuntime) myNodesList() tonoverlay.NodesList {
 }
 
 func (n *roomRuntime) selfOverlayNode() (tonoverlay.Node, error) {
+	return n.signedOverlayNode(n.room.overlayID)
+}
+
+func (n *Node) signedOverlayNode(id []byte) (tonoverlay.Node, error) {
 	nd := tonoverlay.Node{
 		ID:      keys.PublicKeyED25519{Key: n.cfg.Key.Public().(ed25519.PublicKey)},
-		Overlay: n.room.overlayID,
+		Overlay: id,
 		Version: int32(time.Now().Unix()),
 	}
 	if err := nd.Sign(n.cfg.Key); err != nil {

@@ -6,6 +6,9 @@ import (
 )
 
 const DefaultRoom = "tonnet:groupchat:v1"
+const PublicRooms = "tonnet-public-rooms-v1"
+
+func PublicRoomsID() ([]byte, error) { return ID(PublicRooms) }
 
 func ID(room string) ([]byte, error) {
 	return tl.Hash(keys.PublicKeyOverlay{Key: []byte(room)})

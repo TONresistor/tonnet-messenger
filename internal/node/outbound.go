@@ -92,6 +92,14 @@ func (n *Node) filterOutboundTargets(candidates []*peer, max int) []*peer {
 // each strict-outbound operation, so replacement cannot reuse old capabilities
 // or race a probe that would later authorize its new connection.
 func (n *Node) dialNode(ctx context.Context, public ed25519.PublicKey, address string) (*peer, error) {
+	return n.dialNodeTarget(ctx, public, address, true)
+}
+
+func (n *Node) dialCatalogNode(ctx context.Context, public ed25519.PublicKey, address string) (*peer, error) {
+	return n.dialNodeTarget(ctx, public, address, false)
+}
+
+func (n *Node) dialNodeTarget(ctx context.Context, public ed25519.PublicKey, address string, roomScoped bool) (*peer, error) {
 	key, err := community.KeyID(public)
 	if err != nil {
 		return nil, err
@@ -113,7 +121,9 @@ func (n *Node) dialNode(ctx context.Context, public ed25519.PublicKey, address s
 		n.peers.setSigned(id, nil)
 		if n.hasNodeOutbound(previous) && previous.outboundProbed {
 			if previous.outboundCaps.Load() != nil {
-				n.associateSingleRoom(previous)
+				if roomScoped {
+					n.associateSingleRoom(previous)
+				}
 				return previous, nil
 			}
 			if previous.outboundError != nil {
@@ -152,7 +162,9 @@ func (n *Node) dialNode(ctx context.Context, public ed25519.PublicKey, address s
 		return nil, err
 	}
 	p.outboundCaps.Store(&capabilities)
-	n.associateSingleRoom(p)
+	if roomScoped {
+		n.associateSingleRoom(p)
+	}
 	return p, nil
 }
 

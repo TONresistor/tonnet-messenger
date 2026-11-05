@@ -12,6 +12,7 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/control"
+	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
@@ -57,13 +58,20 @@ func fakePublicRooms(n *Node) ([]*fakeRoomPublisher, *atomic.Int32, *atomic.Bool
 		pubs[i] = &fakeRoomPublisher{room: r.genesis.RoomKey, started: make(chan struct{}), stopped: make(chan struct{})}
 	}
 	closed, premature := &atomic.Int32{}, &atomic.Bool{}
-	n.newPublishers = func(context.Context) ([]roomPublisher, func(), error) {
+	n.newPublishers = func(context.Context) ([]roomPublisher, roomPublisher, func(), error) {
 		out := make([]roomPublisher, len(pubs))
 		for i, p := range pubs {
 			out[i] = p
 		}
-		return out, func() {
-			for _, p := range pubs {
+		all := append([]*fakeRoomPublisher(nil), pubs...)
+		var global roomPublisher
+		if n.catalog != nil {
+			p := &fakeRoomPublisher{room: []byte(ov.PublicRooms), started: make(chan struct{}), stopped: make(chan struct{})}
+			global = p
+			all = append(all, p)
+		}
+		return out, global, func() {
+			for _, p := range all {
 				select {
 				case <-p.stopped:
 				default:
@@ -347,8 +355,8 @@ func TestRoomGossipBoundsAndPublicationStartupFailure(t *testing.T) {
 	}
 	// No real DHT request is needed to prove that initialization failure tears
 	// down the already-started single control service.
-	n.newPublishers = func(context.Context) ([]roomPublisher, func(), error) {
-		return nil, nil, errors.New("DHT initialization failed")
+	n.newPublishers = func(context.Context) ([]roomPublisher, roomPublisher, func(), error) {
+		return nil, nil, nil, errors.New("DHT initialization failed")
 	}
 	if err := n.Run(context.Background()); err == nil {
 		t.Fatal("failed DHT startup was accepted")

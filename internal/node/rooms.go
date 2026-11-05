@@ -103,6 +103,9 @@ func (n *Node) cleanupRoomPeer(p *peer) {
 		delete(r.associations, p)
 		r.peersMu.Unlock()
 	}
+	if n.catalog != nil {
+		n.catalog.forgetPeer(p)
+	}
 }
 func (n *Node) associateSingleRoom(p *peer) {
 	if len(n.roomList()) == 1 {

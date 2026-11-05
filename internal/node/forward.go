@@ -53,7 +53,7 @@ func (n *Node) outboundWriter(p *peer) {
 				ctx, cancel := context.WithTimeout(context.Background(), relayTimeout)
 				var err error
 				p.outboundMu.RLock()
-				if job.node || n.forRoom(job.room).peers.isNode(p) {
+				if job.node || n.peers.isNode(p) {
 					err = p.useOutbound(func(conn *roomnet.Peer) error { return conn.SendOutboundMessage(ctx, item) })
 				} else {
 					err = p.conn.SendMessage(ctx, item)
@@ -83,7 +83,7 @@ func (n *Node) enqueueRoom(room *roomContext, p *peer, items ...tl.Serializable)
 	select {
 	case <-p.stop:
 		return false
-	case p.out <- outboundJob{room: room, node: n.forRoom(room).peers.isNode(p), items: items}:
+	case p.out <- outboundJob{room: room, node: n.peers.isNode(p), items: items}:
 		return true
 	default:
 		n.stats.slowPeerDisconnects.Add(1)

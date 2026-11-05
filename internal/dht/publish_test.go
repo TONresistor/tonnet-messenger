@@ -1,6 +1,7 @@
 package dht
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -8,6 +9,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	ov "github.com/TONresistor/tonnet-messenger/internal/overlay"
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
@@ -285,5 +288,26 @@ func TestSharedDHTPublishesDistinctRoomsAfterAddressVerification(t *testing.T) {
 				t.Fatal("failed address verification published an overlay")
 			}
 		})
+	}
+}
+
+func TestPublicRoomsPublisherUsesGlobalNameAndSharedIdentity(t *testing.T) {
+	list := address.List{Addresses: []address.Address{quicAddr("1.1.1.1", 17400)}}
+	f := &publicationDHT{fakeDHT: fakeDHT{storeAddrN: 1, findAddr: &list, storeOverN: 1}}
+	owner := testPublisher(t, f)
+	owner.gw.SetAddressList(list.Addresses)
+	id, err := ov.PublicRoomsID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	global := owner.ForRoom([]byte(ov.PublicRooms), id)
+	if addr, overlayOK := global.publish(context.Background()); !addr || !overlayOK {
+		t.Fatal("global publication failed")
+	}
+	if len(f.rooms) != 1 || string(f.rooms[0]) != ov.PublicRooms || !bytes.Equal(f.nodes[0].Overlay, id) || f.nodes[0].CheckSignature() != nil || !f.nodes[0].ID.(keys.PublicKeyED25519).Key.Equal(owner.key.Public()) {
+		t.Fatal("global publication used a room or another identity")
+	}
+	if len(f.order) != 2 || f.order[0] != "address" || f.order[1] != "overlay" {
+		t.Fatal("global overlay preceded verified address publication")
 	}
 }
