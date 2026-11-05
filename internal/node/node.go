@@ -253,7 +253,10 @@ func New(cfg Config) (*Node, error) {
 			pctx, cancel := context.WithTimeout(n.ctx, 30*time.Second)
 			n.payments, err = payments.New(pctx, n.database, cfg.Key.Public().(ed25519.PublicKey), *cfg.DM.Payments)
 			cancel()
-			if err != nil { n.Close(); return nil, err }
+			if err != nil {
+				n.Close()
+				return nil, err
+			}
 			n.cfg.DM.Limits.PaidOffers = n.payments.Offers()
 		}
 		n.relays, err = newRelayDirectory(n)
@@ -371,7 +374,9 @@ func (n *Node) Close() error {
 			<-done
 		}
 		quicErr := n.qgw.Close()
-		if n.payments != nil { n.payments.Close() }
+		if n.payments != nil {
+			n.payments.Close()
+		}
 		if n.inbox != nil {
 			n.inbox.close()
 		}
@@ -526,7 +531,9 @@ func (n *Node) Run(ctx context.Context) error {
 		start(func() { n.holders.run(ctx) })
 	}
 	start(func() { n.databaseMaintenanceLoop(ctx) })
-	if n.payments != nil { start(func() { n.paymentMaintenanceLoop(ctx) }) }
+	if n.payments != nil {
+		start(func() { n.paymentMaintenanceLoop(ctx) })
+	}
 	start(func() { n.peerMaintenanceLoop(ctx) })
 	for _, room := range n.roomList() {
 		if room.role == community.NodeRoleRelay {

@@ -150,7 +150,9 @@ CREATE TABLE IF NOT EXISTS pending_inbox_acks (
 `); err != nil {
 		return fmt.Errorf("client store migration: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, payerSchema); err != nil { return err }
+	if _, err := tx.ExecContext(ctx, payerSchema); err != nil {
+		return err
+	}
 	if version < clientSchemaVersion {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO client_meta(key,value) VALUES ('schema_version',?)
 ON CONFLICT(key) DO UPDATE SET value=excluded.value`, strconv.Itoa(clientSchemaVersion)); err != nil {

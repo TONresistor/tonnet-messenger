@@ -34,12 +34,14 @@ func (c DMConfig) validate() error {
 	if len(c.Limits.PaidOffers) != 0 {
 		return errors.New("paid offers must be configured through the receiving payment backend")
 	}
-	if c.Payments != nil { return c.Payments.Validate() }
+	if c.Payments != nil {
+		return c.Payments.Validate()
+	}
 	return nil
 }
 
 // Validate is shared by operator flags and runtime construction.
-func(c DMConfig)Validate()error{return c.validate()}
+func (c DMConfig) Validate() error { return c.validate() }
 
 type inboxConnection struct {
 	peer         *peer

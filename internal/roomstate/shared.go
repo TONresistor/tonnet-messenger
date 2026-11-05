@@ -45,18 +45,28 @@ func (n *NodeState) Close() error { return n.Store.Close() }
 
 // OpenNode opens only the node identity and shared database. Existing room
 // artifacts remain unselected and their private authority is never loaded.
-func OpenNode(ctx context.Context,dir string)(*NodeState,error){
-	paths,key,err:=LoadOrCreateRelayKey(dir)
-	if err!=nil{return nil,err}
-	if err:=regularFile(paths.Database);err!=nil{
-		if !errors.Is(err,os.ErrNotExist){return nil,err}
-		for _,artifact:=range []string{paths.RoomKey,paths.Genesis,filepath.Join(paths.Dir,"rooms")}{
-			if _,err:=os.Lstat(artifact);err==nil{return nil,fmt.Errorf("room state: existing rooms are missing the shared database")}else if !errors.Is(err,os.ErrNotExist){return nil,err}
+func OpenNode(ctx context.Context, dir string) (*NodeState, error) {
+	paths, key, err := LoadOrCreateRelayKey(dir)
+	if err != nil {
+		return nil, err
+	}
+	if err := regularFile(paths.Database); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		for _, artifact := range []string{paths.RoomKey, paths.Genesis, filepath.Join(paths.Dir, "rooms")} {
+			if _, err := os.Lstat(artifact); err == nil {
+				return nil, fmt.Errorf("room state: existing rooms are missing the shared database")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
 		}
 	}
-	db,err:=store.Open(ctx,paths.Database)
-	if err!=nil{return nil,err}
-	return &NodeState{Paths:paths,NodePrivate:key,Store:db},nil
+	db, err := store.Open(ctx, paths.Database)
+	if err != nil {
+		return nil, err
+	}
+	return &NodeState{Paths: paths, NodePrivate: key, Store: db}, nil
 }
 
 func regularFile(path string) error {

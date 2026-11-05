@@ -254,14 +254,20 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		if n.inbox != nil {
 			caps.Flags = community.RelayServiceDM
 		}
-		if n.payments != nil && n.payments.HasOffers() { caps.Flags |= community.RelayServicePaidTiers }
+		if n.payments != nil && n.payments.HasOffers() {
+			caps.Flags |= community.RelayServicePaidTiers
+		}
 		return q.Answer(caps)
 	}
 	now := time.Now()
 	if request, ok := q.Data.(community.RelayPaymentV1); ok {
-		if n.payments == nil { return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "paid service unavailable"}) }
+		if n.payments == nil {
+			return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "paid service unavailable"})
+		}
 		conn, err := quic.ClientFromContext(q.Context())
-		if err != nil { return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "missing authenticated client"}) }
+		if err != nil {
+			return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "missing authenticated client"})
+		}
 		return q.Answer(n.payments.Pay(q.Context(), conn.PeerKey(), request))
 	}
 	if isInboxQuery(q.Data) {

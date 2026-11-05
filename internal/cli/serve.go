@@ -30,24 +30,41 @@ func newServeCmd() *cobra.Command {
 		Short: "Serve saved sequencer and replica rooms under one node identity",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if !dmEnabled&&(dmFlags.tpnConfig!=""||len(dmFlags.paidOffers)!=0){return fmt.Errorf("--tpn-config and --dm-paid-offer require --dm")}
+			if !dmEnabled && (dmFlags.tpnConfig != "" || len(dmFlags.paidOffers) != 0) {
+				return fmt.Errorf("--tpn-config and --dm-paid-offer require --dm")
+			}
 			var dm *node.DMConfig
 			var err error
-			if dmEnabled{dm,err=dmFlags.config();if err!=nil{return err}}
+			if dmEnabled {
+				dm, err = dmFlags.config()
+				if err != nil {
+					return err
+				}
+			}
 			var state *roomstate.NodeState
-			if dmEnabled&&len(sequencers)==0&&len(replicas)==0{
-				state,err=roomstate.OpenNode(cmd.Context(),stateDir)
-			}else{
+			if dmEnabled && len(sequencers) == 0 && len(replicas) == 0 {
+				state, err = roomstate.OpenNode(cmd.Context(), stateDir)
+			} else {
 				var selections []roomstate.Selection
-				selections,err=serveSelections(stateDir,sequencers,replicas,time.Now())
-				if err!=nil{return err}
-				state,err=roomstate.LoadRooms(cmd.Context(),stateDir,selections,time.Now())
+				selections, err = serveSelections(stateDir, sequencers, replicas, time.Now())
+				if err != nil {
+					return err
+				}
+				state, err = roomstate.LoadRooms(cmd.Context(), stateDir, selections, time.Now())
 			}
 			if err != nil {
 				return err
 			}
 			defer state.Close()
-			if dmEnabled{payer,err:=dmFlags.startPayments(cmd.Context(),dm);if err!=nil{return err};if payer!=nil{defer payer.Close()}}
+			if dmEnabled {
+				payer, err := dmFlags.startPayments(cmd.Context(), dm)
+				if err != nil {
+					return err
+				}
+				if payer != nil {
+					defer payer.Close()
+				}
+			}
 			advertised := ""
 			if !localOnly {
 				var advertiseErr error
@@ -64,14 +81,16 @@ func newServeCmd() *cobra.Command {
 			runtime, err := node.New(node.Config{
 				Key: state.NodePrivate, Listen: listen, Advertise: advertised,
 				ConfigURL: cfgURL, Socket: state.Paths.Socket, MaxLeaves: maxLeaves,
-				Rooms: rooms, Store: state.Store, LocalOnly: localOnly, DM:dm,
+				Rooms: rooms, Store: state.Store, LocalOnly: localOnly, DM: dm,
 			})
 			if err != nil {
 				return err
 			}
 			defer runtime.Close()
 			printServeBanner(cmd.OutOrStdout(), runtime.ADNLID(), state, listen, advertised)
-			if dmEnabled{fmt.Fprintln(cmd.OutOrStdout(),"DM relay enabled")}
+			if dmEnabled {
+				fmt.Fprintln(cmd.OutOrStdout(), "DM relay enabled")
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), syscall.SIGINT, syscall.SIGTERM)
 			defer stop()
 			if err := runtime.Run(ctx); err != nil && err != context.Canceled {
@@ -89,8 +108,8 @@ func newServeCmd() *cobra.Command {
 	cmd.Flags().StringVar(&cfgURL, "config", defaultConfigURL, "TON global config url")
 	cmd.Flags().IntVar(&maxLeaves, "max-leaves", node.DefaultMaxLeaves, "maximum connected member leaves (1..2048)")
 	cmd.Flags().BoolVar(&localOnly, "local", false, "run without DHT publication for direct local testing")
-	cmd.Flags().BoolVar(&dmEnabled,"dm",false,"enable the free DM relay service alongside selected rooms")
-	addDMFlags(cmd,&dmFlags)
+	cmd.Flags().BoolVar(&dmEnabled, "dm", false, "enable the free DM relay service alongside selected rooms")
+	addDMFlags(cmd, &dmFlags)
 	_ = cmd.MarkFlagRequired("state")
 	return cmd
 }
@@ -130,5 +149,9 @@ func printServeBanner(out io.Writer, adnlID []byte, state *roomstate.NodeState, 
 		fmt.Fprintf(out, "✓ overlay    %s\n", base64.RawURLEncoding.EncodeToString(r.OverlayID))
 	}
 	fmt.Fprintf(out, "✓ database   %s\n✓ control    %s\n", state.Paths.Database, state.Paths.Socket)
-	if len(state.Rooms)>0{fmt.Fprintln(out,"node live · ctrl-C to stop · room reads are public")}else{fmt.Fprintln(out,"node live · ctrl-C to stop")}
+	if len(state.Rooms) > 0 {
+		fmt.Fprintln(out, "node live · ctrl-C to stop · room reads are public")
+	} else {
+		fmt.Fprintln(out, "node live · ctrl-C to stop")
+	}
 }

@@ -84,7 +84,7 @@ func open(cmd *cobra.Command, opts *options) (*client.Client, context.Context, c
 	}
 	c, err := client.Open(ctx, client.Config{
 		TPNConfig: opts.tpnConfig,
-		StateDir: opts.stateDir, ConfigURL: opts.configURL,
+		StateDir:  opts.stateDir, ConfigURL: opts.configURL,
 		DirectAddress: opts.directAddress, DirectPublic: directPublic,
 	})
 	if err != nil {

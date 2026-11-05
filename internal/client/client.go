@@ -214,7 +214,10 @@ func Open(ctx context.Context, cfg Config) (*Client, error) {
 	c.relays = newRelayPool(clientCtx, connector)
 	if cfg.TPNConfig != "" {
 		c.tpn, err = payments.OpenRuntime(clientCtx, cfg.TPNConfig, true)
-		if err != nil { c.Close(); return nil, err }
+		if err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -228,9 +231,11 @@ func (c *Client) Start() error {
 		return err
 	}
 	c.identityOps.Lock()
-	_,dmErr:=c.ensureDM()
+	_, dmErr := c.ensureDM()
 	c.identityOps.Unlock()
-	if dmErr!=nil{return dmErr}
+	if dmErr != nil {
+		return dmErr
+	}
 	for _, record := range records {
 		c.startRoom(record, nil)
 	}
@@ -259,10 +264,12 @@ func (c *Client) Close() error {
 	c.rooms = map[string]*roomHandle{}
 	connector := c.connector
 	relays := c.relays
-	directs:=c.dmRuntime
-	c.dmRuntime=nil
+	directs := c.dmRuntime
+	c.dmRuntime = nil
 	c.mu.Unlock()
-	if directs!=nil{directs.stop()}
+	if directs != nil {
+		directs.stop()
+	}
 	if relays != nil {
 		relays.Close()
 	}
@@ -280,7 +287,9 @@ func (c *Client) Close() error {
 	close(c.events)
 	c.submissionMu.Lock()
 	defer c.submissionMu.Unlock()
-	if c.tpn != nil { c.tpn.Close() }
+	if c.tpn != nil {
+		c.tpn.Close()
+	}
 	err := c.store.Close()
 	releaseStateLock(c.lock)
 	return err
@@ -388,10 +397,20 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 	}
 	c.identityOps.Lock()
 	defer c.identityOps.Unlock()
-	c.mu.RLock();previousDM:=c.dmRuntime;c.mu.RUnlock()
-	if previousDM!=nil{
+	c.mu.RLock()
+	previousDM := c.dmRuntime
+	c.mu.RUnlock()
+	if previousDM != nil {
 		previousDM.cancel()
-		defer func(){previousDM.stop();c.mu.Lock();if c.dmRuntime==previousDM{c.dmRuntime=nil};c.mu.Unlock();c.ensureDM()}()
+		defer func() {
+			previousDM.stop()
+			c.mu.Lock()
+			if c.dmRuntime == previousDM {
+				c.dmRuntime = nil
+			}
+			c.mu.Unlock()
+			c.ensureDM()
+		}()
 	}
 	c.mu.Lock()
 	if c.closed {
@@ -403,7 +422,7 @@ func (c *Client) ResetIdentity(ctx context.Context, expected string) (Identity, 
 		c.mu.Unlock()
 		return Identity{}, fmt.Errorf("expected identity does not match current identity")
 	}
-	c.dmRuntime=nil
+	c.dmRuntime = nil
 	key, stagedPath, err := stageIdentity(c.keyPath)
 	if err != nil {
 		c.mu.Unlock()
@@ -579,7 +598,6 @@ func (c *Client) SendMessage(ctx context.Context, roomText, text string) (map[st
 func (c *Client) SubmitMutation(ctx context.Context, roomText string, body any) (map[string]any, error) {
 	return c.submit(ctx, roomText, body)
 }
-
 
 func (c *Client) submit(ctx context.Context, roomText string, body any) (map[string]any, error) {
 	c.submissionMu.RLock()

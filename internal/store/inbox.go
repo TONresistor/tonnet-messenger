@@ -142,7 +142,10 @@ func (s *Store) DepositInbox(ctx context.Context, request community.InboxDeposit
 	if request.Tier != 0 {
 		selected = nil
 		for i := range limits.PaidOffers {
-			if limits.PaidOffers[i].Tier == request.Tier { selected = &limits.PaidOffers[i]; break }
+			if limits.PaidOffers[i].Tier == request.Tier {
+				selected = &limits.PaidOffers[i]
+				break
+			}
 		}
 	}
 	if selected == nil || selected.Tier != request.Tier || selected.Services != community.RelayServiceDM {

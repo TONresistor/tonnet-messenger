@@ -50,37 +50,57 @@ func (s *SDK) PaymentKey() ed25519.PublicKey {
 }
 
 func (s *SDK) BindIdentity(relay, storeToken []byte) error {
-	if len(relay) != 32 || len(storeToken) != 32 { return fmt.Errorf("payments: invalid owner binding") }
+	if len(relay) != 32 || len(storeToken) != 32 {
+		return fmt.Errorf("payments: invalid owner binding")
+	}
 	data := append(append(append([]byte("tonnet-payment-owner-v1\n"), s.PaymentKey()...), relay...), storeToken...)
 	directory := filepath.Dir(s.ownershipFile)
 	f, err := os.CreateTemp(directory, ".tonnet-payment-owner-*")
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer os.Remove(f.Name())
 	_, writeErr := f.Write(data)
 	syncErr := f.Sync()
 	closeErr := f.Close()
-	if err := errors.Join(writeErr, syncErr, closeErr); err != nil { return err }
+	if err := errors.Join(writeErr, syncErr, closeErr); err != nil {
+		return err
+	}
 	// Link publishes a complete binding without ever replacing an existing one.
 	if err := os.Link(f.Name(), s.ownershipFile); errors.Is(err, os.ErrExist) {
 		existing, err := os.Open(s.ownershipFile)
-		if err != nil { return err }
+		if err != nil {
+			return err
+		}
 		defer existing.Close()
 		old, err := io.ReadAll(io.LimitReader(existing, int64(len(data)+1)))
-		if err != nil { return err }
-		if !bytes.Equal(old, data) { return fmt.Errorf("payments: TPN key belongs to another relay or store") }
-	} else if err != nil { return err }
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(old, data) {
+			return fmt.Errorf("payments: TPN key belongs to another relay or store")
+		}
+	} else if err != nil {
+		return err
+	}
 	dir, err := os.Open(directory)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	defer dir.Close()
 	return dir.Sync()
 }
 
 func (s *SDK) CloseConditional(ctx context.Context, key ed25519.PublicKey) error {
 	err := s.Service.CloseConditional(ctx, key)
-	if err == nil || errors.Is(err, tonpayments.ErrNoResolveExists) || errors.Is(err, tonpayments.ErrNotActive) { return err }
+	if err == nil || errors.Is(err, tonpayments.ErrNoResolveExists) || errors.Is(err, tonpayments.ErrNotActive) {
+		return err
+	}
 	// The SDK's missing-meta error is untyped. Confirm it through its typed read,
 	// rather than matching error text or mistaking a missing conditional for it.
-	if _, readErr := s.Service.GetVirtualChannelMeta(ctx, key); errors.Is(readErr, db.ErrNotFound) { return ErrChannelGone }
+	if _, readErr := s.Service.GetVirtualChannelMeta(ctx, key); errors.Is(readErr, db.ErrNotFound) {
+		return ErrChannelGone
+	}
 	return err
 }
 

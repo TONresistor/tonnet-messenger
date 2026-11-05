@@ -51,18 +51,26 @@ type Publisher struct {
 
 // Discovery borrows the existing lookup implementation without publishing.
 type Discovery interface {
-	FindOverlayNodes(context.Context,[]byte)(*overlay.NodesList,error)
-	ResolveAll(context.Context,[]byte)([]string,ed25519.PublicKey,error)
+	FindOverlayNodes(context.Context, []byte) (*overlay.NodesList, error)
+	ResolveAll(context.Context, []byte) ([]string, ed25519.PublicKey, error)
 	Close()
 }
-func NewDiscovery(ctx context.Context,cfgURL string)(Discovery,error){
-	_,key,err:=ed25519.GenerateKey(rand.Reader)
-	if err!=nil{return nil,err}
-	gw:=adnl.NewGateway(key)
-	if err:=gw.StartClient();err!=nil{return nil,err}
-	p,err:=NewPublisher(ctx,gw,cfgURL,key,nil,nil)
-	if err!=nil{gw.Close();return nil,err}
-	return p,nil
+
+func NewDiscovery(ctx context.Context, cfgURL string) (Discovery, error) {
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, err
+	}
+	gw := adnl.NewGateway(key)
+	if err := gw.StartClient(); err != nil {
+		return nil, err
+	}
+	p, err := NewPublisher(ctx, gw, cfgURL, key, nil, nil)
+	if err != nil {
+		gw.Close()
+		return nil, err
+	}
+	return p, nil
 }
 
 func NewPublisher(ctx context.Context, gw *adnl.Gateway, cfgURL string, key ed25519.PrivateKey, room, overlayID []byte) (*Publisher, error) {
