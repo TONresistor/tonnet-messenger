@@ -15,7 +15,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 func TestSubmitRejectsUnrelatedCommit(t *testing.T) {
@@ -51,7 +50,7 @@ func TestSubmitRejectsUnrelatedCommit(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer gateway.Close()
-	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {

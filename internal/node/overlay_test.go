@@ -14,7 +14,6 @@ import (
 	"time"
 
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -196,7 +195,7 @@ func TestForwardedOverlayRejectionsAndSuccessfulSubmission(t *testing.T) {
 	var rejection atomic.Int32
 	seen := make(chan community.EventProposal, 3)
 	id, _ := community.OverlayID(genesis.RoomKey)
-	server.SetConnectionHandler(func(raw *quic.Peer) error {
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(q *roomnet.Query) error {
 			if _, ok := q.Data.(community.GetCapabilities); ok {

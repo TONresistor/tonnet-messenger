@@ -22,7 +22,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 )
 
@@ -270,7 +269,7 @@ func TestRoomJoinRejectsV2StateAsProtocolError(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+			gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 				peer := roomnet.Wrap(raw)
 				peer.SetQueryHandler(func(query *roomnet.Query) error {
 					switch query.Data.(type) {

@@ -13,7 +13,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/payments"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 // DMConfig enables inbox service and its relay advertisement.
@@ -65,7 +64,7 @@ type inboxService struct {
 	// queue admission. No network write runs while it is held.
 	order          sync.Mutex
 	mu             sync.Mutex
-	connections    map[*quic.Client]*inboxConnection
+	connections    map[*roomnet.Connection]*inboxConnection
 	maxConnections int
 	closed         bool
 	ttl            int64
@@ -74,7 +73,7 @@ type inboxService struct {
 func newInboxService(n *Node, c DMConfig) *inboxService {
 	// Both directions can carry queries. Bound state using the existing finite
 	// managed-peer budgets, including transient same-key incoming replacements.
-	return &inboxService{node: n, connections: make(map[*quic.Client]*inboxConnection), maxConnections: 2 * (n.cfg.MaxLeaves + MaxPendingPeers + MaxNodePeers), ttl: int64(c.ChallengeTTL / time.Second)}
+	return &inboxService{node: n, connections: make(map[*roomnet.Connection]*inboxConnection), maxConnections: 2 * (n.cfg.MaxLeaves + MaxPendingPeers + MaxNodePeers), ttl: int64(c.ChallengeTTL / time.Second)}
 }
 
 func (s *inboxService) pruneLocked(now int64) {
@@ -104,7 +103,7 @@ func (s *inboxService) close() {
 	}
 }
 
-func (s *inboxService) challenge(conn *quic.Client, inbox []byte, now int64) (community.InboxChallengeV1, error) {
+func (s *inboxService) challenge(conn *roomnet.Connection, inbox []byte, now int64) (community.InboxChallengeV1, error) {
 	if len(inbox) != 32 {
 		return community.InboxChallengeV1{}, &store.Rejection{Code: community.RejectMalformedRequest, Message: "invalid inbox id"}
 	}
@@ -135,7 +134,7 @@ func (s *inboxService) challenge(conn *quic.Client, inbox []byte, now int64) (co
 	return community.InboxChallengeV1{Nonce: bytes.Clone(nonce), ExpireAt: expire}, nil
 }
 
-func (s *inboxService) authenticate(conn *quic.Client, auth community.InboxAuthV1, now int64) (community.InboxAuthV1ToSign, error) {
+func (s *inboxService) authenticate(conn *roomnet.Connection, auth community.InboxAuthV1, now int64) (community.InboxAuthV1ToSign, error) {
 	if len(auth.RecipientKey) != 32 || len(auth.Nonce) != 32 {
 		return community.InboxAuthV1ToSign{}, &store.Rejection{Code: community.RejectMalformedRequest, Message: "malformed inbox auth"}
 	}
@@ -153,7 +152,7 @@ func (s *inboxService) authenticate(conn *quic.Client, auth community.InboxAuthV
 	return challenge, nil
 }
 
-func (s *inboxService) subscribe(conn *quic.Client, p *peer, proof community.InboxAuthV1ToSign, after int64) {
+func (s *inboxService) subscribe(conn *roomnet.Connection, p *peer, proof community.InboxAuthV1ToSign, after int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(time.Now().Unix())
@@ -162,7 +161,7 @@ func (s *inboxService) subscribe(conn *quic.Client, p *peer, proof community.Inb
 	}
 }
 
-func (s *inboxService) subscribed(conn *quic.Client, sub *inboxSubscription) bool {
+func (s *inboxService) subscribed(conn *roomnet.Connection, sub *inboxSubscription) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(time.Now().Unix())
@@ -225,7 +224,7 @@ func (n *Node) answerInbox(p *peer, q *roomnet.Query, now time.Time) error {
 	if err := q.Context().Err(); err != nil {
 		return err
 	}
-	conn, err := quic.ClientFromContext(q.Context())
+	conn, err := roomnet.ConnectionFromContext(q.Context())
 	if err != nil {
 		code := community.RejectInboxAuthenticationFailed
 		if _, deposit := q.Data.(community.InboxDepositV1); deposit {

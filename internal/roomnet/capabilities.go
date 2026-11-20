@@ -4,8 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"reflect"
 	"time"
+
+	quicgo "github.com/xssnick/quic-go-ton"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 )
@@ -57,20 +58,8 @@ func (p *Peer) probeCapabilities(ctx context.Context, outbound bool) (community.
 	}
 }
 
-// IsRemoteStreamReset inspects the pinned transport's wrapped StreamError and
-// its Remote field without promoting the indirect QUIC module to a direct
-// dependency or depending on error-message text.
+// IsRemoteStreamReset distinguishes a peer reset from a local cancellation.
 func IsRemoteStreamReset(err error) bool {
-	for err != nil {
-		value := reflect.ValueOf(err)
-		if value.Kind() == reflect.Pointer && !value.IsNil() {
-			value = value.Elem()
-			if value.Kind() == reflect.Struct && value.Type().PkgPath() == "github.com/xssnick/quic-go-ton" && value.Type().Name() == "StreamError" {
-				remote := value.FieldByName("Remote")
-				return remote.IsValid() && remote.Kind() == reflect.Bool && remote.Bool()
-			}
-		}
-		err = errors.Unwrap(err)
-	}
-	return false
+	var reset *quicgo.StreamError
+	return errors.As(err, &reset) && reset.Remote
 }

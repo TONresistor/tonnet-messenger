@@ -11,8 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/quic"
-
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
@@ -308,7 +306,7 @@ func clockTestPeer(
 		serverGateway.Close()
 		t.Fatal(err)
 	}
-	serverGateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	serverGateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			switch query.Data.(type) {

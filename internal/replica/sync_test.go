@@ -11,7 +11,6 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 func TestOverlayNotServedTriesNextDiscoveryCandidate(t *testing.T) {
@@ -37,7 +36,7 @@ func TestOverlayNotServedTriesNextDiscoveryCandidate(t *testing.T) {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { gateway.Close() })
-		gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+		gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 			peer := roomnet.Wrap(raw)
 			peer.SetQueryHandler(func(q *roomnet.Query) error {
 				if _, ok := q.Data.(community.GetCapabilities); ok {

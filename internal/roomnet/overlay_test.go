@@ -19,7 +19,7 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
-func overlayPeer(t *testing.T, handler func(*roomnet.Query) error) (*roomnet.Peer, *quic.Peer) {
+func overlayPeer(t *testing.T, handler func(*roomnet.Query) error) (*roomnet.Peer, *roomnet.RawPeer) {
 	t.Helper()
 	serverKey := testKey(t)
 	server, err := roomnet.NewGateway(serverKey)
@@ -27,7 +27,7 @@ func overlayPeer(t *testing.T, handler func(*roomnet.Query) error) (*roomnet.Pee
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { server.Close() })
-	server.SetConnectionHandler(func(raw *quic.Peer) error { roomnet.Wrap(raw).SetQueryHandler(handler); return nil })
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error { roomnet.Wrap(raw).SetQueryHandler(handler); return nil })
 	packet, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

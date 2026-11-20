@@ -20,13 +20,13 @@ func TestStrictOutboundOperationsNeverUseInbound(t *testing.T) {
 	defer cancel()
 	keyA, keyB := testKey(t), testKey(t)
 	id := community.Zero256()
-	listen := func(key ed25519.PrivateKey) (*quic.Gateway, string) {
+	listen := func(key ed25519.PrivateKey) (*roomnet.Gateway, string) {
 		gateway, err := roomnet.NewGateway(key)
 		if err != nil {
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { gateway.Close() })
-		gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+		gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 			peer := roomnet.Wrap(raw)
 			peer.SetQueryHandler(func(q *roomnet.Query) error {
 				if _, ok := q.Data.(community.GetCapabilities); ok {

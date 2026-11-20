@@ -18,7 +18,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 func sharedAddress(t *testing.T) string {
@@ -328,7 +327,7 @@ func TestSharedDispatcherRejectsWrongRoomAndInvalidData(t *testing.T) {
 	}
 	peers := make(chan *roomnet.Peer, 8)
 	var probes atomic.Int32
-	server.SetConnectionHandler(func(raw *quic.Peer) error {
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peers <- peer
 		peer.SetQueryHandler(func(q *roomnet.Query) error {

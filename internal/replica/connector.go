@@ -6,11 +6,10 @@ import (
 	"crypto/ed25519"
 	"errors"
 	"fmt"
-	"reflect"
 	"sync"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/quic"
+	quicgo "github.com/xssnick/quic-go-ton"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -40,7 +39,7 @@ type connectorEntry struct {
 	cancel       context.CancelFunc
 	ready, gone  chan struct{}
 	shutdown     sync.Once
-	gateway      *quic.Gateway
+	gateway      *roomnet.Gateway
 	peer         *roomnet.Peer
 	capabilities community.Capabilities
 	err          error
@@ -186,24 +185,11 @@ func (e *connectorEntry) open() {
 	}
 }
 
-// Preserve authentication failures through candidate selection. The pinned
-// QUIC fork exposes TLS alerts as qerr.TransportError codes 0x100..0x1ff.
-// Inspect that concrete type, as roomnet does for stream resets, without adding
-// the indirect QUIC fork as a direct dependency or matching error text.
+// Preserve authentication failures through candidate selection.
 func endpointDialError(err error) error {
-	for current := err; current != nil; current = errors.Unwrap(current) {
-		value := reflect.ValueOf(current)
-		if value.Kind() != reflect.Pointer || value.IsNil() {
-			continue
-		}
-		value = value.Elem()
-		if value.Kind() != reflect.Struct || value.Type().PkgPath() != "github.com/xssnick/quic-go-ton/internal/qerr" || value.Type().Name() != "TransportError" {
-			continue
-		}
-		code := value.FieldByName("ErrorCode")
-		if code.IsValid() && code.Kind() == reflect.Uint64 && code.Uint() >= 0x100 && code.Uint() < 0x200 {
-			return fmt.Errorf("%w: peer authentication: %w", roomnet.ErrMalformedAnswer, err)
-		}
+	var transportError *quicgo.TransportError
+	if errors.As(err, &transportError) && transportError.ErrorCode >= 0x100 && transportError.ErrorCode < 0x200 {
+		return fmt.Errorf("%w: peer authentication: %w", roomnet.ErrMalformedAnswer, err)
 	}
 	return err
 }

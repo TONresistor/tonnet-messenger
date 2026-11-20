@@ -302,6 +302,16 @@ func (g *Gateway) OutboundPeerDefaultID(id []byte) (*Peer, error) {
 	return nil, tonquic.ErrOutboundPeerNotFound
 }
 
+func (g *Gateway) OutboundPeer(local, public ed25519.PublicKey) (*Peer, error) {
+	p := g.Peer(local, public)
+	if p != nil {
+		if _, err := p.connection(true); err == nil {
+			return p, nil
+		}
+	}
+	return nil, tonquic.ErrOutboundPeerNotFound
+}
+
 func (g *Gateway) Close() error {
 	g.mu.Lock()
 	if g.closed {

@@ -12,8 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/quic"
-
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
@@ -40,7 +38,7 @@ func TestOversizedAnswerIsRejectedBeforeTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer clientGateway.Close()
-	serverGateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	serverGateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		roomnet.Wrap(raw).SetQueryHandler(func(query *roomnet.Query) error {
 			return query.Answer(community.BatchResult{Items: []community.BatchItem{{
 				Data: make([]byte, roomnet.MaxAnswerPayloadSize),
@@ -81,7 +79,7 @@ func TestQueryAndMessageUseAuthenticatedTONQUIC(t *testing.T) {
 	defer clientGateway.Close()
 
 	messages := make(chan broadcast.Time, 1)
-	serverGateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	serverGateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			switch query.Data.(type) {
@@ -176,7 +174,7 @@ func TestAnswerLimitRemainsFourMiBWithUpstreamDefaults(t *testing.T) {
 	}
 	defer server.Close()
 	var sendOversized atomic.Bool
-	server.SetConnectionHandler(func(raw *quic.Peer) error {
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		// Bypass the application answer guard to exercise the receive cap.
 		raw.SetQueryHandler(func(context.Context, []byte) ([]byte, error) {
 			if sendOversized.Load() {

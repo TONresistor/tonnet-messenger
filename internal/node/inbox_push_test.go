@@ -10,7 +10,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 type inboxPushReceiver struct {
@@ -404,7 +403,7 @@ func TestInboxPushSharedQueueFullClosesOnlyPhysicalTargetAndKeepsDeposits(t *tes
 			release()
 		}
 	}()
-	var physical *quic.Client
+	var physical *roomnet.Connection
 	var sub *inboxSubscription
 	f.n.inbox.mu.Lock()
 	for conn, state := range f.n.inbox.connections {

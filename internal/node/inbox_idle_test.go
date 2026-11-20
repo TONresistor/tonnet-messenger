@@ -9,7 +9,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 )
 
@@ -48,7 +47,7 @@ func TestRelayIdleBoundaries(t *testing.T) {
 	}
 }
 
-func waitIdleConnection(t *testing.T, ctx context.Context, n *Node, key ed25519.PrivateKey, exclude *quic.Client) (*quic.Client, inboxConnection) {
+func waitIdleConnection(t *testing.T, ctx context.Context, n *Node, key ed25519.PrivateKey, exclude *roomnet.Connection) (*roomnet.Connection, inboxConnection) {
 	t.Helper()
 	for {
 		n.inbox.mu.Lock()
@@ -68,7 +67,7 @@ func waitIdleConnection(t *testing.T, ctx context.Context, n *Node, key ed25519.
 	}
 }
 
-func waitIdleCompletion(t *testing.T, ctx context.Context, n *Node, conn *quic.Client, answeredAfter time.Time) inboxConnection {
+func waitIdleCompletion(t *testing.T, ctx context.Context, n *Node, conn *roomnet.Connection, answeredAfter time.Time) inboxConnection {
 	t.Helper()
 	for {
 		n.inbox.mu.Lock()
@@ -87,7 +86,7 @@ func waitIdleCompletion(t *testing.T, ctx context.Context, n *Node, conn *quic.C
 	}
 }
 
-func ageIdleConnection(n *Node, conn *quic.Client, at time.Time) {
+func ageIdleConnection(n *Node, conn *roomnet.Connection, at time.Time) {
 	n.inbox.mu.Lock()
 	n.inbox.connections[conn].lastActivity = at
 	n.inbox.mu.Unlock()

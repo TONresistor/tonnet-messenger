@@ -17,7 +17,6 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl"
 	"github.com/xssnick/tonutils-go/adnl/address"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"golang.org/x/net/ipv4"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -79,7 +78,7 @@ type stats struct {
 type Node struct {
 	cfg             Config
 	gw              *adnl.Gateway
-	qgw             *quic.Gateway
+	qgw             *roomnet.Gateway
 	quicPacket      net.PacketConn
 	quicErr         chan error
 	peers           *peerTable
@@ -227,7 +226,7 @@ func New(cfg Config) (*Node, error) {
 			return tondns.ResolveIdentity(ctx, cfg.ConfigURL, domain)
 		}
 	}
-	qgw.SetConnectionHandler(func(peer *quic.Peer) error { return n.onInbound(roomnet.Wrap(peer)) })
+	qgw.SetConnectionHandler(func(peer *roomnet.RawPeer) error { return n.onInbound(roomnet.Wrap(peer)) })
 
 	if cfg.Advertise != "" {
 		addr, err := parseAddress(cfg.Advertise)

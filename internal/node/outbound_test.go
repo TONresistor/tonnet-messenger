@@ -14,7 +14,6 @@ import (
 	"time"
 
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -31,7 +30,7 @@ func (g *outboundProbeGate) unblock() { g.once.Do(func() { close(g.release) }) }
 
 type outboundTestEndpoint struct {
 	key                      ed25519.PrivateKey
-	gateway                  *quic.Gateway
+	gateway                  *roomnet.Gateway
 	address                  string
 	caps                     atomic.Value
 	resets, probes, requests atomic.Int32
@@ -72,7 +71,7 @@ func outboundFixture(t *testing.T) (*Node, *outboundTestEndpoint) {
 		t.Fatal(err)
 	}
 	id, _ := community.OverlayID(genesis.RoomKey)
-	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(q *roomnet.Query) error {
 			if _, ok := q.Data.(community.GetCapabilities); ok {
@@ -316,7 +315,7 @@ func TestNodeOutboundLossNeverFallsBackToLiveInbound(t *testing.T) {
 	}
 	defer legacy.Close()
 	var legacyProbes atomic.Int32
-	legacy.SetConnectionHandler(func(raw *quic.Peer) error {
+	legacy.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		roomnet.Wrap(raw).SetQueryHandler(func(q *roomnet.Query) error {
 			if _, ok := q.Data.(community.GetCapabilities); ok {
 				legacyProbes.Add(1)

@@ -14,7 +14,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/xssnick/tonutils-go/adnl/address"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 )
 
@@ -58,7 +57,7 @@ func newPoolEndpoint(t *testing.T) *poolEndpoint {
 	if err != nil {
 		t.Fatal(err)
 	}
-	g.SetConnectionHandler(func(raw *quic.Peer) error {
+	g.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		p := roomnet.Wrap(raw)
 		f.peers <- p
 		p.SetQueryHandler(func(q *roomnet.Query) error {

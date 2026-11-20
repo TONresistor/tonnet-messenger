@@ -10,6 +10,8 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/overlay"
 	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
+
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet/transport"
 )
 
 const (
@@ -25,12 +27,20 @@ var (
 	ErrMalformedAnswer = errors.New("room transport: malformed answer")
 )
 
-func NewGateway(keys ...ed25519.PrivateKey) (*quic.Gateway, error) {
+type Gateway = transport.Gateway
+type RawPeer = transport.Peer
+type Connection = transport.Connection
+
+func ConnectionFromContext(ctx context.Context) (*Connection, error) {
+	return transport.ConnectionFromContext(ctx)
+}
+
+func NewGateway(keys ...ed25519.PrivateKey) (*Gateway, error) {
 	limits := quic.DefaultLimits()
 	limits.MaxObjectSize = maxQUICObjectSize
 	limits.MaxIncomingStreams = MaxIncomingStreams
 	limits.MaxConcurrentIncomingStreamsPerConnection = MaxIncomingStreams
-	return quic.NewGatewayWithLimits(limits, keys...)
+	return transport.NewGateway(limits, keys...)
 }
 
 // Query is a decoded TON QUIC query and its single response.
@@ -63,7 +73,7 @@ func (q *Query) Answer(response any) error {
 
 // Peer exposes boxed TL requests over an authenticated TON QUIC path.
 type Peer struct {
-	raw  *quic.Peer
+	raw  *RawPeer
 	done chan struct{}
 
 	disconnectMu sync.Mutex
@@ -72,12 +82,12 @@ type Peer struct {
 	notifyOnce   sync.Once
 }
 
-func Wrap(raw *quic.Peer) *Peer {
+func Wrap(raw *RawPeer) *Peer {
 	if raw == nil {
 		return nil
 	}
 	p := &Peer{raw: raw, done: make(chan struct{})}
-	raw.SetDisconnectHandler(func(_ *quic.Peer) {
+	raw.SetDisconnectHandler(func(_ *RawPeer) {
 		p.closeOnce.Do(func() { close(p.done) })
 		p.notifyDisconnect()
 	})
@@ -155,7 +165,7 @@ func (p *Peer) sendMessage(ctx context.Context, message any, outbound bool) erro
 
 // SendMessageOn sends on exactly the authenticated physical connection supplied
 // by the transport handler, with the same application bound as Peer messages.
-func SendMessageOn(ctx context.Context, conn *quic.Client, message any) error {
+func SendMessageOn(ctx context.Context, conn *Connection, message any) error {
 	if conn == nil {
 		return quic.ErrPeerClosed
 	}
@@ -179,7 +189,7 @@ func (p *Peer) GetRandomPeers(ctx context.Context, overlayID []byte) ([]overlay.
 
 // SetConnectionHandler observes every authenticated physical opening, before
 // streams are dispatched, including a silent replacement on the same Peer.
-func (p *Peer) SetConnectionHandler(handler func(*quic.Client)) {
+func (p *Peer) SetConnectionHandler(handler func(*Connection)) {
 	if p != nil && p.raw != nil {
 		p.raw.SetConnectionHandler(handler)
 	}
@@ -338,4 +348,4 @@ func decodeInto(raw []byte, result any) error {
 }
 
 // Wraps compares managed paths, not physical QUIC connection identities.
-func (p *Peer) Wraps(raw *quic.Peer) bool { return p != nil && p.raw == raw }
+func (p *Peer) Wraps(raw *RawPeer) bool { return p != nil && p.raw == raw }

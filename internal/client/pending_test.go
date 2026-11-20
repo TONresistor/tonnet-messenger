@@ -17,7 +17,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 	"github.com/TONresistor/tonnet-messenger/internal/store"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 type pendingFixture struct {
@@ -61,7 +60,7 @@ func newPendingEndpoint(t *testing.T, relayed bool) *pendingFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {

@@ -7,7 +7,6 @@ import (
 	"log"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -25,7 +24,7 @@ type outboundJob struct {
 	node  bool
 	items []tl.Serializable
 
-	physical     *quic.Client
+	physical     *roomnet.Connection
 	subscription *inboxSubscription
 }
 
@@ -38,7 +37,7 @@ func (n *Node) wirePeer(p *peer) {
 	})
 	queryHandler := func(query *roomnet.Query) error { return n.answerQuery(p, query) }
 	if n.inbox != nil {
-		p.conn.SetConnectionHandler(func(conn *quic.Client) { n.inbox.open(p, conn, time.Now()) })
+		p.conn.SetConnectionHandler(func(conn *roomnet.Connection) { n.inbox.open(p, conn, time.Now()) })
 		p.conn.SetQueryHandlerWithLifecycle(queryHandler, n.inbox.beginQuery)
 	} else {
 		p.conn.SetQueryHandler(queryHandler)
@@ -106,7 +105,7 @@ func (n *Node) writeInboxPush(job outboundJob) {
 	}
 }
 
-func (n *Node) enqueueInbox(p *peer, conn *quic.Client, sub *inboxSubscription, push community.InboxPushV1) bool {
+func (n *Node) enqueueInbox(p *peer, conn *roomnet.Connection, sub *inboxSubscription, push community.InboxPushV1) bool {
 	select {
 	case <-p.stop:
 		return false

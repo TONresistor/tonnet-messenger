@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
@@ -74,7 +73,7 @@ func newCapabilityEndpoint(t *testing.T) *capabilityEndpoint {
 	}
 	t.Cleanup(func() { gateway.Close() })
 	id, _ := community.OverlayID(genesis.RoomKey)
-	gateway.SetConnectionHandler(func(raw *quic.Peer) error {
+	gateway.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		f.peers <- peer
 		peer.SetQueryHandler(func(q *roomnet.Query) error {

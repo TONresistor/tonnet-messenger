@@ -41,6 +41,8 @@ type Peer struct {
 	inbound, outbound   *Connection
 	closed              bool
 	initOnce, closeOnce sync.Once
+	notifyOnce          sync.Once
+	finalized           atomic.Bool
 	ready, done         chan struct{}
 	initErr             error
 	query               atomic.Pointer[queryHandler]
@@ -83,6 +85,15 @@ func (p *Peer) SetDisconnectHandler(h func(*Peer)) {
 	} else {
 		v := disconnectHandler(h)
 		p.disconnect.Store(&v)
+		if p.finalized.Load() {
+			p.notifyDisconnect()
+		}
+	}
+}
+
+func (p *Peer) notifyDisconnect() {
+	if h := p.disconnect.Load(); h != nil {
+		p.notifyOnce.Do(func() { (*h)(p) })
 	}
 }
 
@@ -241,9 +252,8 @@ func (p *Peer) finalize() {
 		// A rejected/failed dial may have no connection and no initializer.
 		p.initOnce.Do(func() { p.initErr = tonquic.ErrPeerClosed; close(p.ready) })
 		<-p.ready
-		if h := p.disconnect.Load(); h != nil {
-			(*h)(p)
-		}
+		p.finalized.Store(true)
+		p.notifyDisconnect()
 		p.gateway.mu.Lock()
 		if p.gateway.peers[p.mapKey] == p {
 			delete(p.gateway.peers, p.mapKey)

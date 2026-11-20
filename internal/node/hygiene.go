@@ -9,7 +9,7 @@ import (
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
 	"github.com/TONresistor/tonnet-messenger/internal/community"
-	"github.com/xssnick/tonutils-go/adnl/quic"
+	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
 )
 
 const (
@@ -77,7 +77,7 @@ func (c *inboxConnection) idleAt(now time.Time, member bool) bool {
 	return now.Sub(c.lastActivity) >= ttl
 }
 
-func (s *inboxService) open(p *peer, conn *quic.Client, now time.Time) {
+func (s *inboxService) open(p *peer, conn *roomnet.Connection, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked(now.Unix())
@@ -100,7 +100,7 @@ func (s *inboxService) open(p *peer, conn *quic.Client, now time.Time) {
 }
 
 func (s *inboxService) beginQuery(ctx context.Context) func(bool) {
-	conn, err := quic.ClientFromContext(ctx)
+	conn, err := roomnet.ConnectionFromContext(ctx)
 	s.mu.Lock()
 	state := s.connections[conn]
 	if err != nil || state == nil {
@@ -124,7 +124,7 @@ func (s *inboxService) beginQuery(ctx context.Context) func(bool) {
 	return func(answered bool) { finished <- answered }
 }
 
-func (s *inboxService) pushed(conn *quic.Client, sub *inboxSubscription, now time.Time) {
+func (s *inboxService) pushed(conn *roomnet.Connection, sub *inboxSubscription, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if state := s.connections[conn]; state != nil && sub != nil && state.subscription == sub && sub.expireAt > now.Unix() {

@@ -16,7 +16,6 @@ import (
 	"github.com/xssnick/tonutils-go/adnl/address"
 	tondht "github.com/xssnick/tonutils-go/adnl/dht"
 	tonkeys "github.com/xssnick/tonutils-go/adnl/keys"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/community"
@@ -212,7 +211,7 @@ func connect(ctx context.Context, cfg Config, database *store.Store, requireSequ
 }
 
 func connectTargets(ctx context.Context, cfg Config, database *store.Store, requireSequencer bool, targets []target) (*connected, func(), error) {
-	var gateway *quic.Gateway
+	var gateway *roomnet.Gateway
 	var err error
 	if cfg.Connector == nil {
 		gateway, err = roomnet.NewGateway(cfg.NodeKey)

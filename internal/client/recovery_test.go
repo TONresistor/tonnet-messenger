@@ -13,7 +13,6 @@ import (
 	"github.com/TONresistor/tonnet-messenger/internal/community"
 	"github.com/TONresistor/tonnet-messenger/internal/replica"
 	"github.com/TONresistor/tonnet-messenger/internal/roomnet"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 )
 
 func TestClientReopenPreservesVerifiedHistory(t *testing.T) {
@@ -228,7 +227,7 @@ func TestReconnectRecoversStateWithoutRewindingHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	server.SetConnectionHandler(func(raw *quic.Peer) error {
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			if selected, err := selectTestRoomQuery(query, f.genesis.RoomKey); err != nil || !selected {
@@ -383,7 +382,7 @@ func TestClientReplacesCachedV2WithVerifiedV3AtSameRevision(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	server.SetConnectionHandler(func(raw *quic.Peer) error {
+	server.SetConnectionHandler(func(raw *roomnet.RawPeer) error {
 		peer := roomnet.Wrap(raw)
 		peer.SetQueryHandler(func(query *roomnet.Query) error {
 			if selected, err := selectTestRoomQuery(query, genesis.RoomKey); err != nil || !selected {

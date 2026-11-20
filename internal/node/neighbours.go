@@ -12,7 +12,6 @@ import (
 
 	"github.com/xssnick/tonutils-go/adnl/keys"
 	tonoverlay "github.com/xssnick/tonutils-go/adnl/overlay"
-	"github.com/xssnick/tonutils-go/adnl/quic"
 	"github.com/xssnick/tonutils-go/tl"
 
 	"github.com/TONresistor/tonnet-messenger/internal/broadcast"
@@ -264,7 +263,7 @@ func (n *Node) answerQuery(p *peer, q *roomnet.Query) error {
 		if n.payments == nil {
 			return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "paid service unavailable"})
 		}
-		conn, err := quic.ClientFromContext(q.Context())
+		conn, err := roomnet.ConnectionFromContext(q.Context())
 		if err != nil {
 			return q.Answer(community.RelayPaymentRejectedV1{Code: community.RejectInsufficientPrepaidBalance, Message: "missing authenticated client"})
 		}
