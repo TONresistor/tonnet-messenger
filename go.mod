@@ -10,6 +10,7 @@ require (
 	github.com/mdp/qrterminal/v3 v3.2.1
 	github.com/rs/zerolog v1.35.1
 	github.com/spf13/cobra v1.10.2
+	github.com/xssnick/quic-go-ton v0.0.0-20261001181112-f2ad8f940a32
 	github.com/xssnick/ton-payment-network v1.3.2
 	github.com/xssnick/tonutils-go v1.19.1
 	golang.org/x/net v0.60.0
@@ -51,7 +52,6 @@ require (
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/syndtr/goleveldb v1.0.0 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
-	github.com/xssnick/quic-go-ton v0.0.0-20261001181112-f2ad8f940a32 // indirect
 	github.com/xssnick/raptorq v1.6.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.2 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
